@@ -230,6 +230,10 @@ private struct ExtensionRequestReference: @unchecked Sendable {
 
   private nonisolated static func scanDevices() -> Bool? {
     let system = CMIOObjectID(kCMIOObjectSystemObject)
+    var visibility = address(kCMIOHardwarePropertyAllowScreenCaptureDevices)
+    var allow: UInt32 = 1
+    guard CMIOObjectSetPropertyData(system, &visibility, 0, nil,
+      UInt32(MemoryLayout<UInt32>.size), &allow) == noErr else { return nil }
     var property = address(kCMIOHardwarePropertyDevices)
     var size: UInt32 = 0
     let stride = UInt32(MemoryLayout<CMIOObjectID>.stride)

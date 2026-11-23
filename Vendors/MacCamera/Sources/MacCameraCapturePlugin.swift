@@ -7,8 +7,12 @@ final class MacCameraCapturePlugin: CaptureSourcePlugin, @unchecked Sendable {
     let token: UUID
     weak var session: MacCameraCaptureSession?
   }
-  private struct WeakDeviceObserver { weak var value: DeviceObservation? }
-  private struct WeakStatusObserver { weak var value: DeviceStatusObservation? }
+  private struct WeakDeviceObserver: Sendable { weak var value: DeviceObservation? }
+  private struct WeakStatusObserver: Sendable { weak var value: DeviceStatusObservation? }
+  private struct DeviceFallbacks {
+    let device: ObjectIdentifier
+    var byMode: [String: Set<OSType>] = [:]
+  }
 
   let descriptor = VendorDescriptor(id: "maccamera", displayName: "Mac Camera", badgeText: "MAC",
     signalHint: "Check that the camera is connected and Camera access is enabled.", sdkVersion: nil,
@@ -25,7 +29,7 @@ final class MacCameraCapturePlugin: CaptureSourcePlugin, @unchecked Sendable {
   private var statusObservers: [UUID: WeakStatusObserver] = [:]
   private var statuses: [String: CaptureDeviceStatus] = [:]
   private var diagnostics: [String: DeviceDiagnostics] = [:]
-  private var availableFallbacks: [String: [String: Set<OSType>]] = [:]
+  private var availableFallbacks: [String: DeviceFallbacks] = [:]
   private var sessions: [String: SessionClaim] = [:]
   private let desiredLock = NSLock()
   private var desired = VendorSettingsPolicy()
@@ -164,6 +168,11 @@ final class MacCameraCapturePlugin: CaptureSourcePlugin, @unchecked Sendable {
       quarantineDuplicateUIDs(identities.map { DiscoveryIdentity(uid: $0.0, object: $0.1) })
     }
   }
+
+  @MainActor func observeFixtureStatus(_ handler: @escaping @MainActor @Sendable (String, CaptureDeviceStatus) -> Void)
+    -> DeviceStatusObservation {
+    registerStatusObserver(handler)
+  }
   #endif
 
   static func includes(uid: String) -> Bool { !uid.isEmpty && !VirtualCameraDescriptor.isDeviceUID(uid) }
@@ -216,8 +225,10 @@ final class MacCameraCapturePlugin: CaptureSourcePlugin, @unchecked Sendable {
 
   private func publishDevices() {
     let snapshot = snapshot()
-    let observations = deviceObservers.values.compactMap(\.value)
-    Task { @MainActor in for observation in observations { observation.deliver(snapshot) } }
+    let observations = Array(deviceObservers.values)
+    DispatchQueue.main.async {
+      for observation in observations { observation.value?.deliver(snapshot) }
+    }
     refreshIdleStatuses()
   }
 
@@ -225,13 +236,19 @@ final class MacCameraCapturePlugin: CaptureSourcePlugin, @unchecked Sendable {
   func diagnostics(deviceID: String) -> DeviceDiagnostics? { withQueue { diagnostics[deviceID] } }
 
   @MainActor func observeStatus(_ handler: @escaping @MainActor @Sendable (String, CaptureDeviceStatus) -> Void) -> DeviceStatusObservation? {
+    let token = registerStatusObserver(handler)
+    refreshIdleStatus()
+    return token
+  }
+
+  @MainActor private func registerStatusObserver(_ handler: @escaping @MainActor @Sendable (String, CaptureDeviceStatus) -> Void)
+    -> DeviceStatusObservation {
     let token = DeviceStatusObservation(handler)
     let id = UUID()
     withQueue { statusObservers[id] = WeakStatusObserver(value: token) }
     token.onCancel { [weak self] in
       self?.queue.async { [weak self] in self?.statusObservers.removeValue(forKey: id) }
     }
-    refreshIdleStatus()
     return token
   }
 
@@ -239,9 +256,12 @@ final class MacCameraCapturePlugin: CaptureSourcePlugin, @unchecked Sendable {
 
   private func refreshIdleStatuses() {
     let devices = allDevices()
+    let connectedIDs = Set(devices.map { Self.id(for: $0.uniqueID) })
     let quarantined = ambiguousUIDs.map(Self.id)
-    let activeIDs = Set(devices.map { Self.id(for: $0.uniqueID) }).union(sessions.keys).union(quarantined)
+    let activeIDs = connectedIDs.union(sessions.keys).union(quarantined)
     statuses = statuses.filter { activeIDs.contains($0.key) }
+    diagnostics = diagnostics.filter { connectedIDs.contains($0.key) || sessions[$0.key] != nil }
+    availableFallbacks = availableFallbacks.filter { connectedIDs.contains($0.key) }
     for id in quarantined where sessions[id] == nil {
       var status = CaptureDeviceStatus()
       status.problems = [DeviceProblem(id: "ambiguous-camera-id", severity: .warning,
@@ -258,8 +278,10 @@ final class MacCameraCapturePlugin: CaptureSourcePlugin, @unchecked Sendable {
     if let diagnostics { self.diagnostics[id] = diagnostics }
     guard statuses[id] != status else { return }
     statuses[id] = status
-    let observations = statusObservers.values.compactMap(\.value)
-    Task { @MainActor in for observation in observations { observation.deliver(id, status) } }
+    let observations = Array(statusObservers.values)
+    DispatchQueue.main.async {
+      for observation in observations { observation.value?.deliver(id, status) }
+    }
   }
 
   func publishSessionStatus(_ status: CaptureDeviceStatus, id: String, diagnostics: DeviceDiagnostics,
@@ -280,8 +302,21 @@ final class MacCameraCapturePlugin: CaptureSourcePlugin, @unchecked Sendable {
     }
   }
 
-  func rememberFallbacks(_ pixels: [OSType], modeID: String, deviceID: String) {
-    queue.async { [weak self] in self?.availableFallbacks[deviceID, default: [:]][modeID] = Set(pixels) }
+  func rememberFallbacks(_ pixels: [OSType], modeID: String, deviceID: String, device: ObjectIdentifier, token: UUID) {
+    queue.async { [weak self] in
+      guard let self, self.sessions[deviceID]?.token == token else { return }
+      var cached = self.availableFallbacks[deviceID] ?? DeviceFallbacks(device: device)
+      if cached.device != device { cached = DeviceFallbacks(device: device) }
+      cached.byMode[modeID] = Set(pixels)
+      self.availableFallbacks[deviceID] = cached
+    }
+  }
+
+  private func fallbackPixels(device: AVCaptureDevice, deviceID: String, modeID: String) -> Set<OSType>? {
+    withQueue {
+      guard let cached = availableFallbacks[deviceID], cached.device == ObjectIdentifier(device) else { return nil }
+      return cached.byMode[modeID]
+    }
   }
 
   func endSession(_ id: String, token: UUID) {
@@ -289,7 +324,11 @@ final class MacCameraCapturePlugin: CaptureSourcePlugin, @unchecked Sendable {
       guard sessions[id]?.token == token else { return }
       sessions[id] = nil
       if discovery != nil, let device = device(id) { publish(Self.baseStatus(device, running: false), id: id) }
-      else { statuses[id] = nil }
+      else {
+        statuses[id] = nil
+        diagnostics[id] = nil
+        availableFallbacks[id] = nil
+      }
     }
   }
 
@@ -424,7 +463,7 @@ final class MacCameraCapturePlugin: CaptureSourcePlugin, @unchecked Sendable {
       let savedMode = VendorCaptureMode(selection: selected)
       let target = savedMode.flatMap { saved in catalog.first { $0.id == saved.formatID } } ?? active
       let fallbackScope = Self.fallbackScope(formatID: target.id, duration: savedMode?.duration)
-      let available = withQueue { availableFallbacks[deviceID]?[target.id] }
+      let available = fallbackPixels(device: device, deviceID: deviceID, modeID: target.id)
       let native = PixelFormatTable.entry(for: PixelFormatID(rawValue: target.pixel))
       let pixels = native?.captureQualified == true ? [] : Self.fallbackPixels.filter { available?.contains($0.rawValue) ?? true }
       let candidate = selectionForFallback(deviceID)
@@ -479,7 +518,7 @@ final class MacCameraCapturePlugin: CaptureSourcePlugin, @unchecked Sendable {
           let requested = try resolveMode(for: device, id: deviceID, timing: .automatic)
           guard PixelFormatTable.entry(for: PixelFormatID(rawValue: requested.mode.pixel))?.captureQualified != true,
             let pixel = Self.parseFallback(value, modeID: Self.fallbackScope(formatID: requested.mode.id, duration: requested.duration)),
-            withQueue({ availableFallbacks[deviceID]?[requested.mode.id]?.contains(pixel) }) != false else {
+            fallbackPixels(device: device, deviceID: deviceID, modeID: requested.mode.id)?.contains(pixel) != false else {
             throw PluginError.unsupported("Choose a delivery conversion for the selected Capture Format.")
           }
         }

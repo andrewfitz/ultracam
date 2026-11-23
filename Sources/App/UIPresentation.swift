@@ -86,6 +86,7 @@ struct UIAudioLevels: Sendable, Equatable {
 
 struct UICameraRecording: Sendable, Equatable {
   var status: UIRecordingStatus = .idle
+  var isStarting = false
   var elapsed: TimeInterval = 0
   var fileBytes: Int64 = 0
   var megabitsPerSecond: Double = 0
@@ -105,6 +106,7 @@ struct UICameraRecording: Sendable, Equatable {
   var takeFallbackFrom: RecordingCodec?
   /// The rolling take burns the camera's LUT in, as decided at its start. Stale while idle.
   var takeBurnsInLUT = false
+  var failedToStart = false
   var failed = false
   var error: String?
   /// A note on the take that isn't an error, such as audio re-synced to the picture.
@@ -221,6 +223,10 @@ struct UICameraSnapshot: Sendable, Equatable, Identifiable {
   var automaticStatus: String?
   /// Automatic mode tried to start this camera and failed; Retry is available.
   var automaticStartFailed = false
+  var acceptsAutomaticDemand: Bool {
+    enabled && automaticStart && !captureManuallyStopped && !automaticStartFailed &&
+      (running || deviceAvailable || captureAuthorizationRequestable || captureAuthorizationPending)
+  }
   var timecode: String?
   var audio = UIAudioLevels()
   /// How many channels the expanded strip's meter shows (Settings › Audio).
@@ -271,6 +277,7 @@ struct UIUnexpectedStop: Sendable, Equatable {
 /// Program moved off a camera that lost its signal. It stays until it's acknowledged.
 struct UIProgramMove: Sendable, Equatable {
   enum Cause: Sendable, Equatable { case signalLost, stopped, notReady }
+  var fromID: String
   var from: String
   var to: String
   /// Hold was on: loss overrode it once, and it stays on for the new shot.
@@ -472,7 +479,7 @@ enum UITileState: Sendable, Equatable {
 }
 
 enum UIStripState: String, Sendable, Equatable {
-  case ready, recording, paused, finishing, saved, noFolder, failed, recordingNoSignal, stopped, waiting, updating
+  case ready, starting, recording, paused, finishing, saved, noFolder, failed, recordingNoSignal, stopped, waiting, updating
 }
 
 enum UITone: String, Sendable, Equatable { case neutral, positive, warning, critical, onAir }
@@ -785,8 +792,8 @@ struct UISessionPresentation: Sendable, Equatable {
 }
 
 extension UISessionPresentation {
-  /// A camera is on air or rolling: no time to ask anyone anything.
-  var isLive: Bool { streamActive || cameras.contains { $0.tally.isRed || $0.pauseTitle != nil } }
+  /// An output is in use or a take is active, even during a picture outage.
+  var isLive: Bool { streamActive || outputInUse || cameras.contains(where: \.recordButtonActive) }
   /// The camera the menu bar preview shows: the one a meeting sees, then one a meeting has open,
   /// then the first running. Never the window's selection (D7): the menu has none.
   var previewCamera: UICameraPresentation? {
@@ -963,6 +970,7 @@ enum UIPresentationBuilder {
   }
 
   static func tileState(for camera: UICameraSnapshot) -> UITileState {
+    if camera.captureAuthorizationPending { return .connecting }
     if !camera.deviceAvailable && !camera.running { return .deviceMissing }
     guard camera.running else { return .stopped }
     switch camera.signal {
@@ -984,6 +992,7 @@ enum UIPresentationBuilder {
     case .paused: return recording.failed ? .failed : .paused
     case .recording:
       if recording.failed { return .failed }
+      if recording.isStarting { return .starting }
       if case .noSignal = camera.signal { return .recordingNoSignal }
       return camera.applying ? .updating : .recording
     case .idle:
@@ -1010,6 +1019,8 @@ enum UIPresentationBuilder {
 
     let (statusBadge, statusTone): (String, UITone) = {
       if !camera.running {
+        if !camera.enabled { return ("Disabled", .neutral) }
+        if camera.captureAuthorizationPending { return ("Waiting for capture access", .neutral) }
         // "No input" when none was ever chosen, as the picture says; "Input disconnected" when it's unplugged.
         if !camera.deviceAvailable { return (camera.inputName == nil ? "No input" : "Input disconnected", .warning) }
         // The picture offers Retry; the badge names the same problem instead of a neutral "Stopped".
@@ -1028,6 +1039,7 @@ enum UIPresentationBuilder {
     var recordDetail = ""
     var recordTone: UITone = .neutral
     switch strip {
+    case .starting: recordTitle = "Starting recording…"
     // Every clock on screen uses the short form ("12:31", "1:02:47").
     case .recording, .updating: recordTitle = "Recording"; recordDetail = UIFormat.shortElapsed(rec.elapsed); recordTone = .critical
     case .recordingNoSignal:
@@ -1048,6 +1060,9 @@ enum UIPresentationBuilder {
         // Say what to do, not the writer's error text; Details still has that.
         recordTitle = "Disk full"
         recordDetail = "Free space on \(drive(for: camera, in: session)?.name ?? "the drive") or choose another folder"
+      } else if rec.failedToStart {
+        recordTitle = "Couldn't start recording"
+        recordDetail = rec.error ?? "An error occurred while preparing the take."
       } else {
         recordTitle = "Take ended early"
         recordDetail = takeSavedLine(camera) ?? rec.error ?? "The take ended with an error."
@@ -1118,10 +1133,11 @@ enum UIPresentationBuilder {
     let elapsedShort = UIFormat.shortElapsed(rec.elapsed)
     var labelParts = [camera.name]
     if let label = tally.label { labelParts.append(label) }
-    if isRecording { labelParts.append(rec.status == .paused ? "recording paused at \(elapsedShort)" : "recording \(elapsedShort)") }
+    if strip == .starting { labelParts.append("starting recording") }
+    else if isRecording { labelParts.append(rec.status == .paused ? "recording paused at \(elapsedShort)" : "recording \(elapsedShort)") }
     if tile != .live { labelParts.append(statusBadge) }
     // The take's audio warns only when it needs a look: an over, or a true peak at −1 dBTP or above.
-    let takeAudio = isRecording || strip == .saved ? rec.audio : nil
+    let takeAudio = (isRecording && !rec.isStarting) || strip == .saved ? rec.audio : nil
     let audioNote = takeAudio.flatMap { $0.needsAttention ? $0.note : nil }
     // A saved take's losses are in its detail line; the writer's sentence is for Diagnostics.
     let takeNote = strip == .saved && rec.droppedFrames > 0 ? nil : rec.note
@@ -1139,10 +1155,10 @@ enum UIPresentationBuilder {
       statusBadge: statusBadge, statusTone: statusTone,
       recordTitle: recordTitle, recordDetail: recordDetail, recordTone: recordTone,
       recordButtonActive: recordButtonActive, recordButtonEnabled: recordButtonEnabled, recordButtonHelp: recordHelp,
-      pauseTitle: rec.status == .recording ? "Pause" : rec.status == .paused ? "Resume" : nil,
-      sizeLine: isRecording ? (rec.fileBytes > 0 ? UIFormat.bytes(rec.fileBytes) : "—") : nil,
+      pauseTitle: rec.status == .recording && !rec.isStarting ? "Pause" : rec.status == .paused ? "Resume" : nil,
+      sizeLine: isRecording && !rec.isStarting ? (rec.fileBytes > 0 ? UIFormat.bytes(rec.fileBytes) : "—") : nil,
       // A green "0 dropped" doesn't sit beside a take that's losing its picture.
-      dropsLine: isRecording ? (strip == .recordingNoSignal ? "Losing frames"
+      dropsLine: isRecording && !rec.isStarting ? (strip == .recordingNoSignal ? "Losing frames"
         : rec.droppedFrames > 0 ? "\(rec.droppedFrames) dropped" : "0 dropped") : nil,
       dropsWarning: rec.droppedFrames > 0 || strip == .recordingNoSignal,
       folderLine: rec.folderPath.map { ($0 as NSString).abbreviatingWithTildeInPath } ?? "No recording folder",
@@ -1156,7 +1172,7 @@ enum UIPresentationBuilder {
       cutEnabled: session.programAvailable && canTakeCut(camera) && session.onAirID != camera.id,
       cutHelp: cutHelp(camera, in: session),
       chips: chips, processing: camera.processing, applying: camera.applying,
-      canStart: !camera.running && !camera.captureAuthorizationPending &&
+      canStart: camera.enabled && !camera.running && !camera.captureAuthorizationPending &&
         (camera.deviceAvailable || camera.captureAuthorizationRequestable),
       canStop: camera.running || camera.captureAuthorizationPending,
       stopNeedsConfirmation: camera.running && !stopConsequences.isEmpty,
@@ -1213,13 +1229,16 @@ enum UIPresentationBuilder {
     }
     switch strip {
     case .recording, .updating, .recordingNoSignal: return nil
+    case .starting: return "Starting…"
     case .paused: return "Paused"
     case .saved: return "Saved"
     case .finishing: return "Saving…"
     case .stopped: return badge
     case .waiting: return badge
     case .noFolder: return "No folder"
-    case .failed: return diskFull(camera, in: session) ? "Disk full" : "Ended early"
+    case .failed:
+      if diskFull(camera, in: session) { return "Disk full" }
+      return camera.recording.failedToStart ? "Couldn't record" : "Ended early"
     case .ready: return "Ready"
     }
   }
@@ -1304,12 +1323,18 @@ enum UIPresentationBuilder {
     }
       .joined(separator: ", ")
     let paused = recording.filter { $0.recording.status == .paused }.count
-    let rollingCount = recording.count - paused
+    let starting = recording.filter(\.recording.isStarting).count
+    let readyToPause = recording.count - starting
+    let rollingCount = readyToPause - paused
     let recordingSummary: String
     if recording.isEmpty { recordingSummary = drivesLine.isEmpty ? "Not recording" : "Not recording, \(drivesLine)" }
+    else if starting == recording.count {
+      recordingSummary = "Starting recording…" + (drivesLine.isEmpty ? "" : " \(drivesLine)")
+    }
     else {
-      let count = recording.count > 1 ? (paused == recording.count ? "\(paused) paused " : paused > 0 ? "\(rollingCount), \(paused) paused " : "\(recording.count) ") : (paused > 0 ? "paused " : "")
-      recordingSummary = "REC \(count)\(elapsed)" + (drivesLine.isEmpty ? "" : ", \(drivesLine)")
+      let count = readyToPause > 1 ? (paused == readyToPause ? "\(paused) paused " : paused > 0 ? "\(rollingCount), \(paused) paused " : "\(readyToPause) ") : (paused > 0 ? "paused " : "")
+      recordingSummary = ["REC \(count)\(elapsed)", starting > 0 ? "\(starting) starting" : nil,
+        drivesLine.isEmpty ? nil : drivesLine].compactMap { $0 }.joined(separator: ", ")
     }
 
     // The worst problem comes first in the bar, with its action, so it's one click.
@@ -1317,7 +1342,7 @@ enum UIPresentationBuilder {
     // What isn't wrong yet but needs a click (an extension to install, the alerts offer)
     // follows the problems in the bar's list. It stays out of `problems`: the menu bar's
     // count, its icon and the alerts are for problems alone.
-    let offersAlerts = session.offerAlerts && !session.stream.active && !cameras.contains { $0.tally.isRed || $0.pauseTitle != nil }
+    let offersAlerts = session.offerAlerts && !session.stream.active && !outputInUse && recording.isEmpty
     let setup = setupRows(session) + (offersAlerts ? [alertsOffer] : [])
     let listed = problems + setup
     var segments: [UIStatusSegment] = []
@@ -1345,7 +1370,7 @@ enum UIPresentationBuilder {
       segments.append(programSegment(session, onAirName: programSource?.name, autoSwitching: autoSwitching, holding: canHoldShot && session.autoHold,
         onAirWord: programSource.map { tally(for: $0, in: session) == .onAir } == true ? "on air" : "in Program"))
     }
-    segments.append(recordingSegment(worstDrive: worstDrive, recording: recording.count, paused: paused, elapsed: elapsed,
+    segments.append(recordingSegment(worstDrive: worstDrive, recording: readyToPause, paused: paused, starting: starting, elapsed: elapsed,
       codec: session.codec.title, summary: recordingSummary))
     // Audio can only be judged from a picture with a signal; a running camera without HDMI has none.
     let live = session.cameras.filter(isLive)
@@ -1396,8 +1421,8 @@ enum UIPresentationBuilder {
     presentation.setupRows = setup
     presentation.virtualCameras = virtualCameras
     presentation.askBeforeEnding = session.askBeforeEnding
-    presentation.canPauseAll = !recording.isEmpty
-    presentation.pauseAllTitle = !recording.isEmpty && paused == recording.count ? "Resume All" : "Pause All"
+    presentation.canPauseAll = readyToPause > 0
+    presentation.pauseAllTitle = readyToPause > 0 && paused == readyToPause ? "Resume All" : "Pause All"
     return presentation
   }
 
@@ -1450,7 +1475,7 @@ enum UIPresentationBuilder {
     let program = session.programAvailable ? [UIVirtualCamera(id: "program", name: "Ultracam · Program", cameraID: nil,
       inUse: session.programInUse, clientLine: session.programClientLine,
       format: session.cameras.first { $0.id == session.onAirID }?.outputFormat)] : []
-    return program + session.cameras.map {
+    return program + session.cameras.filter(\.enabled).map {
       UIVirtualCamera(id: $0.id, name: "Ultracam · \($0.name)", cameraID: $0.id, inUse: $0.inUse, clientLine: $0.clientLine, format: $0.outputFormat)
     }
   }
@@ -1493,16 +1518,17 @@ enum UIPresentationBuilder {
 
   /// The session's format rides along at full width only, read-only: it's set in the
   /// popover this segment opens, and no strip repeats it.
-  private static func recordingSegment(worstDrive: UIDrive?, recording: Int, paused: Int, elapsed: String, codec: String,
+  private static func recordingSegment(worstDrive: UIDrive?, recording: Int, paused: Int, starting: Int, elapsed: String, codec: String,
     summary: String) -> UIStatusSegment {
     var state: [UIStatusPiece]
     let rolling = recording - paused
     if recording == 0 {
-      state = [.dim("Not recording")]
+      state = [.dim(starting > 0 ? "Starting recording…" : "Not recording")]
     } else {
       let clock = UIStatusPiece.value([UIValuePart(number: elapsed)])
       state = rolling > 0 ? [.recordingDot, .dim(rolling > 1 ? "REC \(rolling)" : "REC"), clock] : [clock]
       if paused > 0 { state += [.pausedGlyph, .strong("\(paused)")] }
+      if starting > 0 { state += [.dim("\(starting) starting")] }
     }
     let format: [UIStatusPiece] = [.dim(codec)]
     // A full drive says so: it has no time to show.
@@ -1576,10 +1602,10 @@ enum UIPresentationBuilder {
 
   private static func menuBarIcon(_ session: UISessionSnapshot, problems: [UIProblem]) -> UIMenuBarIcon {
     if !problems.isEmpty { return .attention }
-    if session.cameras.contains(where: { $0.recording.status == .recording }) { return .recording }
+    if session.cameras.contains(where: { $0.recording.status == .recording && !$0.recording.isStarting }) { return .recording }
     let running = session.cameras.filter(\.running)
     guard !running.isEmpty else {
-      return session.cameras.contains(where: \.automaticStart) ? .waiting : .stopped
+      return session.cameras.contains(where: \.acceptsAutomaticDemand) ? .waiting : .stopped
     }
     if running.allSatisfy({ $0.signal == .noSignal }) { return .noSignal }
     // The camera a meeting sees, not the window's selection (D7): Program's, then one in use.

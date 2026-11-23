@@ -94,25 +94,42 @@ monitor_kit_package_build() {
 
 # Prints, one per line, why a swift test log does not account for every test: a SwiftPM or
 # runtime error, a crash, a case that started and never finished, or an expected bundle
-# that never finished. Prints nothing for a complete log. $2 overrides the bundle list.
+# that never completed. A filtered retry may legitimately have empty bundles.
 monitor_kit_log_problems() {
-  LC_ALL=C awk -v bundles="${2:-$monitor_kit_test_bundles}" '
+  LC_ALL=C awk -v bundles="${2:-$monitor_kit_test_bundles}" -v allow_empty="${3:-0}" '
     # Buffered benchmark output can share a line with an XCTest marker.
-    /Test Case \047-\[[^ ]+ [^]]+\]\047 started\./ { started++ }
-    /Test Case \047-\[[^ ]+ [^]]+\]\047 (passed|failed|skipped) \(/ { ended++ }
-    /Test Suite \047[^ ]+\.xctest\047 started at / { suites++ }
+    match($0, /Test Case \047-\[[^ ]+ [^]]+\]\047 started\./) {
+      split(substr($0, RSTART, RLENGTH), marker, "\047")
+      started[marker[2]]++
+      split(substr(marker[2], 3), identity, ".")
+      cases_in_bundle[identity[1]]++
+    }
+    match($0, /Test Case \047-\[[^ ]+ [^]]+\]\047 (passed|failed|skipped) \(/) {
+      split(substr($0, RSTART, RLENGTH), marker, "\047")
+      ended[marker[2]]++
+    }
+    match($0, /Test Suite \047[^ ]+\.xctest\047 started at /) {
+      split(substr($0, RSTART, RLENGTH), marker, "\047")
+      sub(/\.xctest$/, "", marker[2]); suites[marker[2]]++
+    }
     match($0, /Test Suite \047[^ ]+\.xctest\047 (passed|failed) at /) {
-      split(substr($0, RSTART, RLENGTH), marker, " ")
-      name = marker[3]; gsub(/\047|\.xctest/, "", name); finished[name] = 1; done++
+      split(substr($0, RSTART, RLENGTH), marker, "\047")
+      sub(/\.xctest$/, "", marker[2]); finished[marker[2]]++
     }
     /^error: |Exited with|unexpected signal|Fatal error|fatal error:|Restarting after unexpected exit|^\342\234\230 / {
       if (errors++ < 3) print "error line: " substr($0, 1, 300)
     }
     END {
-      if (started != ended) print started - ended " test case(s) started and never finished"
-      if (suites != done) print suites - done " test bundle(s) started and never finished"
+      for (test in started) if (started[test] != 1 || ended[test] != 1) print "incomplete or repeated test case " test
+      for (test in ended) if (!(test in started)) print "test case finished without starting: " test
       n = split(bundles, expected, " ")
-      for (i = 1; i <= n; i++) if (!(expected[i] in finished)) print "test bundle " expected[i] " never finished"
+      if (!n) print "no expected test bundles"
+      for (i = 1; i <= n; i++) {
+        name = expected[i]
+        if (!finished[name]) print "test bundle " name " never finished"
+        else if (suites[name] != 1 || finished[name] != 1) print "incomplete or repeated test bundle " name
+        else if (!allow_empty && !cases_in_bundle[name]) print "test bundle " name " ran no cases"
+      }
     }' "$1"
 }
 # Prints cases with the given result as Module.Class/test. Use the marker itself
@@ -124,7 +141,7 @@ monitor_kit_cases_with_result() {
 }
 # Prints the failed cases of a log as Module.Class/test, sorted.
 monitor_kit_failed_cases() {
-  monitor_kit_cases_with_result "$1" failed | sort -u
+  monitor_kit_cases_with_result "$1" failed | LC_ALL=C sort -u
 }
 # Prints the skipped cases of a log, sorted. Skips are expected on hosts without
 # optional platform capabilities (for example Metal), but remain part of the
@@ -173,16 +190,18 @@ monitor_kit_package_test() {
   if [[ $rc -eq 0 ]]; then
     problems="$(monitor_kit_log_problems "$log")"
     [[ -z "$problems" ]] || { printf 'MonitorKit tests exited 0 but the run is incomplete: %s\n' "$problems" >> "$log"; return 1; }
+    [[ -z "$(monitor_kit_failed_cases "$log")" ]] || { echo 'MonitorKit tests exited 0 despite a failed case' >> "$log"; return 1; }
   else
     plan="$(monitor_kit_retry_plan "$log")" || { printf '%s\n' "$plan" >> "$log"; return 1; }
     printf 'FLAKY (retrying once): %s\n' $plan >> "$log"
     filter="^($(printf '%s\n' "$plan" | sed 's/\./\\./g' | paste -sd '|' -))$"
     rc=0
     "${monitor_kit_env[@]}" xcrun swift test "${test_args[@]}" --skip-build --filter "$filter" > "$retry_log" 2>&1 || rc=$?
-    problems="$(monitor_kit_log_problems "$retry_log")"
-    passed="$(monitor_kit_cases_with_result "$retry_log" passed | awk 'END { print NR }')"
-    if [[ $rc -ne 0 || -n "$problems" || -n "$(monitor_kit_failed_cases "$retry_log")" || "$passed" -ne "$(printf '%s\n' "$plan" | wc -l)" ]]; then
-      printf 'MonitorKit retry failed (exit %s, %s of the retried cases passed): %s\n' "$rc" "$passed" "$retry_log" >> "$log"
+    problems="$(monitor_kit_log_problems "$retry_log" '' 1)"
+    passed="$(monitor_kit_cases_with_result "$retry_log" passed | LC_ALL=C sort)"
+    if [[ $rc -ne 0 || -n "$problems" || "$passed" != "$plan" ||
+          -n "$(monitor_kit_failed_cases "$retry_log")" || -n "$(monitor_kit_skipped_cases "$retry_log")" ]]; then
+      printf 'MonitorKit retry failed (exit %s, expected exactly the planned cases to pass): %s\n' "$rc" "$retry_log" >> "$log"
       [[ -z "$problems" ]] || printf '%s\n' "$problems" >> "$log"
       return 1
     fi
@@ -316,6 +335,8 @@ STUB
   # The retry exits 0 but never ran the case (a filter that matched nothing).
   { bundle MonitorKitTests passed; bundle MonitorKitAudioTests passed; } > "$dir/retry.log"
   scenario 'retry that runs nothing' 1 0 1 2
+  { bundle MonitorKitTests passed ContractTests/testA/passed; bundle MonitorKitAudioTests passed; } > "$dir/retry.log"
+  scenario 'retry that passes the wrong case' 1 0 1 2
   # A timing failure plus a crash later in the bundle: never retried (the audited hole).
   { bundle MonitorKitTests crash "$bench/failed" ContractTests/testA/started
     bundle MonitorKitAudioTests passed RealtimeTests/testX/passed; } > "$dir/first.log"
@@ -325,8 +346,12 @@ STUB
   # A crash that printed no signal line still leaves a case and a bundle unfinished.
   { bundle MonitorKitTests failed "$bench/failed" | grep -v "^Test Suite 'MonitorKitTests.xctest' failed"
     bundle MonitorKitAudioTests passed RealtimeTests/testX/started; } > "$dir/first.log"
-  expect "$(monitor_kit_log_problems "$dir/first.log" | wc -l | tr -d ' ')" 3 'unfinished case and bundles are reported'
+  expect "$(monitor_kit_log_problems "$dir/first.log" | wc -l | tr -d ' ')" 2 'unfinished case and bundle are reported'
   scenario 'timing failure beside an unfinished case' 1 0 1 1
+  { bundle MonitorKitTests failed "$bench/failed" ContractTests/testA/started
+    bundle MonitorKitAudioTests passed RealtimeTests/testX/passed
+    echo "Test Case '-[MonitorKitTests.ContractTests testB]' passed (0.010 seconds)."; } > "$dir/first.log"
+  scenario 'different test starts and ends do not cancel each other' 1 0 1 1
   # A bundle that never ran at all.
   bundle MonitorKitTests failed "$bench/failed" > "$dir/first.log"
   scenario 'timing failure with a bundle missing' 1 0 1 1
@@ -339,10 +364,10 @@ STUB
   expect "$(grep -c '^not retried, not a timing budget: MonitorKitAudioTests.RealtimeTests/testResetNeverReappearsWhileProcessRuns$' "$dir/run.log")" 1 'race failure is named'
   # An allowlisted case retries only when every assertion it failed is a timing budget.
   plan_case() {  # plan_case LABEL BUNDLE CASE EXPECTED_RC EXPECTED_FIRST_LINE (cut to 200)
-    local out got=0 b
+    local out got=0
     { bundle "$2" failed "$3"
-      for b in MonitorKitTests MonitorKitAudioTests; do [[ "$b" == "$2" ]] || bundle "$b" passed; done; } > "$dir/first.log"
-    out="$(monitor_kit_retry_plan "$dir/first.log")" || got=$?
+      bundle MonitorKitAudioTests passed RealtimeTests/testX/passed; } > "$dir/first.log"
+    out="$(monitor_kit_retry_plan "$dir/first.log" "$2 MonitorKitAudioTests")" || got=$?
     expect "$got" "$4" "$1: retried?"
     expect "$(printf '%s\n' "$out" | head -1 | cut -c1-200)" "$5" "$1: plan"
   }
@@ -378,19 +403,22 @@ STUB
   plan_case 'the handoff throughput floor' MonitorKitUITests "$handoff/failed:floor" 1 \
     "$(printf '%s: %s: %s' "$refused" "MonitorKitUITests.$handoff" 'XCTAssertGreaterThan failed: ("812") is not greater than ("10000")' | cut -c1-200)"
   # End to end: the pixel identity fails once and would pass alone; it is never retried.
-  { bundle MonitorKitTests failed "$inline/failed:pixels"; bundle MonitorKitAudioTests passed; } > "$dir/first.log"
+  { bundle MonitorKitTests failed "$inline/failed:pixels"; bundle MonitorKitAudioTests passed RealtimeTests/testX/passed; } > "$dir/first.log"
   { bundle MonitorKitTests passed "$inline/passed"; bundle MonitorKitAudioTests passed; } > "$dir/retry.log"
   scenario 'pixel identity failure' 1 0 1 1
   expect "$(grep -c "^$refused: MonitorKitTests.$inline: XCTAssertEqual" "$dir/run.log")" 1 'pixel failure is named'
   # Its GPU-time budget alone is retried.
-  { bundle MonitorKitTests failed "$inline/failed:inline"; bundle MonitorKitAudioTests passed; } > "$dir/first.log"
+  { bundle MonitorKitTests failed "$inline/failed:inline"; bundle MonitorKitAudioTests passed RealtimeTests/testX/passed; } > "$dir/first.log"
   scenario 'inline-shader budget flake' 1 0 0 2
   # A non-zero exit with every case passing (a build or tool failure).
-  { bundle MonitorKitTests passed "$bench/passed"; bundle MonitorKitAudioTests passed; } > "$dir/first.log"
+  { bundle MonitorKitTests passed "$bench/passed"; bundle MonitorKitAudioTests passed RealtimeTests/testX/passed; } > "$dir/first.log"
   scenario 'exit without a failed case' 1 0 1 1
   # Exit 0 but a bundle is missing.
   bundle MonitorKitTests passed "$bench/passed" > "$dir/first.log"
   scenario 'exit 0 with a bundle missing' 0 0 1 1
+  # A bundle can finish with zero tests if discovery silently fails.
+  { bundle MonitorKitTests passed "$bench/passed"; bundle MonitorKitAudioTests passed; } > "$dir/first.log"
+  scenario 'exit 0 with an empty bundle' 0 0 1 1
   # The failure report stays short however long the assertion messages are.
   { bundle MonitorKitTests failed "$bench/failed"; bundle MonitorKitAudioTests passed
     head -c 2000000 /dev/zero | tr '\0' 'x'; echo; } > "$dir/big.log"

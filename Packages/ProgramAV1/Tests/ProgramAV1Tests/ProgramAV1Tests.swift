@@ -44,6 +44,34 @@ final class ProgramAV1Tests: XCTestCase {
     XCTAssertEqual(try encoder.encode(next).presentationTimeStamp, step)
   }
 
+  func testRejectsUndersizedNV12PlanesBeforeEncoding() throws {
+    let width = 128, height = 128
+    let duration = CMTime(value: 1, timescale: 30)
+    let encoder = try ProgramAV1Encoder(width: width, height: height, frameDuration: duration, bitrate: 200_000)
+    let lumaBytes = width * height
+    let byteCount = lumaBytes + lumaBytes / 2
+    let bytes = UnsafeMutableRawPointer.allocate(byteCount: byteCount, alignment: 64)
+    defer { bytes.deallocate() }
+    memset(bytes, 128, byteCount)
+    for (plane, shortWidth) in [(0, true), (0, false), (1, true), (1, false)] {
+      var addresses: [UnsafeMutableRawPointer?] = [bytes, bytes.advanced(by: lumaBytes)]
+      var widths = [width, width / 2]
+      var heights = [height, height / 2]
+      var strides = [width, width]
+      if shortWidth { widths[plane] -= 1 }
+      else { heights[plane] -= 1 }
+      var image: CVPixelBuffer?
+      XCTAssertEqual(CVPixelBufferCreateWithPlanarBytes(nil, width, height,
+        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, bytes, byteCount, 2, &addresses, &widths,
+        &heights, &strides, nil, nil, nil, &image), kCVReturnSuccess)
+      let frame = try sample(XCTUnwrap(image), pts: .zero, duration: duration)
+      XCTAssertThrowsError(try encoder.encode(frame)) { error in
+        guard case ProgramAV1Error.invalidInput = error else { return XCTFail("Expected invalid input, received \(error)") }
+      }
+    }
+    XCTAssertEqual(try encoder.encode(input(width, height, y: 100, pts: .zero, duration: duration)).presentationTimeStamp, .zero)
+  }
+
   private func roundTrip(width: Int, height: Int, step: CMTime) throws {
     let encoder = try ProgramAV1Encoder(width: width, height: height, frameDuration: step, bitrate: 20_000_000)
     var decoded = aom_codec_ctx_t()
@@ -108,6 +136,10 @@ final class ProgramAV1Tests: XCTestCase {
       for column in 0..<(width / 2) { uv[row * stride + column * 2] = 86; uv[row * stride + column * 2 + 1] = 180 }
     }
     CVPixelBufferUnlockBaseAddress(image, [])
+    return try sample(image, pts: pts, duration: duration)
+  }
+
+  private func sample(_ image: CVPixelBuffer, pts: CMTime, duration: CMTime) throws -> CMSampleBuffer {
     var format: CMVideoFormatDescription?
     XCTAssertEqual(CMVideoFormatDescriptionCreateForImageBuffer(allocator: nil, imageBuffer: image, formatDescriptionOut: &format), noErr)
     var timing = CMSampleTimingInfo(duration: duration, presentationTimeStamp: pts, decodeTimeStamp: .invalid)

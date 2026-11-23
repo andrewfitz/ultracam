@@ -20,13 +20,9 @@ final class Packed422GPU {
     guard width > 0, width.isMultiple(of: 2), height > 0,
       width <= UInt32.max, height <= UInt32.max, rowBytes <= UInt32.max else { throw Failure.invalidLayout }
     try format.validate(width: width, height: height, rowBytes: rowBytes, dataSize: source.length, alphaRowBytes: alphaRowBytes)
-    guard luma.pixelFormat == .r16Uint, chroma.pixelFormat == .rg16Uint,
-      luma.width == width, luma.height == height,
-      chroma.width == width / 2, chroma.height == height,
-      luma.usage.contains(.shaderWrite), chroma.usage.contains(.shaderWrite),
-      source.device.registryID == pipeline.device.registryID,
-      luma.device.registryID == pipeline.device.registryID,
-      chroma.device.registryID == pipeline.device.registryID else { throw Failure.invalidTexture }
+    let device = pipeline.device
+    guard commandBuffer.device === device, source.device === device,
+      Self.validOutputs(luma: luma, chroma: chroma, width: width, height: height, device: device) else { throw Failure.invalidTexture }
     guard let encoder = commandBuffer.makeComputeCommandEncoder() else { throw Failure.encoderUnavailable }
     var parameters = SIMD4<UInt32>(UInt32(width), UInt32(height), UInt32(rowBytes), format == .yuvs ? 1 : 0)
     encoder.setComputePipelineState(pipeline)
@@ -36,6 +32,14 @@ final class Packed422GPU {
     encoder.dispatchThreads(MTLSize(width: width / 2, height: height, depth: 1),
       threadsPerThreadgroup: MTLSize(width: min(32, pipeline.threadExecutionWidth), height: 1, depth: 1))
     encoder.endEncoding()
+  }
+
+  static func validOutputs(luma: MTLTexture, chroma: MTLTexture, width: Int, height: Int, device: MTLDevice) -> Bool {
+    luma.device === device && chroma.device === device &&
+      luma.textureType == .type2D && chroma.textureType == .type2D &&
+      luma.pixelFormat == .r16Uint && chroma.pixelFormat == .rg16Uint &&
+      luma.width == width && luma.height == height && chroma.width == width / 2 && chroma.height == height &&
+      (luma.usage.isEmpty || luma.usage.contains(.shaderWrite)) && (chroma.usage.isEmpty || chroma.usage.contains(.shaderWrite))
   }
 
   // Byte order: Apple's CoreVideo/CVPixelBuffer.h (2vuy/yuvs).

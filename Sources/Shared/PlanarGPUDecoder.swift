@@ -59,7 +59,13 @@ final class PlanarGPUDecoder {
   func encode(luma: MTLTexture, chroma: MTLTexture, destination: MTLTexture,
     format: PlanarGPUFormat, location: PlanarGPUChromaLocation, range: Colorimetry.Range,
     command: MTL4CommandBuffer, residency: MTLResidencySet) throws -> Resources {
-    guard luma.pixelFormat == format.lumaFormat, chroma.pixelFormat == format.chromaFormat,
+    guard command.device === device, residency.device === device,
+      luma.device === device, chroma.device === device, destination.device === device,
+      luma.textureType == .type2D, chroma.textureType == .type2D, destination.textureType == .type2D,
+      luma.usage.isEmpty || luma.usage.contains(.shaderRead),
+      chroma.usage.isEmpty || chroma.usage.contains(.shaderRead),
+      destination.usage.isEmpty || destination.usage.contains(.shaderWrite),
+      luma.pixelFormat == format.lumaFormat, chroma.pixelFormat == format.chromaFormat,
       chroma.width == luma.width / 2 + luma.width % 2,
       chroma.height == luma.height / format.verticalSubsampling + (luma.height % format.verticalSubsampling == 0 ? 0 : 1),
       destination.pixelFormat == .rgba32Float, destination.width == luma.width, destination.height == luma.height else { throw PlanarGPUError.textureMismatch }
@@ -74,12 +80,12 @@ final class PlanarGPUDecoder {
     guard let buffer = device.makeBuffer(bytes: &parameters, length: MemoryLayout<SIMD4<Float>>.stride * parameters.count, options: .storageModeShared) else { throw PlanarGPUError.invalidLayout }
     let td = MTL4ArgumentTableDescriptor(); td.maxBufferBindCount = 1; td.maxTextureBindCount = 3
     let arguments = try device.makeArgumentTable(descriptor: td)
+    guard let encoder = command.makeComputeCommandEncoder() else { throw PlanarGPUError.invalidLayout }
     arguments.setAddress(buffer.gpuAddress, index: 0)
     for (index, texture) in [luma, chroma, destination].enumerated() {
       arguments.setTexture(texture.gpuResourceID, index: index); residency.addAllocation(texture)
     }
     residency.addAllocation(buffer)
-    guard let encoder = command.makeComputeCommandEncoder() else { throw PlanarGPUError.invalidLayout }
     encoder.setComputePipelineState(pipeline); encoder.setArgumentTable(arguments)
     encoder.dispatchThreads(threadsPerGrid: MTLSize(width: destination.width, height: destination.height, depth: 1),
       threadsPerThreadgroup: MTLSize(width: pipeline.threadExecutionWidth, height: 1, depth: 1))

@@ -6,7 +6,6 @@ final class CaptureDeviceClaims: @unchecked Sendable {
   private struct Claim { var owners: [String: Set<UUID>]; let shareable: Bool }
   private var claims: [String: Claim] = [:]
   fileprivate func claim(device: CaptureDeviceInfo, ownerID: String, token: UUID) throws {
-    _ = try VendorRegistry.pluginID(for: device.id)
     try lock.withLock {
       if var claim = claims[device.id] {
         guard claim.owners[ownerID]?.contains(token) == true || (claim.shareable && device.shareable) else { throw PluginError.busy("Device already claimed: \(device.id)") }
@@ -23,26 +22,31 @@ final class CaptureDeviceClaims: @unchecked Sendable {
     }
   }
   func makeSession(plugin: any CaptureSourcePlugin, device: CaptureDeviceInfo, ownerID: String) -> any CaptureSession {
-    ClaimedCaptureSession(session: plugin.makeSession(), claims: self, device: device, ownerID: ownerID)
+    ClaimedCaptureSession(session: plugin.makeSession(), claims: self, device: device,
+      pluginID: plugin.descriptor.id, ownerID: ownerID)
   }
 }
 private final class ClaimedCaptureSession: CaptureSession, @unchecked Sendable {
   private let session: any CaptureSession
   private let claims: CaptureDeviceClaims
   private let device: CaptureDeviceInfo
+  private let pluginID: String
   private let ownerID: String
   private let control = NSLock()
   private let token = UUID()
   private var stopped = false
   private var started: CaptureTiming?
-  init(session: any CaptureSession, claims: CaptureDeviceClaims, device: CaptureDeviceInfo, ownerID: String) {
-    self.session = session; self.claims = claims; self.device = device; self.ownerID = ownerID
+  init(session: any CaptureSession, claims: CaptureDeviceClaims, device: CaptureDeviceInfo, pluginID: String, ownerID: String) {
+    self.session = session; self.claims = claims; self.device = device; self.pluginID = pluginID; self.ownerID = ownerID
   }
   var counters: CaptureCounters { session.counters }
   func start(deviceID: String, timing: CaptureTiming, handlers: CaptureHandlers) throws {
     try control.withLock {
       guard !stopped, deviceID == device.id else { throw PluginError.invalidState("Stopped session or mismatched device") }
       if let started { guard started == timing else { throw PluginError.invalidState("Session configuration changed") }; return }
+      guard try VendorRegistry.pluginID(for: deviceID) == pluginID else {
+        throw PluginError.invalidState("Device does not belong to capture plugin: \(pluginID)")
+      }
       try claims.claim(device: device, ownerID: ownerID, token: token)
       do { try session.start(deviceID: deviceID, timing: timing, handlers: handlers); started = timing }
       catch { stopped = true; session.stop(); claims.release(deviceID: device.id, ownerID: ownerID, token: token); throw error }

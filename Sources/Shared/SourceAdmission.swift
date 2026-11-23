@@ -42,6 +42,7 @@ struct SourceAdmissionSnapshot: Sendable {
   let clockBindings: CaptureClockBindings
   let entry: PixelFormatTable.Entry
   let sourceSize: SourceSize
+  private let admittedStage: SourceAdmissionStage
   var formatSignature: String { format.signature }
 
   init(format: SourceFormat, epochID: CaptureEpochID, clockBindings: CaptureClockBindings, stage: SourceAdmissionStage) throws {
@@ -54,13 +55,17 @@ struct SourceAdmissionSnapshot: Sendable {
     try Self.validateRoute(entry: entry, format: format, stage: stage)
     self.format = format; self.epochID = epochID; self.clockBindings = clockBindings; self.entry = entry
     self.sourceSize = sourceSize
+    self.admittedStage = stage
   }
 
   // Run before retention-budget admission, so malformed input is reported as a
   // contract failure rather than capacity loss. No CPU pixel access occurs.
   func validate(_ metadata: SourceAdmissionMetadata, stage: SourceAdmissionStage) throws {
     func refuse(_ reason: String) -> SourceAdmissionRefusal { Self.refusal(format, stage, reason) }
-    try Self.validateRoute(entry: entry, format: format, stage: stage)
+    // Capture admission includes both the LUT and recording GPU routes.
+    if admittedStage != .capture && admittedStage != stage {
+      try Self.validateRoute(entry: entry, format: format, stage: stage)
+    }
     guard metadata.epochID == epochID, metadata.formatSignature == formatSignature else { throw refuse("stale epoch or format signature") }
     guard metadata.width == format.width, metadata.height == format.height, metadata.pixel == format.pixel else { throw refuse("frame dimensions or pixel format differ from declaration") }
     guard metadata.presentationTime.isNumeric, metadata.presentationTime.timescale > 0,

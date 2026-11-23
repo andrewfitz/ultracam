@@ -55,6 +55,7 @@ extension MonitorPass {
 
   /// For drawing inside the host's own Metal 4 render pass: caches the state and
   /// writes this encode's uniforms (encodes nothing), then `draw(with:)` in the pass.
+  /// The feed must use this pass's engine so their resources share a residency set.
   public func prepare(
     frame: MonitorFrame, feed: MonitorFeed, state: MonitorState, viewport: MonitorViewport,
     target: MonitorRenderTargetFormat, submission: MonitorSubmission
@@ -97,8 +98,9 @@ extension MonitorPass {
   }
 
   /// The picture written by a compute kernel into `viewport` of a shader-writable,
-  /// non-sRGB `target`, in its own compute encoder: the same values a render
-  /// pass writes. Every viewport pixel is written (black outside the picture).
+  /// non-sRGB `target` with a floating-point or normalized pixel format, in its
+  /// own compute encoder. Every viewport pixel gets the same value that a render
+  /// pass writes (black outside the picture).
   ///
   /// `sharesTarget` (the default): a consumer barrier first waits for earlier
   /// fragment and dispatch work on the queue, as a render pass into the same target
@@ -137,9 +139,9 @@ extension MonitorPass {
   ) throws {
     pending = nil
     let vp = try Self.checkedViewport(viewport, target)
-    guard target.textureType == .type2D, target.sampleCount == 1,
-      !target.isFramebufferOnly, !target.pixelFormat.isSRGB, target.usage.contains(.shaderWrite) else {
-      throw MonitorKitError.invalidFrame("a compute target must be a single-sample, shader-writable 2D texture and not sRGB-encoded")
+    guard target.textureType == .type2D, target.sampleCount == 1, !target.isFramebufferOnly,
+      !target.pixelFormat.isSRGB, !target.pixelFormat.isIntegerColor, target.usage.contains(.shaderWrite) else {
+      throw MonitorKitError.invalidFrame("a compute target must be a single-sample, shader-writable 2D texture with a floating-point or normalized non-sRGB format")
     }
     try prepareMetal4(
       frame: frame, feed: feed, state: state, viewport: vp,
@@ -189,20 +191,26 @@ extension MonitorPass {
     target: MonitorRenderTargetFormat, submission: MonitorSubmission, compute: Bool
   ) throws {
     pending = nil
+    guard feed.engine === engine else {
+      throw MonitorKitError.invalidFrame("a Metal 4 pass and its feed must use the same MonitorEngine")
+    }
     engine.residency.observe(submission)
     if metal4Table == nil {
       metal4Table = try engine.makeArgumentTable(textures: 7, buffers: 5, label: "MonitorKit pass")
     }
     try prepareState(frame: frame, feed: feed, state: state, viewport: viewport, target: target, compute: compute)
-    if pending!.focusMask != nil {
-      pending!.waitsForMask = feed.maskWritePending(submission)
+    var prepared = pending!
+    pending = nil
+    prepared.uniforms = try writeUniforms(prepared, submission)
+    if prepared.focusMask != nil {
+      prepared.waitsForMask = feed.maskWritePending(submission)
       feed.noteMaskRead(submission)
     }
     // The pass reads the feed's LUTs, mask and Freeze planes, and the planes of
     // a frozen frame the host still draws after its feed let them go.
     feed.updateResidency()
     frame.keepResidentIfReleased(in: engine.residency)
-    pending!.uniforms = try writeUniforms(pending!, submission)
+    pending = prepared
   }
 
   /// This encode's uniforms: into the host's allocator, or a ring slot rewritten

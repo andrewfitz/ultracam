@@ -26,7 +26,18 @@ import SwiftUI
   /// not tall, and sized to its content.
   static func sizes(_ verifier: Verifier) {
     for screen in UIMonitorToolScreens.screens() {
-      guard let size = screen.popover else { continue }
+      guard let size = screen.popover else {
+        let hosted = HostedView(screen.view, size: screen.size, dark: false)
+        let nodes = Accessibility.nodes(in: hosted.host)
+        let labels = nodes.map(\.name)
+        hosted.close()
+        let compact = screen.name == "monitor-tool-bar-collapsed"
+        verifier.check("\(screen.name) offers settings within its width", compact
+          ? nodes.contains(where: { $0.role == "AXMenuButton" }) && !labels.contains("Picture settings")
+          : labels.contains("Guides settings") && labels.contains("Picture settings"),
+          labels.filter { !$0.isEmpty }.joined(separator: ", "), viewDependent: true)
+        continue
+      }
       // The 356-point columns intentionally keep sliders and readouts stable
       // while dragging. Check their actual panel width so unexpected horizontal
       // growth fails, rather than imposing the former 320-point layout's cap.
@@ -99,6 +110,12 @@ import SwiftUI
     var hidden = MonitorFeedPreferences()
     hidden.state.guides.enabled = true
     hidden.state.clipIndicators.enabled = true
+    hidden.state.falseColor.mode = .sixBand
+    let box = Box(hidden)
+    UIMonitorToolBindings.falseColorMode(box.binding).wrappedValue = .off
+    UIMonitorToolBindings.enabling(box.binding, \.state.focus.enabled).wrappedValue = false
+    UIMonitorToolBindings.zebraEnabled(box.binding, 0).wrappedValue = false
+    check("choosing Off on a hidden tool keeps the saved tools hidden", box.value == hidden, "")
     check("clip indicators are off while the tools are hidden", !UIMonitorBridge.clipIndicatorsOn(hidden), "")
     let clipOn = UIMonitorBridge.toggledClipIndicators(in: hidden)
     check("clip indicators on from hidden tools",

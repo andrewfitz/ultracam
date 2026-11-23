@@ -31,6 +31,28 @@ import XCTest
     let duplicates = try VendorRegistry(capture: [RegistryFixture(id: "a", devices: [Self.device("a:x"), Self.device("a:x")])])
     XCTAssertTrue(duplicates.snapshot.devices.isEmpty)
   }
+  @MainActor func testOpaqueSuffixCanStartWithACombiningMark() throws {
+    let id = "a:\u{0301}name:0"
+    let registry = try VendorRegistry(capture: [RegistryFixture(id: "a", devices: [Self.device(id)])])
+    XCTAssertEqual(registry.snapshot.devices.first.map { Array($0.id.utf8) }, Array(id.utf8))
+    XCTAssertEqual(try registry.capturePlugin(for: id).descriptor.id, "a")
+  }
+  @MainActor func testObserverAddedDuringPublicationStartsWithLatestSnapshot() throws {
+    let plugin = RegistryFixture(id: "a", devices: [])
+    let registry = try VendorRegistry(capture: [plugin])
+    var token: VendorRegistryObservation?
+    var received: [String] = []
+    let original = registry.observe { snapshot in
+      guard snapshot.devices.first?.id == "a:first" else { return }
+      plugin.emit([Self.device("a:second")])
+      plugin.emit([Self.device("a:third")])
+      token = registry.observe { received.append(contentsOf: $0.devices.map(\.id)) }
+    }
+    plugin.emit([Self.device("a:first")])
+    plugin.emit([Self.device("a:fourth")])
+    XCTAssertEqual(received, ["a:third", "a:fourth"])
+    withExtendedLifetime((original, token)) {}
+  }
   func testClaimsSharingFailureAndStop() throws {
     let claims = CaptureDeviceClaims()
     let exclusive = Self.device("a:x")
@@ -81,6 +103,17 @@ import XCTest
     first.stop()
     try start(other, device: device)
     other.stop()
+  }
+  func testClaimRejectsDevicesFromAnotherPlugin() throws {
+    let claims = CaptureDeviceClaims()
+    let device = Self.device("a:x")
+    let wrongPlugin = RegistryFixture(id: "b", devices: [device])
+    let wrongSession = claims.makeSession(plugin: wrongPlugin, device: device, ownerID: "wrong")
+    XCTAssertThrowsError(try start(wrongSession, device: device))
+    XCTAssertEqual(wrongPlugin.session.starts, 0)
+    let matchingSession = claimedSession(claims, device: device, owner: "matching")
+    try start(matchingSession, device: device)
+    matchingSession.stop()
   }
   func testStoppedClaimDoesNotStopPluginAgainAtDeinit() throws {
     let claims = CaptureDeviceClaims()
@@ -143,8 +176,12 @@ private final class RegistryFixture: CaptureSourcePlugin, @unchecked Sendable {
 }
 private final class RegistrySession: CaptureSession, @unchecked Sendable {
   var fail = false
+  var starts = 0
   var counters: CaptureCounters { CaptureCounters() }
-  func start(deviceID: String, timing: CaptureTiming, handlers: CaptureHandlers) throws { if fail { throw PluginError.failed("start") } }
+  func start(deviceID: String, timing: CaptureTiming, handlers: CaptureHandlers) throws {
+    starts += 1
+    if fail { throw PluginError.failed("start") }
+  }
   var stops = 0
   func stop() { stops += 1 }
 }

@@ -11,15 +11,18 @@ struct SourceSize: Hashable, Codable, Sendable {
     guard width > 0, height > 0, pixelAspect.numerator > 0 else {
       throw SourceFormatError.invalid("Invalid source size or pixel aspect")
     }
-    let (aspectNumerator, numeratorOverflow) = Int64(width).multipliedReportingOverflow(by: pixelAspect.numerator)
-    let (aspectDenominator, denominatorOverflow) = Int64(height).multipliedReportingOverflow(by: pixelAspect.denominator)
-    guard !numeratorOverflow, !denominatorOverflow, aspectNumerator > 0, aspectDenominator > 0 else {
+    let aspectNumerator = Int128(width) * Int128(pixelAspect.numerator)
+    let aspectDenominator = Int128(height) * Int128(pixelAspect.denominator)
+    // The products can overflow Int64 even when their reduced ratio fits.
+    var divisor = aspectNumerator
+    var remainder = aspectDenominator
+    while remainder != 0 { (divisor, remainder) = (remainder, divisor % remainder) }
+    guard let numerator = Int64(exactly: aspectNumerator / divisor),
+      let denominator = Int64(exactly: aspectDenominator / divisor) else {
       throw SourceFormatError.invalid("Source display aspect overflows Int64")
     }
-    guard let displayAspect = try? Rational(aspectNumerator, aspectDenominator) else {
-      throw SourceFormatError.invalid("Invalid source display aspect")
-    }
-    self.width = width; self.height = height; self.pixelAspect = pixelAspect; self.displayAspect = displayAspect
+    self.width = width; self.height = height; self.pixelAspect = pixelAspect
+    displayAspect = try Rational(numerator, denominator)
   }
   init(_ format: SourceFormat) throws {
     try self.init(width: format.width, height: format.height, pixelAspect: format.pixelAspect)

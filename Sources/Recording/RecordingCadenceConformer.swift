@@ -21,7 +21,6 @@ struct RecordingCadenceConformer<Frame> {
   private var pending: (frame: Frame, pts: CMTime, duration: CMTime, used: Bool)?
   private var origin: CMTime?
   private var nextIndex: Int64 = 0
-  private var outputBase: CMTime = .zero
   private var ended = false
 
   init(frameDuration: CMTime, maximumGapDuration: CMTime = CMTime(value: 10, timescale: 1), maximumJobs: Int = 4096) throws {
@@ -36,8 +35,10 @@ struct RecordingCadenceConformer<Frame> {
     guard Self.valid(pts), Self.valid(duration), duration.value > 0 else { throw Failure.invalidTime }
     if let pending, CMTimeCompare(pts, pending.pts) <= 0 { throw Failure.regression }
     if let pending {
-      let gap = CMTimeSubtract(pts, pending.pts)
-      guard Self.valid(gap), CMTimeCompare(gap, maximumGapDuration) <= 0 else { throw Failure.gapExceeded }
+      let gap = Self.difference(pts, pending.pts)
+      // Cross products fit Int128, even when Core Media must round the time difference.
+      guard gap.numerator * Int128(maximumGapDuration.timescale)
+        <= Int128(maximumGapDuration.value) * gap.denominator else { throw Failure.gapExceeded }
     }
     // Prepare on a value copy: refused gaps never consume the pending frame.
     var candidate = self
@@ -68,7 +69,7 @@ struct RecordingCadenceConformer<Frame> {
   mutating func reanchor() throws -> [Output] {
     var candidate = self
     let outputs = try candidate.finish()
-    candidate.outputBase = try candidate.gridTime(index: candidate.nextIndex)
+    _ = try candidate.nextOutputTime()
     candidate.nextIndex = 0
     candidate.origin = nil
     candidate.ended = false
@@ -79,27 +80,26 @@ struct RecordingCadenceConformer<Frame> {
   private mutating func drain(before bound: CMTime, adding duration: CMTime = .zero) throws -> [Output] {
     guard let origin, var chosen = pending else { return [] }
     var outputs: [Output] = []
-    while true {
-      // Compare (origin + index*duration) with bound using exact integers.
-      var numerator = Int128(bound.value) * Int128(origin.timescale) - Int128(origin.value) * Int128(bound.timescale)
-      var denominator = Int128(bound.timescale) * Int128(origin.timescale)
-      var divisor = Self.gcd(numerator, denominator)
+    // Compare each grid index with the same exact source interval.
+    var (numerator, denominator) = Self.difference(bound, origin)
+    var divisor = Self.gcd(numerator, denominator)
+    numerator /= divisor; denominator /= divisor
+    if duration.value != 0 {
+      let left = try Self.product([numerator, Int128(duration.timescale)])
+      let right = try Self.product([Int128(duration.value), denominator])
+      let (sum, overflow) = left.addingReportingOverflow(right)
+      guard !overflow else { throw Failure.overflow }
+      numerator = sum
+      denominator = try Self.product([denominator, Int128(duration.timescale)])
+      divisor = Self.gcd(numerator, denominator)
       numerator /= divisor; denominator /= divisor
-      if duration.value != 0 {
-        let left = try Self.product([numerator, Int128(duration.timescale)])
-        let right = try Self.product([Int128(duration.value), denominator])
-        let (sum, overflow) = left.addingReportingOverflow(right)
-        guard !overflow else { throw Failure.overflow }
-        numerator = sum
-        denominator = try Self.product([denominator, Int128(duration.timescale)])
-        divisor = Self.gcd(numerator, denominator)
-        numerator /= divisor; denominator /= divisor
-      }
+    }
+    let rhs = try Self.product([numerator, Int128(frameDuration.timescale)])
+    while true {
       let lhs = try Self.product([Int128(nextIndex), Int128(frameDuration.value), denominator])
-      let rhs = try Self.product([numerator, Int128(frameDuration.timescale)])
       guard lhs < rhs else { break }
       guard outputs.count < maximumJobs else { throw Failure.gapExceeded }
-      let time = try gridTime(index: nextIndex)
+      let time = try nextOutputTime()
       outputs.append(Output(frame: chosen.frame, presentationTime: time, duration: frameDuration))
       statistics.emitted += 1
       if chosen.used { statistics.repeated += 1 }
@@ -112,13 +112,23 @@ struct RecordingCadenceConformer<Frame> {
     return outputs
   }
 
-  private func gridTime(index: Int64) throws -> CMTime {
-    let product = Int128(index) * Int128(frameDuration.value)
-    guard let value = Int64(exactly: product) else { throw Failure.overflow }
-    let time = CMTimeAdd(outputBase, CMTime(value: value, timescale: frameDuration.timescale))
-    guard Self.valid(time) else { throw Failure.overflow }
-    return time
+  private func nextOutputTime() throws -> CMTime {
+    let ticks = Int128(statistics.emitted) * Int128(frameDuration.value)
+    if let value = Int64(exactly: ticks) {
+      return CMTime(value: value, timescale: frameDuration.timescale)
+    }
+    // Large timestamps can still be represented exactly at a reduced scale.
+    let scale = Int128(frameDuration.timescale)
+    let divisor = Self.gcd(ticks, scale)
+    guard let value = Int64(exactly: ticks / divisor) else { throw Failure.overflow }
+    return CMTime(value: value, timescale: Int32(scale / divisor))
   }
+
+  private static func difference(_ end: CMTime, _ start: CMTime) -> (numerator: Int128, denominator: Int128) {
+    (Int128(end.value) * Int128(start.timescale) - Int128(start.value) * Int128(end.timescale),
+      Int128(end.timescale) * Int128(start.timescale))
+  }
+
   private static func gcd(_ a: Int128, _ b: Int128) -> Int128 {
     var x = abs(a), y = b
     while y != 0 { (x, y) = (y, x % y) }

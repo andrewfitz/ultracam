@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import Metal
-import MonitorKit
+@testable import MonitorKit
 import MonitorKitCore
 import MonitorKitScopes
 import Synchronization
@@ -450,6 +450,35 @@ final class MTL4Host {
 
 /// The Metal 4 path draws the same pixels as the classic one.
 final class RendererMetal4Tests: XCTestCase {
+  func testTeardownKeepsFrameBackingAliveUntilSubmissionCompletes() throws {
+    try requireMetal4()
+    // A fresh residency set gives the test its own submission timeline.
+    let gpu = try UIGPU()
+    let host = try MTL4Host(gpu)
+    let source = MonitorSource()
+    let target = gpu.texture(.bgra8Unorm, 16, 9)
+    host.resident(target)
+    weak var backing: NSObject?
+    try autoreleasepool {
+      let texture = gpu.texture(.bgra8Unorm, 16, 9)
+      let owner = NSObject()
+      backing = owner
+      let frame = try MonitorFrame(
+        layout: .bgra8, width: 16, height: 9, packed: nil, luma: texture, chroma: nil,
+        signal: SignalDescription(range: .full, encoding: .display(.bt709)), pixelAspectRatio: 1,
+        retained: (owner, nil))
+      frame.addResidency(to: host.host)
+      source.submit(frame)
+      let renderer = MonitorRenderer(engine: gpu.engine, scene: MonitorScene(surfaces: [MonitorSurface(source: source)]))
+      try renderer.update()
+      try host.run(completed: 0) { try renderer.encode(target: target, into: $0) }
+      source.clear()
+    }
+    XCTAssertNotNil(backing, "teardown must retain the Core Video wrapper until reported completion")
+    gpu.engine.residency.release(through: 1)
+    XCTAssertNil(backing)
+  }
+
   func testMetal4MatchesClassic() throws {
     let gpu = try requireGPU()
     let mtl4 = try MTL4Host(gpu)

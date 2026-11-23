@@ -489,6 +489,14 @@ import XCTest
     }
   }
 
+  func testSyntheticSourceSkipsExpiredFrameDeadlines() {
+    XCTAssertEqual(SyntheticSource.firstSlot(after: 19, ticksPerFrame: 20), 1)
+    XCTAssertEqual(SyntheticSource.firstSlot(after: 20, ticksPerFrame: 20), 2)
+    XCTAssertEqual(SyntheticSource.firstSlot(after: 95, ticksPerFrame: 20), 5)
+    XCTAssertEqual(SyntheticSource.firstSlot(after: 20, ticksPerFrame: 10.25), 2)
+    XCTAssertEqual(SyntheticSource.firstSlot(after: 21, ticksPerFrame: 10.25), 3)
+  }
+
   /// Offers synthetic frames at `hz` from a delivery thread of their own, as a camera does.
   private final class SyntheticSource: @unchecked Sendable {
     private let host: MonitorFeedHost
@@ -508,15 +516,20 @@ import XCTest
     /// The largest interval between two offers, in seconds: a late offer would
     /// make the next two land on one refresh.
     private(set) var maximumGap = 0.0
+    static func firstSlot(after elapsedTicks: UInt64, ticksPerFrame: Double) -> UInt64 {
+      UInt64(Double(elapsedTicks) / ticksPerFrame) + 1
+    }
+
     func start() {
       let thread = Thread { [self] in
         var timebase = mach_timebase_info_data_t()
         mach_timebase_info(&timebase)
         let ticksPerSecond = 1e9 * Double(timebase.denom) / Double(timebase.numer)
+        let ticksPerFrame = ticksPerSecond / hz
         // A capture thread's scheduling: a real-time period of one frame, so the
         // test process's timer coalescing never bunches frames.
         var policy = thread_time_constraint_policy_data_t(
-          period: UInt32(ticksPerSecond / hz), computation: UInt32(ticksPerSecond * 0.001),
+          period: UInt32(ticksPerFrame), computation: UInt32(ticksPerSecond * 0.001),
           constraint: UInt32(ticksPerSecond * 0.004), preemptible: 1)
         let count = mach_msg_type_number_t(
           MemoryLayout<thread_time_constraint_policy_data_t>.size / MemoryLayout<integer_t>.size)
@@ -526,21 +539,24 @@ import XCTest
           }
         }
         let start = mach_absolute_time()
-        var sequence: UInt64 = 0
-        var last = ProcessInfo.processInfo.systemUptime
+        var slot: UInt64 = 0
+        var last: Double?
         while lock.withLock({ running }) {
-          sequence += 1
+          let elapsed = mach_absolute_time() - start
+          slot = max(slot, Self.firstSlot(after: elapsed, ticksPerFrame: ticksPerFrame) - 1)
+          let sequence = slot + 1
           let buffer = buffers[Int(sequence) % buffers.count]
           host.offer(buffer, pts: CMTime(value: CMTimeValue(sequence), timescale: CMTimeScale(hz.rounded())),
             captureGeneration: generation, sequence: sequence)
           let now = ProcessInfo.processInfo.systemUptime
           lock.withLock {
             offered += 1
-            if sequence > 1 { maximumGap = max(maximumGap, now - last) }
+            if let last { maximumGap = max(maximumGap, now - last) }
           }
           last = now
-          // A camera's cadence: each frame at its own time, never a burst to catch up.
-          mach_wait_until(start + UInt64(Double(sequence) / hz * ticksPerSecond))
+          // A late wake or submission can miss slots. Wait for a future deadline instead of replaying them.
+          slot = max(sequence, Self.firstSlot(after: mach_absolute_time() - start, ticksPerFrame: ticksPerFrame))
+          mach_wait_until(start + UInt64((Double(slot) * ticksPerFrame).rounded(.up)))
         }
       }
       thread.qualityOfService = .userInteractive

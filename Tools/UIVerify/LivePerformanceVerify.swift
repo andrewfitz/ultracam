@@ -275,7 +275,7 @@ struct LivePerformanceSample {
 
   static func measure(cameras: Int, liveMeters: Bool, idleSeconds: Double, profileToggles: Int, verifier: Verifier) {
     let name = "perf \(cameras) cameras\(liveMeters ? "" : ", fixed meters")"
-    let suiteName = "org.ultracam.ui-verify-perf.\(UUID().uuidString)"
+    let suiteName = verifier.makeDefaultsDomain()
     guard let defaults = UserDefaults(suiteName: suiteName) else { return verifier.check("perf: defaults suite", false) }
     defer { defaults.removePersistentDomain(forName: suiteName) }
     let ids = (1...cameras).map { FeedID(rawValue: "ui-verify-perf-\($0)") }

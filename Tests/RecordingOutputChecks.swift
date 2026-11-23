@@ -176,6 +176,24 @@ private final class ChangingRecordingOutputDiskSpace: RecordingOutputDiskSpacePr
     }
   }
 
+  func testFailedEmptyTakeRetainsJournalWhenOwnedMetadataCannotBeRemoved() throws {
+    let root = try makeRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let manager = try RecordingOutputManager(rootDirectory: root, minimumFreeBytes: 0)
+    let take = try manager.beginExternalWriterSession(feedID: "camera")
+    let sidecar = RecordingTakeSidecar.url(for: take.finalURL)
+    try Data([1]).write(to: sidecar)
+    try take.claimSidecar()
+    try FileManager.default.removeItem(at: sidecar)
+    try FileManager.default.createDirectory(at: sidecar, withIntermediateDirectories: false)
+
+    take.preserveForRecovery(discardingEmptyTake: true)
+
+    let journal = try RecordingRecoveryJournal(opening: RecordingRecoveryJournal.url(for: take.temporaryURL))
+    XCTAssertEqual(journal.entry.sidecarOwned, true)
+    XCTAssertFalse(try RecordingRecovery.scanReport(root: root).mayPruneRoot)
+  }
+
   func testFailedTakeWithMediaOrAForeignPathKeepsItsJournal() throws {
     for kind in ["media", "directory", "not discarding"] {
       let root = try makeRoot()
@@ -546,6 +564,56 @@ private final class ChangingRecordingOutputDiskSpace: RecordingOutputDiskSpacePr
     XCTAssertEqual(try Data(contentsOf: take.temporaryURL), original)
   }
 
+  func testTornRecoveryJournalUpdateKeepsThePriorRecordAndAllowsRetry() throws {
+    let root = try makeRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let manager = try RecordingOutputManager(rootDirectory: root, minimumFreeBytes: 0)
+    let session = try manager.beginExternalWriterSession(feedID: "Wide")
+    try Data([1]).write(to: session.temporaryURL)
+    try session.claimSidecar()
+    session.preserveForRecovery()
+    let take = try XCTUnwrap(RecordingRecovery.scan(root: root).first)
+    let folder = take.journalURL.deletingLastPathComponent()
+    let unrelated = folder.appendingPathComponent("unrelated.mov")
+    try Data([2]).write(to: unrelated)
+    do {
+      let journal = try RecordingRecoveryJournal(opening: take.journalURL)
+      try journal.preparePublication(of: unrelated, to: unrelated)
+    }
+    // Simulate a torn overwrite that leaves a parseable update with
+    // inconsistent bytes in the second slot.
+    let secondSlot = 32 * 1024
+    let persisted = try Data(contentsOf: take.journalURL)
+    let record = try XCTUnwrap(persisted.indices.contains(secondSlot) ? persisted.suffix(from: secondSlot) : nil)
+    var update = try XCTUnwrap(JSONSerialization.jsonObject(with: record) as? [String: Any])
+    update["checksum"] = Data(repeating: 0, count: 32).base64EncodedString()
+    let handle = try FileHandle(forWritingTo: take.journalURL)
+    try handle.seek(toOffset: UInt64(secondSlot))
+    var torn = try JSONSerialization.data(withJSONObject: update)
+    torn.append(0x0a)
+    try handle.write(contentsOf: torn)
+    try handle.close()
+
+    XCTAssertEqual(try RecordingRecovery.scan(root: root), [take])
+    let staging = folder.appendingPathComponent("staged.mov")
+    let destination = folder.appendingPathComponent("recovered.mov")
+    try Data([3]).write(to: staging)
+    do {
+      let journal = try RecordingRecoveryJournal(opening: take.journalURL)
+      XCTAssertEqual(journal.entry.sidecarOwned, true)
+      XCTAssertNil(journal.entry.recoveredName)
+      try journal.preparePublication(of: staging, to: destination)
+    }
+    let reopened = try RecordingRecoveryJournal(opening: take.journalURL)
+    XCTAssertEqual(reopened.entry.sidecarOwned, true)
+    XCTAssertEqual(reopened.entry.recoveredName, destination.lastPathComponent)
+    for _ in 0..<20 {
+      try reopened.preparePublication(of: staging, to: unrelated)
+      try reopened.preparePublication(of: staging, to: destination)
+    }
+    XCTAssertLessThan(try Data(contentsOf: take.journalURL).count, 48 * 1024)
+  }
+
   func testLegacyRecoveryMarkerRequiresANonemptyRegularMovie() throws {
     let root = try makeRoot()
     defer { try? FileManager.default.removeItem(at: root) }
@@ -650,6 +718,22 @@ private final class ChangingRecordingOutputDiskSpace: RecordingOutputDiskSpacePr
     tight.preserveForRecovery()
   }
 
+  func testDrainedTakeReleasesHeadroomWhileTheDriveIsFull() throws {
+    let root = try makeRoot()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let volumes = RecordingVolumeSpaceRegistry()
+    let disk = ChangingRecordingOutputDiskSpace(bytes: 1_000)
+    let manager = try RecordingOutputManager(rootDirectory: root, minimumFreeBytes: 100, diskSpace: disk, volumes: volumes)
+    let take = try manager.beginExternalWriterSession(feedID: "Wide")
+    try take.checkExternalWriterCapacity(headroom: 600)
+    disk.bytes = 99
+    XCTAssertThrowsError(try take.checkExternalWriterCapacity(headroom: 0))
+    XCTAssertEqual(volumes.usage(for: root).headroom, 0)
+    disk.bytes = 200
+    try manager.makeSession(feedID: "Tight", expectedBytes: 100).cancel()
+    try take.cancel()
+  }
+
   /// Three ProRes HQ feeds recording to three folders on one drive each saw
   /// only their own folder's headroom, so the drive filled before any check
   /// failed. Reservations, headroom and the floor are pooled per volume.
@@ -726,6 +810,13 @@ private final class ChangingRecordingOutputDiskSpace: RecordingOutputDiskSpacePr
     // A failed recorder reports only what it still owes; here, nothing.
     try wide.checkExternalWriterCapacity(headroom: 0)
     XCTAssertNoThrow(try tight.checkExternalWriterCapacity(headroom: 800))
+    try wide.pause()
+    try wide.checkExternalWriterCapacity(headroom: 150)
+    XCTAssertThrowsError(try wide.resume(), "Resume must cover the 150 bytes still owed")
+    XCTAssertEqual(volumes.usage(for: root).headroom, 950)
+    try tight.checkExternalWriterCapacity(headroom: 700)
+    try wide.resume()
+    XCTAssertEqual(volumes.usage(for: root).headroom, 850)
     wide.preserveForRecovery()
     tight.preserveForRecovery()
   }
@@ -805,6 +896,22 @@ private final class ChangingRecordingOutputDiskSpace: RecordingOutputDiskSpacePr
       let session = try manager.makeSession(feedID: "Wide")
       XCTAssertEqual(session.finalURL.lastPathComponent, "001-2.mov", leftover)
       XCTAssertFalse(FileManager.default.fileExists(atPath: RecordingTakeSidecar.url(for: session.finalURL).path), leftover)
+    }
+  }
+
+  func testDanglingTakePathsHoldTheirNames() throws {
+    for path in ["001.mov", "001.mov.ultracam.json", ".001.partial", ".001.partial.ultracam-recovery"] {
+      let root = try makeRoot()
+      defer { try? FileManager.default.removeItem(at: root) }
+      let occupied = root.appendingPathComponent(path)
+      let missing = root.appendingPathComponent("missing")
+      try FileManager.default.createSymbolicLink(at: occupied, withDestinationURL: missing)
+      let naming = RecordingFileNaming(tokens: [.take], cameraSubfolders: false)
+      let manager = try RecordingOutputManager(rootDirectory: root, minimumFreeBytes: 0, naming: naming)
+      let session = try manager.beginExternalWriterSession(feedID: "Wide")
+      XCTAssertEqual(session.finalURL.lastPathComponent, "001-2.mov", path)
+      try session.cancel()
+      XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: occupied.path), missing.path)
     }
   }
 

@@ -32,14 +32,15 @@ func ids(_ object: CMIOObjectID, _ selector: Int) throws -> [UInt32] {
   var property = address(selector)
   var size: UInt32 = 0
   try check(CMIOObjectGetPropertyDataSize(object, &property, 0, nil, &size), "Read CMIO list size")
-  try require(size % UInt32(MemoryLayout<UInt32>.size) == 0, "Invalid CMIO list size.")
+  try require(size % UInt32(MemoryLayout<UInt32>.size) == 0 && size <= 64 * 1024, "Invalid CMIO list size.")
   var values = [UInt32](repeating: 0, count: Int(size) / MemoryLayout<UInt32>.size)
-  if !values.isEmpty {
-    try values.withUnsafeMutableBytes {
-      try check(CMIOObjectGetPropertyData(object, &property, 0, nil, size, &size, $0.baseAddress!), "Read CMIO list")
-    }
+  if values.isEmpty { return [] }
+  var used: UInt32 = 0
+  try values.withUnsafeMutableBytes {
+    try check(CMIOObjectGetPropertyData(object, &property, 0, nil, size, &used, $0.baseAddress!), "Read CMIO list")
   }
-  return values
+  try require(used <= size && used.isMultiple(of: UInt32(MemoryLayout<UInt32>.size)), "Invalid CMIO list size.")
+  return Array(values.prefix(Int(used) / MemoryLayout<UInt32>.size))
 }
 
 func string(_ object: CMIOObjectID, _ selector: Int) throws -> String {
@@ -213,9 +214,11 @@ final class SourceQueue {
   init(route: CameraSinkRoute, arrivals: SourceArrivals? = nil) throws {
     self.arrivals = arrivals
     guard let device = try ids(CMIOObjectID(kCMIOObjectSystemObject), kCMIOHardwarePropertyDevices)
-      .first(where: { try string($0, kCMIODevicePropertyDeviceUID) == route.deviceUID }),
-      let stream = try ids(device, kCMIODevicePropertyStreams)
-      .first(where: { try string($0, kCMIOObjectPropertyName) == route.sourceStreamName }) else {
+      .first(where: { (try? string($0, kCMIODevicePropertyDeviceUID)) == route.deviceUID }) else {
+      throw VideoError.message("Installed synthetic target device was not discovered.")
+    }
+    let streams = CameraStreamNames.describe(try ids(device, kCMIODevicePropertyStreams))
+    guard let stream = CameraStreamNames.source(streams, named: route.sourceStreamName) else {
       throw VideoError.message("Installed synthetic target/source was not discovered.")
     }
     self.device = device
@@ -1101,17 +1104,27 @@ func consumerRequest(seconds: Double) throws {
 func registryCheck() throws {
   let provider = try VirtualCameraRegistryTransport.providerID()
   let original = try VirtualCameraRegistryTransport.read(provider)
+  // A bootstrap registry has generation zero. Restore its devices as a fresh
+  // publication, advancing past the last fixture even if its acknowledgement failed.
+  var requested = original
+  func restore() throws -> VirtualCameraRegistrySnapshot {
+    try VirtualCameraRegistryTransport.synchronize(requested.advancing(to: original.devices))
+  }
+  var restored = false
   defer {
-    do { _ = try VirtualCameraRegistryTransport.synchronize(original) }
-    catch { log("CMIO_REGISTRY restore failed: \(error.localizedDescription)") }
+    if !restored {
+      do { _ = try restore() }
+      catch { log("CMIO_REGISTRY restore failed: \(error.localizedDescription)") }
+    }
   }
   let feed = VirtualCameraDescriptor.feed(feedID: FeedID.primary.rawValue, displayName: "Ultracam · Registry Test")
   let other = VirtualCameraDescriptor.feed(feedID: "registry-second", displayName: "Ultracam · Second Test")
   let mode = SyntheticMode(width: 1920, height: 1080, format: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
   let pool = try makePool(mode)
   for descriptors in [[feed, other], [.program()], [], [feed]] {
-    let desired = VirtualCameraRegistrySnapshot(generation: 1, devices: descriptors)
-    let applied = try VirtualCameraRegistryTransport.synchronize(desired)
+    requested = requested.advancing(to: descriptors)
+    let applied = try VirtualCameraRegistryTransport.synchronize(requested)
+    requested = applied
     try require(applied.devices == descriptors, "Live registry acknowledgement differs from request.")
     log("CMIO_REGISTRY applied generation=\(applied.generation) devices=\(descriptors.count)")
     if let descriptor = descriptors.first {
@@ -1119,14 +1132,15 @@ func registryCheck() throws {
       // registry acknowledgement. Allow device discovery to receive it.
       let deadline = now() + 5
       while !(try ids(CMIOObjectID(kCMIOObjectSystemObject), kCMIOHardwarePropertyDevices)
-        .contains(where: { try string($0, kCMIODevicePropertyDeviceUID) == descriptor.deviceUID })) && now() < deadline {
+        .contains(where: { (try? string($0, kCMIODevicePropertyDeviceUID)) == descriptor.deviceUID })) && now() < deadline {
         RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.02))
       }
       try runCase(fast: false, pool: pool, mode: mode, route: CameraSinkRoute(descriptor: descriptor))
     }
   }
-  let restored = try VirtualCameraRegistryTransport.synchronize(original)
-  try require(restored.devices == original.devices, "Original registry was not restored.")
+  let applied = try restore()
+  try require(applied.devices == original.devices, "Original registry was not restored.")
+  restored = true
   log("CMIO_REGISTRY PASS feedToProgram=true emptyRegistryRecovery=true physicalCapture=false")
 }
 

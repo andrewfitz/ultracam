@@ -108,19 +108,69 @@ struct MacCameraMode {
     }
   }
 
+  /// Call while holding the device configuration lock.
+  func apply(to device: AVCaptureDevice, minimum: CMTime?, maximum: CMTime?) throws {
+    guard device.isConnected, device.formats.contains(format) else {
+      throw PluginError.unavailable("The capture format was removed before configuration.")
+    }
+    guard [minimum, maximum].compactMap({ $0 }).allSatisfy(supports) else {
+      throw PluginError.unsupported("The requested frame duration is outside the camera's supported ranges.")
+    }
+    if device.activeFormat != format { device.activeFormat = format }
+    if let minimum, let maximum {
+      guard !device.isVideoFrameDurationLocked, !device.isFollowingExternalSyncDevice else {
+        throw PluginError.busy("The camera cadence is locked by another capture client or external sync.")
+      }
+      if device.isAutoVideoFrameRateEnabled {
+        guard format.isAutoVideoFrameRateSupported else {
+          throw PluginError.unsupported("This camera does not permit changing its automatic Frame Rate.")
+        }
+        device.isAutoVideoFrameRateEnabled = false
+      }
+      let caps: [AVFrameRateRange?] = [
+        device.isCenterStageActive ? format.videoFrameRateRangeForCenterStage : nil,
+        device.isPortraitEffectActive ? format.videoFrameRateRangeForPortraitEffect : nil,
+        device.isStudioLightActive ? format.videoFrameRateRangeForStudioLight : nil,
+        device.isBackgroundReplacementActive ? format.videoFrameRateRangeForBackgroundReplacement : nil,
+        device.reactionEffectsInProgress.isEmpty ? nil : format.videoFrameRateRangeForReactionEffectsInProgress
+      ]
+      guard caps.compactMap({ $0 }).allSatisfy({ $0.minFrameDuration <= minimum && maximum <= $0.maxFrameDuration }) else {
+        throw PluginError.unsupported("A macOS video effect limits the selected Frame Rate. Change the effect in Control Center or select another rate.")
+      }
+      if minimum > device.activeVideoMaxFrameDuration {
+        device.activeVideoMaxFrameDuration = maximum
+        device.activeVideoMinFrameDuration = minimum
+      } else {
+        device.activeVideoMinFrameDuration = minimum
+        device.activeVideoMaxFrameDuration = maximum
+      }
+    }
+  }
+
   func supports(_ duration: CMTime) -> Bool {
     settingFormat.supports(duration)
   }
 
   func sourceFormat(rate: FrameRate, clock: VideoClockDomain) throws -> SourceFormat {
-    try Self.sourceFormat(description: format.formatDescription, image: nil, rate: rate, clock: clock)
+    let description = format.formatDescription
+    return try Self.sourceFormat(description: description, image: nil, rate: rate, clock: clock,
+      scan: Self.scan(description: description, image: nil))
   }
 
-  static func sourceFormat(rate: FrameRate, clock: VideoClockDomain, sample: CMSampleBuffer) throws -> SourceFormat {
-    guard let description = sample.formatDescription, let image = sample.imageBuffer else {
-      throw PluginError.unsupported("The Mac Camera sample has no uncompressed image.")
+  static func scan(description: CMFormatDescription, image: CVPixelBuffer?) throws -> Scan {
+    func hasTwoFields(_ value: CFTypeRef?) throws -> Bool {
+      guard let value else { return false }
+      guard CFGetTypeID(value) == CFNumberGetTypeID(), let count = value as? NSNumber,
+        count.doubleValue == 1 || count.doubleValue == 2 else {
+        throw PluginError.unsupported("The Mac Camera delivered an invalid field count.")
+      }
+      return count.doubleValue == 2
     }
-    return try sourceFormat(description: description, image: image, rate: rate, clock: clock)
+    let bufferFields = try hasTwoFields(image.flatMap { CVBufferCopyAttachment($0, kCVImageBufferFieldCountKey, nil) })
+    let formatFields = try hasTwoFields(CMFormatDescriptionGetExtension(description, extensionKey: kCMFormatDescriptionExtension_FieldCount))
+    let hasDetail = image.flatMap { CVBufferCopyAttachment($0, kCVImageBufferFieldDetailKey, nil) } != nil ||
+      CMFormatDescriptionGetExtension(description, extensionKey: kCMFormatDescriptionExtension_FieldDetail) != nil
+    return bufferFields || formatFields || hasDetail ? .interlaced : .progressive
   }
 
   static func validateDelivery(native: OSType, fallback: OSType?, delivered: OSType) throws {
@@ -140,8 +190,8 @@ struct MacCameraMode {
     }
   }
 
-  private static func sourceFormat(description sourceDescription: CMFormatDescription, image: CVPixelBuffer?,
-    rate: FrameRate, clock: VideoClockDomain) throws -> SourceFormat {
+  static func sourceFormat(description sourceDescription: CMFormatDescription, image: CVPixelBuffer?,
+    rate: FrameRate, clock: VideoClockDomain, scan: Scan) throws -> SourceFormat {
     let dimensions = CMVideoFormatDescriptionGetDimensions(sourceDescription)
     let pixel = PixelFormatID(rawValue: image.map(CVPixelBufferGetPixelFormatType) ?? CMFormatDescriptionGetMediaSubType(sourceDescription))
     guard let entry = PixelFormatTable.entry(for: pixel), entry.captureQualified else {
@@ -152,10 +202,9 @@ struct MacCameraMode {
       ?? CMFormatDescriptionGetExtension(sourceDescription, extensionKey: kCMFormatDescriptionExtension_PixelAspectRatio)) as? [String: NSNumber]
     let horizontal = aspect?[kCVImageBufferPixelAspectRatioHorizontalSpacingKey as String]?.int64Value ?? 1
     let vertical = aspect?[kCVImageBufferPixelAspectRatioVerticalSpacingKey as String]?.int64Value ?? 1
-    let fieldCount = CMFormatDescriptionGetExtension(sourceDescription, extensionKey: kCMFormatDescriptionExtension_FieldCount) as? NSNumber
     return try SourceFormat(width: image.map(CVPixelBufferGetWidth) ?? Int(dimensions.width),
       height: image.map(CVPixelBufferGetHeight) ?? Int(dimensions.height),
-      pixelAspect: Rational(horizontal, vertical), scan: fieldCount?.intValue == 2 ? .interlaced : .progressive,
+      pixelAspect: Rational(horizontal, vertical), scan: scan,
       pixel: pixel, colour: color(description: sourceDescription, image: image, entry: entry), rate: rate, clock: clock)
   }
 

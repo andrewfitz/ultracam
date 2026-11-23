@@ -9,7 +9,21 @@ guard arguments.count == 2, let x = Double(arguments[0]), x.isFinite,
   exit(64)
 }
 let point = CGPoint(x: x, y: y)
-for type in [CGEventType.mouseMoved, .leftMouseDown, .leftMouseUp] {
-  CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: point, mouseButton: .left)?.post(tap: .cghidEventTap)
-  usleep(type == .mouseMoved ? 120_000 : 60_000)
+guard CGPreflightPostEventAccess() else {
+  fputs("Cannot send mouse events. Check Accessibility permission.\n", stderr)
+  exit(1)
+}
+// Create the entire gesture before posting anything. A failed release must not
+// leave the pointer button held down.
+let types: [CGEventType] = [.mouseMoved, .leftMouseDown, .leftMouseUp]
+let events = types.compactMap { type in
+  CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: point, mouseButton: .left)
+}
+guard events.count == types.count else {
+  fputs("Cannot create mouse events.\n", stderr)
+  exit(1)
+}
+for event in events {
+  event.post(tap: .cghidEventTap)
+  usleep(event.type == .mouseMoved ? 120_000 : 60_000)
 }

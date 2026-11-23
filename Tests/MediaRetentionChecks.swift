@@ -26,6 +26,21 @@ import XCTest
     XCTAssertEqual(ledger.snapshot.currentDuration, 0)
   }
 
+  func testReleasingLongSampleKeepsOtherDurationsCharged() throws {
+    let ledger = MediaRetentionLedger(policy: try MediaRetentionPolicy(maximumBytes: 100,
+      maximumDuration: 1, maximumSlots: 3, minimumSlots: 2))
+    let long = try ledger.admit(bytes: 1, duration: 1e16)
+    let short = try ledger.admit(bytes: 1, duration: 0.5)
+    long.release()
+    XCTAssertEqual(ledger.snapshot.currentDuration, 0.5)
+    let next = try ledger.admit(bytes: 1, duration: 0.25)
+    XCTAssertThrowsError(try ledger.admit(bytes: 1, duration: 0.5)) {
+      XCTAssertEqual($0 as? MediaRetentionFailure, .durationLimit)
+    }
+    short.release()
+    next.release()
+  }
+
   func testOverflowInvalidMediaAndSlotFailuresAreDistinct() throws {
     let ledger = MediaRetentionLedger(policy: try MediaRetentionPolicy(maximumBytes: Int.max, maximumDuration: 1, maximumSlots: 2))
     let a = try ledger.admit(bytes: Int.max - 2, duration: 0.01)

@@ -14,6 +14,8 @@ private actor MemoryControlCredentials: CameraControlCredentialStoring {
     var saved: ControlCredentials?
     var holdLoad = false
     var pendingLoad: CheckedContinuation<ControlCredentials?, Never>?
+    var holdDelete = false
+    var pendingDelete: CheckedContinuation<Void, Never>?
     func suspendLoad(with credentials: ControlCredentials) { saved = credentials; holdLoad = true }
     func resumeLoad() { pendingLoad?.resume(returning: saved); pendingLoad = nil }
     func load(service: String, account: String) async throws -> ControlCredentials? { loads += 1; if holdLoad { return await withCheckedContinuation { pendingLoad = $0 } }; return saved }
@@ -24,7 +26,13 @@ private actor MemoryControlCredentials: CameraControlCredentialStoring {
     }
     func saveCount() -> Int { saves }
     func setSaveFailure(_ value: Bool) { failSave = value }
-    func delete(service: String, account: String) async throws { saved = nil }
+    func suspendDelete() { holdDelete = true }
+    func deleteIsPending() -> Bool { pendingDelete != nil }
+    func resumeDelete() { pendingDelete?.resume(); pendingDelete = nil }
+    func delete(service: String, account: String) async throws {
+        if holdDelete { await withCheckedContinuation { pendingDelete = $0 } }
+        saved = nil
+    }
     func loadCount() -> Int { loads }
 }
 @MainActor private final class SuspendedControlPlugin: CameraControlPlugin {
@@ -148,6 +156,35 @@ private actor MemoryControlCredentials: CameraControlCredentialStoring {
         XCTAssertFalse(store.state(for: "feed").connected)
     }
 
+    func testChangedAuthenticationAndMissingSelectedFingerprintPrecedeCredentialLookup() async {
+        let plugin = SuspendedControlPlugin(), credentials = MemoryControlCredentials()
+        let store = CameraControlStore(plugins: ["test": plugin], credentials: credentials, persistence: MemoryControlAssignments())
+        let selected = plugin.camera
+        plugin.camera.authenticationMode = .none
+        await store.connect(camera: selected, to: "changed-authentication")
+        plugin.camera = selected
+        var unverified = selected
+        unverified.fingerprint = nil
+        await store.connect(camera: unverified, to: "missing-pin")
+        let loads = await credentials.loadCount()
+        XCTAssertEqual(loads, 0)
+        XCTAssertEqual(plugin.connectCount, 0)
+        XCTAssertNotNil(store.state(for: "changed-authentication").message)
+        XCTAssertNotNil(store.state(for: "missing-pin").message)
+    }
+
+    func testInvalidCandidateKeepsOriginalAssignmentDisconnected() async {
+        let plugin = SuspendedControlPlugin(), persistence = MemoryControlAssignments()
+        persistence.value.plugins = ["test": ["feed": .init(camera: plugin.camera, autoReconnect: false)]]
+        let store = CameraControlStore(plugins: ["test": plugin], credentials: MemoryControlCredentials(), persistence: persistence)
+        var other = plugin.camera
+        other.id = "wrong-camera"
+        await store.connect(camera: other, to: "feed")
+        XCTAssertEqual(store.assignment(for: "feed")?.autoReconnect, false)
+        XCTAssertTrue(plugin.requests.isEmpty)
+        XCTAssertNotNil(store.state(for: "feed").message)
+    }
+
     func testDisconnectDuringConnectCannotResurrectGeneration() async throws {
         let plugin = SuspendedControlPlugin(); plugin.holdConnect = true
         let store = CameraControlStore(plugins: ["test": plugin], credentials: MemoryControlCredentials(), persistence: MemoryControlAssignments())
@@ -185,6 +222,32 @@ private actor MemoryControlCredentials: CameraControlCredentialStoring {
         await store.connect(camera: plugin.camera, to: "feed", credentials: .usernamePassword(username: "user", password: "secret"), saveCredentials: false)
         XCTAssertEqual(plugin.requests.last, request)
         XCTAssertEqual(persistence.value.plugins["test"]?["feed"]?.preparationRequest, request)
+        _ = await store.shutdown()
+    }
+
+    func testReconnectUsesSavedEndpointUntilAddressChangeIsSelected() async {
+        let plugin = SuspendedControlPlugin(), persistence = MemoryControlAssignments()
+        let original = plugin.camera
+        let originalRequest = ControlPreparationRequest.endpoint(.init(address: original.address, expectedIdentity: original.id,
+            authenticationMode: original.authenticationMode))
+        persistence.value.plugins = ["test": ["feed": .init(camera: original, preparationRequest: originalRequest)]]
+        let credentials = MemoryControlCredentials()
+        let secret = ControlCredentials.usernamePassword(username: "user", password: "mock-secret")
+        let store = CameraControlStore(plugins: ["test": plugin], credentials: credentials, persistence: persistence)
+        plugin.camera.address = "192.0.2.99"
+        let updated = plugin.camera
+        let updatedRequest = ControlPreparationRequest.endpoint(.init(address: updated.address, expectedIdentity: updated.id,
+            authenticationMode: updated.authenticationMode))
+        let prepared = await store.prepare(pluginID: "test", request: updatedRequest, feedID: "feed")
+        XCTAssertEqual(prepared?.camera, updated)
+        plugin.camera = original
+        await store.connect(camera: original, to: "feed", credentials: secret, saveCredentials: false)
+        XCTAssertEqual(plugin.requests.last, originalRequest)
+        await store.disconnect("feed")
+        plugin.camera = updated
+        await store.connect(camera: updated, to: "feed", credentials: secret, saveCredentials: false)
+        XCTAssertEqual(plugin.requests.last, updatedRequest)
+        XCTAssertEqual(store.assignment(for: "feed")?.camera, updated)
         _ = await store.shutdown()
     }
 
@@ -436,6 +499,40 @@ private actor MemoryControlCredentials: CameraControlCredentialStoring {
         await store.connectUsingSavedCredentials(plugin.camera, to: "feed")
         XCTAssertEqual(plugin.requests.count, 1)
         XCTAssertTrue(store.state(for: "feed").connected)
+        XCTAssertTrue(store.hasSavedCredentials(for: plugin.camera))
+        _ = await store.shutdown()
+    }
+
+    func testCredentialAvailabilityIsScopedToExactCameraAndFingerprint() async throws {
+        let plugin = SuspendedControlPlugin(), credentials = MemoryControlCredentials()
+        plugin.camera.id = "body|lens"
+        plugin.camera.fingerprint = "pin"
+        var other = plugin.camera
+        other.id = "body"
+        other.fingerprint = "lens|pin"
+        try await credentials.save(.usernamePassword(username: "user", password: "secret"), service: "test", account: "body|lenspin")
+        let store = CameraControlStore(plugins: ["test": plugin], credentials: credentials, persistence: MemoryControlAssignments())
+        await store.checkSavedCredentials(for: plugin.camera, feedID: "feed")
+        XCTAssertTrue(store.hasSavedCredentials(for: plugin.camera))
+        XCTAssertFalse(store.hasSavedCredentials(for: other))
+    }
+
+    func testCompletedCredentialDeletionDisconnectsEvenIfCallerCancels() async {
+        let plugin = SuspendedControlPlugin(), credentials = MemoryControlCredentials()
+        let store = CameraControlStore(plugins: ["test": plugin], credentials: credentials, persistence: MemoryControlAssignments())
+        await store.connect(camera: plugin.camera, to: "feed", credentials: .usernamePassword(username: "user", password: "secret"))
+        XCTAssertTrue(store.state(for: "feed").connected)
+        XCTAssertTrue(store.hasSavedCredentials(for: plugin.camera))
+        await credentials.suspendDelete()
+        let deletion = Task { await store.forgetCredentials("feed") }
+        while !(await credentials.deleteIsPending()) { await Task.yield() }
+        deletion.cancel()
+        await credentials.resumeDelete()
+        await deletion.value
+        XCTAssertFalse(store.state(for: "feed").connected)
+        XCTAssertFalse(store.state(for: "feed").hasSavedCredentials)
+        XCTAssertFalse(store.hasSavedCredentials(for: plugin.camera))
+        XCTAssertEqual(store.assignment(for: "feed")?.autoReconnect, false)
         _ = await store.shutdown()
     }
     func testCredentialSaveFailureDoesNotPreventPropertySnapshot() async throws {
@@ -465,6 +562,7 @@ private actor MemoryControlCredentials: CameraControlCredentialStoring {
         XCTAssertEqual(steps, [.seconds(10), .seconds(20), .seconds(30), .seconds(60), .seconds(60), .seconds(60)])
         XCTAssertEqual(CameraControlReconnectPolicy.delay(step: 0, jitter: 1), .seconds(11), "Jitter adds at most a tenth")
         XCTAssertEqual(CameraControlReconnectPolicy.delay(step: 99, jitter: 5), .seconds(66), "Jitter is clamped")
+        XCTAssertEqual(CameraControlReconnectPolicy.delay(step: 0, jitter: .nan), .seconds(10))
         let start = Date(timeIntervalSinceReferenceDate: 0)
         XCTAssertFalse(CameraControlReconnectPolicy.givesUp(startedAt: start, now: start.addingTimeInterval(599)))
         XCTAssertTrue(CameraControlReconnectPolicy.givesUp(startedAt: start, now: start.addingTimeInterval(600)))

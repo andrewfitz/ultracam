@@ -29,6 +29,9 @@ final class GPUStandbyLifecycle: @unchecked Sendable {
 
   func image(for format: CMVideoFormatDescription) -> CVPixelBuffer? {
     dispatchPrecondition(condition: .onQueue(queue))
+    if let desiredFormat, desiredFormat !== format, !CFEqual(desiredFormat, format) {
+      invalidate()
+    }
     if let image { return image }
     // Invalidation retires a generation, not its Metal submission. Until that
     // submission completes, retain only the newest desired format; allocating

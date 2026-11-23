@@ -17,6 +17,7 @@ import SwiftUI
       get: { preferences.wrappedValue.toolsEnabled && preferences.wrappedValue[keyPath: keyPath] },
       set: { on in
         var next = preferences.wrappedValue
+        guard on || next.toolsEnabled else { return }
         if on && !next.toolsEnabled { next.hideAllTools() }
         next[keyPath: keyPath] = on
         next.toolsEnabled = next.anyToolOn
@@ -30,6 +31,7 @@ import SwiftUI
       get: { preferences.wrappedValue.toolsEnabled ? preferences.wrappedValue.state.falseColor.mode : .off },
       set: { mode in
         var next = preferences.wrappedValue
+        guard mode != .off || next.toolsEnabled else { return }
         if mode != .off && !next.toolsEnabled { next.hideAllTools() }
         next.state.falseColor.mode = mode
         next.toolsEnabled = next.anyToolOn
@@ -59,6 +61,7 @@ import SwiftUI
       get: { preferences.wrappedValue.toolsEnabled && zebra(preferences, index).wrappedValue.enabled },
       set: { on in
         var next = preferences.wrappedValue
+        guard on || next.toolsEnabled else { return }
         if on && !next.toolsEnabled { next.hideAllTools() }
         padZebras(&next, through: index)
         next.state.zebras[index].enabled = on
@@ -168,14 +171,16 @@ struct UIMonitorSlider: View {
   @Binding var value: Double
   let range: ClosedRange<Double>
   var step: Double?
+  let minimumTrackWidth: CGFloat
   let format: (Double) -> String
 
   init(_ title: String, value: Binding<Double>, in range: ClosedRange<Double>, step: Double? = nil,
-    format: @escaping (Double) -> String) {
+    minimumTrackWidth: CGFloat = 148, format: @escaping (Double) -> String) {
     self.title = title
     _value = value
     self.range = range
     self.step = step
+    self.minimumTrackWidth = minimumTrackWidth
     self.format = format
   }
 
@@ -188,9 +193,9 @@ struct UIMonitorSlider: View {
     LabeledContent {
       HStack {
         Group {
-          if let step { Slider(value: $value, in: range, step: step) } else { Slider(value: $value, in: range) }
+          if let step { Slider(value: clamped, in: range, step: step) } else { Slider(value: clamped, in: range) }
         }
-        .frame(minWidth: 148, maxWidth: .infinity)
+        .frame(minWidth: minimumTrackWidth, maxWidth: .infinity)
         Text(format(value))
           .font(.uiMeta.monospacedDigit()).foregroundStyle(.secondary).frame(width: 56, alignment: .trailing)
       }
@@ -200,12 +205,18 @@ struct UIMonitorSlider: View {
     .accessibilityValue(format(value))
     .accessibilityAdjustableAction { direction in
       let delta = step ?? (range.upperBound - range.lowerBound) / 20
+      let position = clamped.wrappedValue
       switch direction {
-      case .increment: value = min(range.upperBound, value + delta)
-      case .decrement: value = max(range.lowerBound, value - delta)
+      case .increment: value = min(range.upperBound, position + delta)
+      case .decrement: value = max(range.lowerBound, position - delta)
       @unknown default: break
       }
     }
+  }
+
+  /// Older settings can exceed the UI range. Show the saved value and keep the thumb at the boundary until edited.
+  private var clamped: Binding<Double> {
+    Binding(get: { min(range.upperBound, max(range.lowerBound, value)) }, set: { value = $0 })
   }
 }
 

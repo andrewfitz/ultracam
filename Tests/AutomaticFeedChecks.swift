@@ -10,12 +10,16 @@ import XCTest
     saved.sourceHeight = 2160
     saved.sourcePixelAspect = try Rational(4, 3)
     saved.sourceDuration = CMTime(value: 1, timescale: 25)
+    saved.sourcePauseAllowanceSeconds = 10
+    saved.sourceColorimetryOverride = .rec709Video
     let detected = CMTime(value: 1001, timescale: 24_000)
     let bypass = FeedLifecycleDemandPolicy.programContract(configuration: saved,
       pipelineEnabled: false, detectedSourceDuration: detected)
     XCTAssertEqual(bypass.sourceWidth, saved.sourceWidth)
     XCTAssertEqual(bypass.sourceHeight, saved.sourceHeight)
     XCTAssertEqual(bypass.sourcePixelAspect, saved.sourcePixelAspect)
+    XCTAssertEqual(bypass.sourcePauseAllowanceSeconds, 10)
+    XCTAssertNil(bypass.sourceColorimetryOverride)
     XCTAssertEqual(bypass.sourceDuration, detected)
     XCTAssertEqual(bypass.duration, detected)
     XCTAssertFalse(bypass.applyLUT || bypass.downscale || bypass.convertTo420 || bypass.reduceFrameRate)
@@ -33,6 +37,17 @@ import XCTest
       XCTAssertEqual(result.sourceDuration, duration)
       XCTAssertEqual(result.duration, duration)
     }
+  }
+
+  func testProgramContractUsesTheDeclaredNominalDuration() throws {
+    let nominal = CMTime(value: 1, timescale: 30)
+    let format = try SourceFormat(width: 1280, height: 720, pixel: .video420,
+      rate: .variable(nominal: nominal, shortest: CMTime(value: 1, timescale: 60),
+        longest: CMTime(value: 1, timescale: 24)))
+    let contract = FeedLifecycleDemandPolicy.programContract(configuration: .init(), pipelineEnabled: false,
+      detectedSourceDuration: CMTime(value: 1, timescale: 60), source: format)
+    XCTAssertEqual(contract.sourceDuration, nominal)
+    XCTAssertEqual(contract.duration, nominal)
   }
 
   func testProgramUsesDeclaredPixelFormatAndChoosesItsOwnCanvasForSmallSource() throws {

@@ -300,15 +300,17 @@ final class VirtualCameraRegistryStore {
   }
 
   /// Returns the newest valid slot and repairs a corrupt or stale primary
-  /// slot from it. A nil result means both slots failed validation.
-  func load() -> VirtualCameraRegistrySnapshot? {
+  /// slot from it. Read-only consumers must not repair defaults: their read
+  /// can overlap the host publishing a newer primary. A nil result means
+  /// neither slot passed validation.
+  func load(repairPrimary: Bool = true) -> VirtualCameraRegistrySnapshot? {
     guard let defaults else { return nil }
     let primary = decode(data: defaults.data(forKey: Self.key))
     let backup = decode(data: defaults.data(forKey: Self.backupKey))
     guard let selected = [primary, backup].compactMap({ $0 }).max(by: { $0.generation < $1.generation }) else {
       return nil
     }
-    if primary != selected {
+    if repairPrimary, primary != selected {
       if let data = try? JSONEncoder().encode(selected) { defaults.set(data, forKey: Self.key) }
     }
     return selected

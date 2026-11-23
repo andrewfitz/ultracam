@@ -75,7 +75,13 @@ struct UICameraControlSettings: View {
                     if let assignment {
                         if vendor?.sdkPresent == false {
                             Label("\(vendor?.localizedDisplayName() ?? "Camera control") is not included in this build.", systemImage: "info.circle")
-                        } else { connection(assignment) }
+                        } else {
+                            connection(assignment)
+                            if !state.connected, !state.retrying, assignment.camera.authenticationMode == .usernamePassword {
+                                UICameraBodySignIn(camera: assignment.camera, feedID: feedID, cameraName: name,
+                                    store: store, alreadyAssigned: true, offersSavedSignIn: false)
+                            }
+                        }
                         if state.retrying {
                             UICameraControlReconnectStatus(state: state)
                         } else if let message = state.message {
@@ -186,39 +192,59 @@ struct UICameraBodySignIn: View {
     let store: CameraControlStore
     /// The capture device the camera uses, so the person checks the cable before signing in.
     var captureName: String? = nil
+    var alreadyAssigned = false
+    var offersSavedSignIn = true
     @State private var user = ""
     @State private var password = ""
     private var state: CameraControlFeedState { store.state(for: feedID) }
+    private struct SignInTarget: Equatable {
+        let feedID: String
+        let pluginID: String
+        let cameraID: String
+        let address: String
+        let fingerprint: String?
+        let authentication: ControlAuthenticationMode
+    }
+    private var target: SignInTarget {
+        SignInTarget(feedID: feedID, pluginID: camera.pluginID, cameraID: camera.id,
+            address: camera.address, fingerprint: camera.fingerprint, authentication: camera.authenticationMode)
+    }
 
     var body: some View {
         Group {
-            if store.hasSavedCredentials(for: camera) {
-                Button("Connect Using Saved Sign-In") { Task { await store.connectUsingSavedCredentials(camera, to: feedID) } }
-                    .buttonStyle(.borderedProminent).disabled(state.busy)
+            if camera.authenticationMode == .usernamePassword, store.hasSavedCredentials(for: camera) {
+                if offersSavedSignIn {
+                    Button("Connect Using Saved Sign-In") { Task { await store.connectUsingSavedCredentials(camera, to: feedID) } }
+                        .buttonStyle(.borderedProminent).disabled(state.busy)
+                }
                 DisclosureGroup("Change camera sign-in") { fields }
             } else { fields }
-            if let message = state.message {
+            if !alreadyAssigned, let message = state.message {
                 Label { Text(message) } icon: { Image(systemName: "exclamationmark.triangle").foregroundStyle(.orange) }.textSelection(.enabled)
             }
         }
         // The Keychain only; the body is contacted when Connect is pressed.
-        .task(id: camera.id + "|" + feedID) { await store.checkSavedCredentials(for: camera, feedID: feedID) }
+        .onChange(of: target) { _, _ in user = ""; password = "" }
+        .task(id: target) { await store.checkSavedCredentials(for: camera, feedID: feedID) }
     }
 
     @ViewBuilder private var fields: some View {
         if camera.authenticationMode == .usernamePassword {
-            TextField("Camera user name", text: $user).textContentType(.username)
-            SecureField("Camera password", text: $password).textContentType(.password)
+            TextField("Camera user name", text: $user).textContentType(.username).accessibilityLabel("Camera user name")
+            SecureField("Camera password", text: $password).textContentType(.password).accessibilityLabel("Camera password")
             if let fingerprint = camera.fingerprint {
                 LabeledContent("Camera fingerprint") { Text(fingerprint).font(.subheadline.monospaced()).textSelection(.enabled) }
             }
         }
-        Text(["\(captureName.map { "Check that this body’s HDMI goes to \($0)." } ?? "")",
-              camera.authenticationMode == .usernamePassword
-                ? "A successful sign-in is saved in macOS Keychain. Unassigning keeps it; Forget Saved Sign-In removes it." : ""]
-            .filter { !$0.isEmpty }.joined(separator: " "))
-            .font(.subheadline).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-        Button("Connect and Assign to \(cameraName)") {
+        if let captureName {
+            Text("Check that this body’s HDMI goes to \(captureName).")
+                .font(.subheadline).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        }
+        if camera.authenticationMode == .usernamePassword {
+            Text("A successful sign-in is saved in macOS Keychain. Unassigning keeps it; Forget Saved Sign-In removes it.")
+                .font(.subheadline).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        }
+        Button(alreadyAssigned ? "Connect to \(camera.name)" : "Connect and Assign to \(cameraName)") {
             let credential: ControlCredentials? = camera.authenticationMode == .usernamePassword ? .usernamePassword(username: user, password: password) : nil
             password = ""
             Task { await store.connect(camera: camera, to: feedID, credentials: credential) }
@@ -237,11 +263,13 @@ struct UICameraBodyAddByAddress: View {
     let cameras: [(id: String, name: String)]
     var initialAddress = ""
     var initialFeedID: String? = nil
+    var initialAuthentication = true
     var onPrepared: (ControlCamera, String) -> Void = { _, _ in }
     @State private var address = ""
     @State private var identity = ""
     @State private var authentication = true
     @State private var feedID = ""
+    @State private var checkTask: Task<Void, Never>?
 
     var body: some View {
         Group {
@@ -257,24 +285,34 @@ struct UICameraBodyAddByAddress: View {
             Text("Check Camera resolves its identity before connecting. Sign-in is sent when you press Connect.")
                 .font(.subheadline).foregroundStyle(.secondary)
             Button("Check Camera") {
+                guard checkTask == nil else { return }
                 // Keep the result attached to the camera chosen when the check began.
                 // The picker can change while preparation awaits the network.
                 let requestedFeedID = feedID
-                Task {
-                    let trimmed = identity.trimmingCharacters(in: .whitespacesAndNewlines)
-                    let request = ControlPreparationRequest.endpoint(.init(address: address.trimmingCharacters(in: .whitespacesAndNewlines),
-                        expectedIdentity: trimmed.isEmpty ? nil : trimmed, authenticationMode: authentication ? .usernamePassword : .none))
-                    if let prepared = await store.prepare(pluginID: pluginID, request: request, feedID: requestedFeedID) { onPrepared(prepared.camera, requestedFeedID) }
+                let trimmed = identity.trimmingCharacters(in: .whitespacesAndNewlines)
+                let request = ControlPreparationRequest.endpoint(.init(address: address.trimmingCharacters(in: .whitespacesAndNewlines),
+                    expectedIdentity: trimmed.isEmpty ? nil : trimmed, authenticationMode: authentication ? .usernamePassword : .none))
+                checkTask = Task {
+                    defer { checkTask = nil }
+                    guard let prepared = await store.prepare(pluginID: pluginID, request: request, feedID: requestedFeedID),
+                        !Task.isCancelled else { return }
+                    onPrepared(prepared.camera, requestedFeedID)
                 }
             }
-            .disabled(feedID.isEmpty || store.state(for: feedID).busy || address.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            if let message = store.state(for: feedID).message, !feedID.isEmpty {
+            .disabled(checkTask != nil || !cameras.contains(where: { $0.id == feedID }) || store.state(for: feedID).busy
+                || address.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            .onDisappear { checkTask?.cancel() }
+            if !feedID.isEmpty, let message = store.state(for: feedID).message {
                 Label { Text(message) } icon: { Image(systemName: "exclamationmark.triangle").foregroundStyle(.orange) }.textSelection(.enabled)
             }
         }
         .onAppear {
             if address.isEmpty { address = initialAddress }
             if feedID.isEmpty { feedID = initialFeedID ?? cameras.first?.id ?? "" }
+            authentication = initialAuthentication
+        }
+        .onChange(of: cameras.map(\.id)) { _, ids in
+            if initialFeedID == nil, !ids.contains(feedID) { feedID = ids.first ?? "" }
         }
     }
 }
@@ -295,7 +333,10 @@ struct UIControlPropertyField: View {
                 } else if case .boolean(let value) = property.value {
                     Toggle(property.localizedLabel(), isOn: Binding(get: { value }, set: { apply(.boolean($0)) })).labelsHidden()
                 } else { UIControlScalarEditor(property: property, apply: apply) }
-            } else { Text(UIControlPresentation.value(property)).foregroundStyle(connected ? .primary : .secondary) }
+            } else {
+                let value = UIControlPresentation.value(property)
+                Text(value).foregroundStyle(connected ? .primary : .secondary).accessibilityValue(value)
+            }
         }.disabled(busy).accessibilityLabel(property.localizedLabel()).help(property.localizedUnavailableReason() ?? property.localizedLabel())
     }
 }
@@ -353,6 +394,8 @@ struct UIControlScalarEditor: View {
     private func commit() {
         guard let value = parsed else { return }
         editing = false
+        draft = UIControlPresentation.value(property.value)
+        guard value != property.value else { return }
         apply(value)
     }
 

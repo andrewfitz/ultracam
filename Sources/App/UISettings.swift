@@ -73,7 +73,7 @@ struct UISettingsView: View {
     case .general: UISettingsGeneralPane(model: model, interface: interface, shortcuts: shortcuts)
     case .hardware: UISettingsHardwarePane(model: model, interface: interface)
     case .virtualCameras: UISettingsVirtualCamerasPane(model: model)
-    case .recording: UISettingsRecordingPane(model: model)
+    case .recording: UISettingsRecordingPane(model: model, interface: interface)
     case .streaming: UISettingsStreamingPane(model: model)
     case .audio: UISettingsAudioPane(model: model, interface: interface)
     case .switching: UISettingsSwitchingPane(model: model)
@@ -185,7 +185,7 @@ struct UISettingsGeneralPane: View {
   let interface: UIInterfaceState
   @Bindable var shortcuts: UIBackgroundShortcuts
   @AppStorage(UIInterfaceState.askBeforeEndingKey) private var askBeforeEnding = true
-  @State private var loginStatus = SMAppService.mainApp.status
+  @State private var loginStatus: SMAppService.Status = .notRegistered
   @State private var loginError: String?
 
   private var showInDock: Binding<Bool> {
@@ -248,6 +248,9 @@ struct UISettingsGeneralPane: View {
       } header: { Text("Background Shortcuts") }
     }
     .onAppear { loginStatus = SMAppService.mainApp.status }
+    .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+      loginStatus = SMAppService.mainApp.status
+    }
   }
 
   private func shortcutRow(_ title: String, detail: String? = nil, key: String, unavailable: Bool) -> some View {

@@ -554,6 +554,32 @@ import XCTest
   }
 }
 
+@objcMembers final class RecordingLUTRendererChecks: XCTestCase {
+  func testFullRangeRGBLUTOutputRendersIntoVideoRangeEncoderTarget() throws {
+    guard LUTProcessor.sharedDevice != nil else { throw XCTSkip("Metal 4 required") }
+    let rgb = Colorimetry(primaries: .rec709, transfer: .rec709, matrix: .identity, range: .full,
+      horizontalChromaSiting: .unspecified, verticalChromaSiting: .unspecified)
+    let lut = try LUTProcessor.makeLUT(CubeLUT(text: cubeText(transform: { 1 - $0 })))
+    let renderer = try RecordingLUTRenderer(snapshot: RecordingLUTSnapshot(lut: lut,
+      colorSpace: LUTColorSpaceContract(input: .rec709Video, output: rgb),
+      sourceColorimetryOverride: nil, lutOutputColorimetry: nil))
+    let source = try syntheticRamp()
+    var buffer: CVPixelBuffer?
+    XCTAssertEqual(CVPixelBufferCreate(nil, CVPixelBufferGetWidth(source), CVPixelBufferGetHeight(source),
+      kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange,
+      [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary, &buffer), kCVReturnSuccess)
+    let destination = try XCTUnwrap(buffer)
+    _ = try renderer.render(source, sourceColour: .rec709Video, into: destination)
+    XCTAssertEqual(renderer.lutOutputColour, rgb)
+    XCTAssertEqual(try LUTProcessor.sourceColorimetry(destination), renderer.outputColour)
+    XCTAssertEqual(renderer.outputColour, Colorimetry.rec709Video.centeredVideoOutput)
+    CVPixelBufferLockBaseAddress(destination, .readOnly)
+    defer { CVPixelBufferUnlockBaseAddress(destination, .readOnly) }
+    let luma = try XCTUnwrap(CVPixelBufferGetBaseAddressOfPlane(destination, 0)).load(as: UInt16.self) >> 6
+    XCTAssertEqual(Double(luma), 940, accuracy: 2)
+  }
+}
+
 /// The setting: off by default, kept between launches, sampled per take.
 @MainActor @objcMembers final class RecordingLUTBurnInSettingsChecks: XCTestCase {
   func testSettingDefaultsOffPersistsAndResets() throws {

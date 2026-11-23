@@ -85,6 +85,28 @@ import XCTest
     XCTAssertEqual(CVPixelBufferGetWidth(output), 64, "Published independent output stays valid")
   }
 
+  func testIndependentPassthroughKeepsLocalTypedColorContract() throws {
+    guard let device = MTLCreateSystemDefaultDevice(), device.supportsFamily(.metal4) else {
+      throw XCTSkip("Metal 4 GPU required")
+    }
+    var made: CVPixelBuffer?
+    XCTAssertEqual(CVPixelBufferCreate(nil, 64, 32, kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange,
+      [kCVPixelBufferIOSurfacePropertiesKey: [:], kCVPixelBufferMetalCompatibilityKey: true] as CFDictionary,
+      &made), kCVReturnSuccess)
+    let input = try XCTUnwrap(made)
+    let colour = try SourceColorSpaceCatalog.color("sony-slog3-sgamut3cine")
+    let key = LUTProcessor.declaredColorimetryAttachmentKey
+    let payload = try JSONEncoder().encode(ColorimetryContract(colour))
+    CVBufferSetAttachment(input, key, payload as CFData, .shouldNotPropagate)
+
+    let output = try LUTProcessor().passthrough(input)
+
+    XCTAssertEqual(try LUTProcessor.sourceColorimetry(output), colour)
+    var mode = CVAttachmentMode.shouldPropagate
+    XCTAssertNotNil(CVBufferCopyAttachment(output, key, &mode))
+    XCTAssertEqual(mode, .shouldNotPropagate)
+  }
+
 
   func testInputLeaseRemainsValidUntilConsumerCallbackReturns() throws {
     guard let device = MTLCreateSystemDefaultDevice(), device.supportsFamily(.metal4) else {

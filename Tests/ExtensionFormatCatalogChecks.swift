@@ -63,6 +63,24 @@ import XCTest
     XCTAssertThrowsError(try ExtensionFormatCatalog.negotiate(requested: requested,
       duration: VideoContract.fastDuration, installed: [requested]))
   }
+
+  func testInstalledCatalogCanAppendNewIdentitiesButCannotDuplicateAnIndex() throws {
+    let published = ExtensionFormatCatalog.published
+    let known = published[0]
+    let future = try ExtensionFormatContract(width: 7680, height: 4320, pixel: known.pixel,
+      colour: known.colour, allowedDurations: known.allowedDurations)
+    let extended = published + [future]
+    XCTAssertEqual(try ExtensionFormatCatalog.negotiate(requested: known,
+      duration: VideoContract.fastDuration, installed: extended), 0)
+    try ExtensionFormatCatalog.validateAppendOnly(previous: published, proposed: extended)
+    for duplicated in [published + [known], extended + [future]] {
+      XCTAssertThrowsError(try ExtensionFormatCatalog.negotiate(requested: known,
+        duration: VideoContract.fastDuration, installed: duplicated))
+      XCTAssertNil(OutputFormatCatalog.matchingIndex(known, duration: VideoContract.fastDuration,
+        installed: duplicated))
+      XCTAssertThrowsError(try ExtensionFormatCatalog.validateAppendOnly(previous: published, proposed: duplicated))
+    }
+  }
   func testCanonicalIdentityAndSchemaValidation() throws {
     let original = ExtensionFormatCatalog.published[0]
     let reordered = try ExtensionFormatContract(width: original.width, height: original.height, pixel: original.pixel,

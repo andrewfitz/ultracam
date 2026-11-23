@@ -88,6 +88,19 @@ import XCTest
       XCTAssertEqual(budget.snapshot.accepted, held.count)
     }
   }
+  func testReleasingALongFramePreservesTheDurationOfAShorterFrame() {
+    let budget = CaptureAdmissionBudget(maximumSlots: 4, maximumBytes: 100, maximumDuration: 0.1, minimumSlots: 2)
+    var long = budget.admit(bytes: 1, duration: 1e20)
+    let short = budget.admit(bytes: 1, duration: 0.08)
+    XCTAssertNotNil(long)
+    XCTAssertNotNil(short)
+    long = nil
+    XCTAssertEqual(budget.snapshot.currentDuration, 0.08, accuracy: 0.000001)
+    let fillsBudget = budget.admit(bytes: 1, duration: 0.02)
+    XCTAssertNotNil(fillsBudget)
+    XCTAssertNil(budget.admit(bytes: 1, duration: 0.01))
+    withExtendedLifetime((short, fillsBudget)) {}
+  }
 }
 
 private final class HeldAdmissionLeases: @unchecked Sendable {

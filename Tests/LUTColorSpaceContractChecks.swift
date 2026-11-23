@@ -83,6 +83,20 @@ import IOSurface
     CVBufferSetAttachment(source, kCVImageBufferTransferFunctionKey, "unknown-transfer" as CFString, .shouldPropagate)
     XCTAssertThrowsError(try LUTProcessor.sourceColorimetry(source))
   }
+
+  func testMalformedColorTagsDoNotUseUntaggedDefaults() throws {
+    var image: CVPixelBuffer?
+    XCTAssertEqual(CVPixelBufferCreate(nil, 16, 16, kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange,
+      nil, &image), kCVReturnSuccess)
+    let source = try XCTUnwrap(image)
+    for key in [kCVImageBufferTransferFunctionKey, kCVImageBufferChromaLocationTopFieldKey,
+      LUTProcessor.declaredColorimetryAttachmentKey] {
+      CVBufferSetAttachment(source, key, NSNumber(value: 1), .shouldPropagate)
+      XCTAssertThrowsError(try LUTProcessor.sourceColorimetry(source), key as String)
+      CVBufferRemoveAttachment(source, key)
+    }
+    XCTAssertEqual(try LUTProcessor.sourceColorimetry(source), .rec709Video)
+  }
 }
 
 extension LUTDynamicSizeChecks {
@@ -115,7 +129,7 @@ extension LUTDynamicSizeChecks {
     defer { CVPixelBufferUnlockBaseAddress(source, []) }
     for plane in 0..<2 {
       let pointer = try XCTUnwrap(CVPixelBufferGetBaseAddressOfPlane(source, plane)).assumingMemoryBound(to: UInt16.self)
-      let count = CVPixelBufferGetBytesPerRowOfPlane(source, plane) * 64 / 2
+      let count = CVPixelBufferGetBytesPerRowOfPlane(source, plane) * CVPixelBufferGetHeightOfPlane(source, plane) / 2
       for i in 0..<count { pointer[i] = (plane == 0 ? lumaCode : 512) << 6 }
     }
     CVBufferSetAttachment(source, kCVImageBufferTransferFunctionKey, transfer, .shouldPropagate)
@@ -137,6 +151,32 @@ extension LUTDynamicSizeChecks {
     defer { CVPixelBufferUnlockBaseAddress(output, .readOnly) }
     let y = try XCTUnwrap(CVPixelBufferGetBaseAddressOfPlane(output, 0)).assumingMemoryBound(to: UInt8.self)
     XCTAssertEqual(Int(y[64]), 170, accuracy: 1)
+  }
+
+  func testExplicitHLGConversionKeepsSuperblackAtBlack() throws {
+    guard LUTProcessor.sharedDevice != nil else { throw XCTSkip("No Metal device") }
+    let source = try graySource(lumaCode: 0)
+    let hlg = try SourceColorSpaceCatalog.color("rec2020-hlg-video")
+    let destination = Colorimetry.rec709Video
+    let output = try LUTProcessor().process(source, configuration: PipelineConfiguration(downscale: false),
+      colorConversion: .sourceToLUTInput(from: hlg, to: destination), destinationColorimetry: destination,
+      declaredSourceColorimetry: hlg)
+    CVPixelBufferLockBaseAddress(output, .readOnly)
+    defer { CVPixelBufferUnlockBaseAddress(output, .readOnly) }
+    let y = try XCTUnwrap(CVPixelBufferGetBaseAddressOfPlane(output, 0)).assumingMemoryBound(to: UInt8.self)
+    XCTAssertEqual(y[64], 16)
+  }
+
+  func testYCbCrWithIdentityMatrixRefusesBeforeAllocating() throws {
+    guard LUTProcessor.sharedDevice != nil else { throw XCTSkip("No Metal device") }
+    let processor = try LUTProcessor()
+    let colour = Colorimetry(primaries: .rec709, transfer: .rec709, matrix: .identity,
+      range: .video, horizontalChromaSiting: .left, verticalChromaSiting: .center)
+    XCTAssertThrowsError(try processor.process(graySource(), configuration: PipelineConfiguration(downscale: false),
+      declaredSourceColorimetry: colour)) { error in
+      guard case .missingColour = error as? LiveFrameRouteError else { return XCTFail("Unexpected error: \(error)") }
+    }
+    XCTAssertFalse(processor.workingResourceDiagnostics.outputPoolActive)
   }
 
   func testFitWritesBlackBarsAndCropFillsCanvasOnGPU() throws {
@@ -230,6 +270,35 @@ extension LUTDynamicSizeChecks {
     XCTAssertEqual(processor.cachedAllocationBytesForTesting, 0)
     // The published output survives cache retirement independently.
     XCTAssertEqual(CVPixelBufferGetWidth(output), 128)
+  }
+
+  func testCancelledRenderKeepsExistingDestinationMetadataAndCache() throws {
+    guard LUTProcessor.sharedDevice != nil else { throw XCTSkip("No Metal device") }
+    let source = try graySource()
+    let destination = try graySource()
+    var configuration = PipelineConfiguration(downscale: false)
+    configuration.colorTarget = .yuv42210
+    let processor = try LUTProcessor()
+    _ = try processor.render(source, configuration: configuration, declaredSourceColorimetry: .rec709Video,
+      into: destination)
+    XCTAssertTrue(processor.waitUntilIdle(timeout: 1))
+    let originalBytes = processor.cachedAllocationBytesForTesting
+    XCTAssertGreaterThan(originalBytes, 0)
+    let aperture = [kCVImageBufferCleanApertureWidthKey: 120, kCVImageBufferCleanApertureHeightKey: 64,
+      kCVImageBufferCleanApertureHorizontalOffsetKey: 0, kCVImageBufferCleanApertureVerticalOffsetKey: 0] as CFDictionary
+    CVBufferSetAttachment(destination, kCVImageBufferCleanApertureKey, aperture, .shouldPropagate)
+
+    XCTAssertThrowsError(try processor.submit(source, configuration: configuration,
+      declaredSourceColorimetry: .rec709Video, into: destination, isCurrent: { false }) { _ in
+      XCTFail("A cancelled render must not complete")
+    }) { error in
+      guard case VideoError.cancelled = error else { return XCTFail("Unexpected error: \(error)") }
+    }
+
+    XCTAssertEqual(processor.cachedAllocationBytesForTesting, originalBytes)
+    let tag = try XCTUnwrap(CVBufferCopyAttachment(destination, kCVImageBufferCleanApertureKey, nil))
+    XCTAssertTrue(CFEqual(tag, aperture))
+    XCTAssertTrue(processor.waitUntilIdle(timeout: 1))
   }
 
   func testInFlightRecordRetainsBudgetLeaseAcrossStaleCompletionSweep() throws {

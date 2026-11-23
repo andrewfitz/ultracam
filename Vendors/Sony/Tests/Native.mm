@@ -210,6 +210,20 @@ int main() {
     notificationOwner->afterDisconnect = ^{ assert(!notificationWeak.expired()); };
     notificationOwner->OnDisconnected(0);
     assert(notificationWeak.expired());
+    SonySession cleanup;
+    cleanup.handle = 42;
+    cleanup.callback = std::make_shared<SonyCallback>(^(NSString *, NSString *) {});
+    cleanup.callback->OnDisconnected(0);
+    assert(!sonyCloseSession(cleanup, [](CrDeviceHandle handle) -> CrError {
+      assert(handle == 42);
+      return CrError_Connect_Release;
+    }));
+    assert(cleanup.handle == 42 && cleanup.callback);
+    assert(sonyCloseSession(cleanup, [](CrDeviceHandle handle) -> CrError {
+      assert(handle == 42);
+      return CrError_None;
+    }));
+    assert(cleanup.handle == 0);
     assert([UCSonyCameraControl new].available);
     puts("Sony native checks passed: SSDP/HTTP/XML parsing, source/deadline bounds, MAC dedup, formatting, SDK values, callback filtering/coalescing and lifetime.");
   }

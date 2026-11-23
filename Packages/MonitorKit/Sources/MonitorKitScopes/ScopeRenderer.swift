@@ -59,14 +59,16 @@ public final class ScopeRenderer {
   /// Trace intensity, one texel per bin (fewer written on a minified axis):
   /// r16Unorm for one channel, rgb10a2Unorm or rgba16Unorm (histogram) for three.
   public private(set) var traceTexture: MTLTexture?
-  /// Whether `draw(with:)` draws anything. False only while an asynchronous
-  /// engine builds the first pipeline for this target's formats; `draw` encodes
-  /// nothing until then (call `ScopeEngine.prepare(target:)` to build it up front).
-  public var isReady: Bool { pipeline != nil }
+  /// Whether `prepare` produced a valid draw for the target's formats. An
+  /// asynchronous engine may still be building its first pipeline (call
+  /// `ScopeEngine.prepare(target:)` to build it up front).
+  public var isReady: Bool { pipeline != nil && graticuleKey != nil }
   private var graticuleKey: GraticuleKey?
   /// Graticule geometry rebuilds, for cache regression tests.
   private(set) var graticuleBuildCount: UInt64 = 0
   private var resolveKey: ResolveKey?
+  private var graticuleWrite = ClassicWrite()
+  private var traceWrite = ClassicWrite()
   var parameters = ScopeDrawParameters()
   var shapes = ScopeGraticuleParameters()
   var pipeline: MTLRenderPipelineState?
@@ -74,9 +76,9 @@ public final class ScopeRenderer {
   /// Whether `pipeline` is the specialized one `pipelineKey` asks for.
   private var pipelineIsFinal = false
   var drawsDepthStencil = false
-  /// The bins the trace was resolved from, kept alive so their identity in
-  /// `resolveKey` cannot be reused.
-  private var bins: MTLBuffer?
+  /// The bins the trace was resolved from. The accumulator and its GPU
+  /// lifetime management own them even while this renderer is paused.
+  private weak var resolvedBins: MTLBuffer?
   var hasTrace = false
   var viewport = MTLViewport()
   /// The viewport as a scissor rectangle, so a host's scissor cannot clip the scope.
@@ -132,9 +134,56 @@ public final class ScopeRenderer {
 
   /// What the trace texture holds: one accumulation, resolved with these parameters.
   private struct ResolveKey: Equatable {
-    var bins: ObjectIdentifier
     var generation: UInt32
     var parameters: ScopeResolveParameters
+  }
+
+  /// A classic buffer must be free to disappear without being committed (even
+  /// a one-slot queue must be able to create the retry). A shared event can
+  /// prove that the GPU passed the write after the producer itself is gone.
+  private struct ClassicWrite {
+    private enum State { case valid, pending, retry }
+    private var state = State.valid
+    private weak var producer: MTLCommandBuffer?
+    private var event: MTLSharedEvent?
+    private var generation: UInt64 = 0
+
+    mutating func isReusable(in next: MTLCommandBuffer?) -> Bool {
+      if state == .valid { return true }
+      if let producer {
+        if producer === next { return true }
+        switch producer.status {
+        case .committed, .scheduled: return producer.commandQueue === next?.commandQueue
+        case .completed:
+          state = .valid
+          return true
+        default: break
+        }
+      } else if event?.signaledValue == generation {
+        state = .valid
+        return true
+      }
+      state = .retry
+      return false
+    }
+
+    mutating func record(in buffer: MTLCommandBuffer, signalEveryWrite: Bool) {
+      producer = buffer
+      generation &+= 1
+      // Graticules change rarely. Trace generations usually change on every
+      // frame, so only signal a trace if a later prepare needed to reuse an
+      // unconfirmed write. A paused trace can incur one extra resolve.
+      if signalEveryWrite || state == .retry {
+        if event == nil { event = buffer.device.makeSharedEvent() }
+        if let event { buffer.encodeSignalEvent(event, value: generation) }
+      }
+      state = .pending
+    }
+
+    mutating func reset() {
+      producer = nil
+      state = .valid
+    }
   }
 
   init(engine: ScopeEngine) {
@@ -208,7 +257,7 @@ public final class ScopeRenderer {
       // encoder, no draw will consume them; invalidate the encoded state so the
       // next attempt re-encodes the trace and graticule instead of drawing stale
       // or missing resources.
-      forgetEncodedState()
+      invalidateGPUResults()
       throw MonitorKitError.gpu("Cannot create a render encoder for the scope.")
     }
     draw(with: encoder)
@@ -246,20 +295,31 @@ public final class ScopeRenderer {
     _ accumulator: ScopeAccumulator, display: ScopeDisplay? = nil, viewport area: MonitorViewport,
     target: MonitorRenderTargetFormat, into commandBuffer: MTLCommandBuffer
   ) throws {
+    metal4Draw = nil
     // A throw anywhere, in `update` too, leaves the trace and graticule to be redone.
     do {
-      let work = try update(accumulator, display: display, viewport: area, target: target)
+      let work = try update(accumulator, display: display, viewport: area, target: target, commandBuffer: commandBuffer)
       if let r = work.resolve { try encodeResolve(accumulator, r, into: commandBuffer) }
       if let size = work.rasterize { try rasterizeGraticule(width: size.x, height: size.y, into: commandBuffer) }
+      if work.rasterize != nil { graticuleWrite.record(in: commandBuffer, signalEveryWrite: true) }
+      if work.resolve != nil { traceWrite.record(in: commandBuffer, signalEveryWrite: false) }
     } catch {
-      forgetEncodedState()
+      invalidateGPUResults()
       throw error
     }
   }
 
-  /// After a failed encode: the trace and graticule are redone by the next `prepare`.
-  func forgetEncodedState() {
+  /// Call on the renderer's encoding thread after abandoning a Metal 4 submission
+  /// that prepared this renderer, or after receiving its GPU failure. Classic
+  /// prepare tracks its command buffer automatically. The next prepare rebuilds
+  /// the trace and graticule in their existing textures.
+  /// Repeat any accumulation lost with that buffer before preparing the draw.
+  public func invalidateGPUResults() {
+    metal4Draw = nil
+    traceWrite.reset()
+    graticuleWrite.reset()
     resolveKey = nil
+    resolvedBins = nil
     hasTrace = false
     graticuleKey = nil
   }
@@ -275,7 +335,7 @@ public final class ScopeRenderer {
   /// the graticule, the trace texture and the draw parameters. Encodes nothing.
   func update(
     _ accumulator: ScopeAccumulator, display: ScopeDisplay?, viewport area: MonitorViewport,
-    target: MonitorRenderTargetFormat
+    target: MonitorRenderTargetFormat, commandBuffer: MTLCommandBuffer? = nil
   ) throws -> Work {
     guard accumulator.engine.device === engine.device else {
       throw MonitorKitError.gpu("A scope renderer and accumulator must use the same Metal device.")
@@ -331,6 +391,7 @@ public final class ScopeRenderer {
       settings: keySettings, context: keyContext, width: area.width, height: area.height,
       pixelsPerPoint: area.pixelsPerPoint)
     let redraw = key != graticuleKey || !graticuleFits(width: area.width, height: area.height)
+      || !graticuleWrite.isReusable(in: commandBuffer)
     if redraw {
       graticuleBuildCount &+= 1
       graticule = ScopeGraticule(settings: s, context: accumulator.context, viewportWidth: w, viewportHeight: h)
@@ -341,7 +402,7 @@ public final class ScopeRenderer {
     parameters.pixels = Self.pixelBounds(plotPixels)
     var work = Work()
     if accumulator.hasData {
-      work.resolve = try planResolve(accumulator, settings: s, plot: plotPixels)
+      work.resolve = try planResolve(accumulator, settings: s, plot: plotPixels, commandBuffer: commandBuffer)
     } else {
       hasTrace = false
     }
@@ -383,6 +444,10 @@ public final class ScopeRenderer {
       graticuleKey = key
       work.rasterize = SIMD2(area.width, area.height)
     }
+    if commandBuffer == nil {
+      if work.rasterize != nil { graticuleWrite.reset() }
+      if work.resolve != nil { traceWrite.reset() }
+    }
     return work
   }
 
@@ -410,7 +475,7 @@ public final class ScopeRenderer {
   /// writes; whatever state the host left, the scope draws the same. Encodes
   /// nothing while `isReady` is false.
   public func draw(with encoder: MTLRenderCommandEncoder) {
-    guard let pipeline, let graticuleTexture else { return }
+    guard graticuleKey != nil, let pipeline, let graticuleTexture else { return }
     encoder.setRenderPipelineState(pipeline)
     if drawsDepthStencil { encoder.setDepthStencilState(engine.depthStencil) }
     encoder.setViewport(viewport)
@@ -532,18 +597,18 @@ public final class ScopeRenderer {
   /// The resolve the accumulator's last bins need, when they, the display or the
   /// plot size changed since the last one (the trace texture is reshaped here);
   /// nil when the trace is current.
-  private func planResolve(_ accumulator: ScopeAccumulator, settings s: ScopeSettings, plot: SIMD4<Double>) throws
-    -> ScopeResolveParameters?
-  {
+  private func planResolve(
+    _ accumulator: ScopeAccumulator, settings s: ScopeSettings, plot: SIMD4<Double>, commandBuffer: MTLCommandBuffer?
+  ) throws -> ScopeResolveParameters? {
     let shape = Self.traceShape(accumulator, settings: s, plot: plot)
     parameters.traceMap = shape.map
     parameters.flags.w = shape.reduced
     let r = shape.parameters
-    let key = ResolveKey(bins: ObjectIdentifier(accumulator.bins), generation: accumulator.generation, parameters: r)
+    let key = ResolveKey(generation: accumulator.generation, parameters: r)
     let fits =
       traceTexture?.width == shape.width && traceTexture?.height == shape.height
       && traceTexture?.pixelFormat == shape.format
-    if key == resolveKey, fits {
+    if key == resolveKey, fits, resolvedBins === accumulator.bins, traceWrite.isReusable(in: commandBuffer) {
       hasTrace = true
       return nil
     }
@@ -556,9 +621,10 @@ public final class ScopeRenderer {
         throw MonitorKitError.gpu("Cannot allocate a \(shape.width)×\(shape.height) scope trace texture.")
       }
       retired.retire(traceTexture)
+      engine.residency.track(nil as MTLTexture?, in: &residentTrace)
       traceTexture = texture
     }
-    bins = accumulator.bins
+    resolvedBins = accumulator.bins
     resolveKey = key
     hasTrace = true
     return r
@@ -612,6 +678,7 @@ public final class ScopeRenderer {
         throw MonitorKitError.gpu("Cannot allocate a \(width)×\(height) graticule texture.")
       }
       retired.retire(graticuleTexture)
+      engine.residency.track(nil as MTLTexture?, in: &residentGraticule)
       graticuleTexture = texture
     }
   }

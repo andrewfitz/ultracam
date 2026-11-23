@@ -33,16 +33,19 @@ struct UIScopeCardFrame: Equatable, Codable, Sendable {
   /// The card's default rectangle: a wide card at the bottom left, a square one at the
   /// bottom right, both above the bottom labels.
   static func defaultRect(_ shape: UIScopeCardShape, in size: CGSize) -> CGRect {
+    let dimensions: CGSize
     switch shape {
     case .wide:
       let width = min(size.width * 0.5, 520)
-      let height = width / 3
-      return clamp(CGRect(x: 10, y: size.height - bottomLabels - height, width: width, height: height), shape, in: size)
+      dimensions = CGSize(width: width, height: width / 3)
     case .square:
       let side = min(size.height * 0.4, 280)
-      return clamp(CGRect(x: size.width - 10 - side, y: size.height - bottomLabels - side, width: side, height: side),
-        shape, in: size)
+      dimensions = CGSize(width: side, height: side)
     }
+    let fitted = clamp(CGRect(origin: .zero, size: dimensions), shape, in: size).size
+    let x = shape == .square ? size.width - 10 - fitted.width : 10
+    return clamp(CGRect(x: x, y: size.height - bottomLabels - fitted.height,
+      width: fitted.width, height: fitted.height), shape, in: size)
   }
 
   /// `rect` kept inside the picture, at least the shape's minimum and square when the
@@ -90,7 +93,7 @@ struct UIScopeCardFrame: Equatable, Codable, Sendable {
     var width: CGFloat
     var height: CGFloat
     if shape == .square {
-      let grow = max(translation.width, translation.height)
+      let grow = abs(translation.width) > abs(translation.height) ? translation.width : translation.height
       width = start.width + grow
       height = start.height + grow
     } else {
@@ -210,6 +213,7 @@ struct UIScopeCard<Scope: View>: View {
       .accessibilityLabel(description.title)
       .accessibilityAction(named: "Pop Out") { onPopOut() }
       .accessibilityAction(named: "Hide") { onHide() }
+      .accessibilityAction(named: "Reset Scope Position and Size") { places.reset(shape) }
   }
 
   private var header: some View {
@@ -241,7 +245,7 @@ struct UIScopeCard<Scope: View>: View {
   }
 
   private func move(_ rect: CGRect) -> some Gesture {
-    DragGesture(minimumDistance: 3)
+    DragGesture(minimumDistance: 3, coordinateSpace: .global)
       .onChanged { value in
         let from = start ?? rect
         start = from
@@ -251,7 +255,7 @@ struct UIScopeCard<Scope: View>: View {
   }
 
   private func resize(_ rect: CGRect) -> some Gesture {
-    DragGesture(minimumDistance: 1)
+    DragGesture(minimumDistance: 1, coordinateSpace: .global)
       .onChanged { value in
         let from = start ?? rect
         start = from

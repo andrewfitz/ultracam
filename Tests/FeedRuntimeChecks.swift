@@ -46,6 +46,19 @@ import XCTest
     XCTAssertTrue(coordinator.isFeedRunning(second.id))
   }
 
+  func testCreatingSessionForNewFeedUpdatesSelectionAndOutputs() {
+    let disabled = FeedDescriptor(id: FeedID(rawValue: "disabled"), name: "Disabled", enabled: false)
+    let coordinator = FeedCoordinator(snapshot: AppSettingsSnapshot(feeds: [disabled]))
+    let id = FeedID(rawValue: "new-source")
+    let session = coordinator.session(for: id)
+
+    XCTAssertEqual(session.id, id)
+    XCTAssertEqual(coordinator.selectedFeedID, id)
+    XCTAssertEqual(coordinator.programOutput.selectedFeedID, id)
+    XCTAssertEqual(coordinator.virtualCameraRegistrySnapshot.devices, coordinator.virtualCameraDescriptors)
+    XCTAssertTrue(coordinator.start(id))
+  }
+
   func testDisabledOrRunningFeedsCannotBeStartedOrRemoved() {
     let disabled = FeedDescriptor(id: FeedID(rawValue: "disabled"), name: "Disabled", enabled: false)
     let active = FeedDescriptor(id: FeedID(rawValue: "active"), name: "Active")
@@ -154,6 +167,22 @@ import XCTest
     XCTAssertEqual(updated.appGroupIdentifier, group)
     XCTAssertGreaterThan(updated.generation, initial.generation)
     XCTAssertEqual(updated.devices, coordinator.virtualCameraDescriptors)
+  }
+
+  func testRegistryPublicationPreservesSavedGenerationAfterStoreRollback() throws {
+    let group = "org.ultracam.tests.registry-rollback.\(UUID().uuidString)"
+    let defaults = try XCTUnwrap(UserDefaults(suiteName: group))
+    defer { defaults.removePersistentDomain(forName: group) }
+    let store = VirtualCameraRegistryStore(appGroupIdentifier: group, defaults: defaults)
+    let feed = FeedDescriptor(name: "Camera")
+    try store.save(.init(generation: 2, appGroupIdentifier: group,
+      devices: VirtualCameraRegistrySnapshot.devices(for: [feed])))
+    let coordinator = FeedCoordinator(snapshot: AppSettingsSnapshot(feeds: [feed],
+      virtualCameraRegistryVersion: 8), registryStore: store)
+    let published = try XCTUnwrap(store.load())
+    XCTAssertGreaterThan(published.generation, 8)
+    coordinator.update(feed)
+    XCTAssertEqual(store.load(), published)
   }
 
 }

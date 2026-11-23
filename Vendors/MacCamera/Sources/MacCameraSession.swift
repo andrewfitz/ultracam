@@ -203,7 +203,7 @@ final class MacCameraCaptureSession: NSObject, CaptureSession, AVCaptureVideoDat
         prior.2 != device.activeVideoMaxFrameDuration || prior.3 != device.isAutoVideoFrameRateEnabled,
          (try? device.lockForConfiguration()) != nil {
         defer { device.unlockForConfiguration() }
-        try? setMode(MacCameraMode(prior.0), minimum: prior.1, maximum: prior.2, device: device)
+        try? MacCameraMode(prior.0).apply(to: device, minimum: prior.1, maximum: prior.2)
         if prior.3, !device.isAutoVideoFrameRateEnabled, device.activeFormat.isAutoVideoFrameRateSupported,
            !device.isVideoFrameDurationLocked, !device.isFollowingExternalSyncDevice {
           device.isAutoVideoFrameRateEnabled = true
@@ -259,10 +259,13 @@ final class MacCameraCaptureSession: NSObject, CaptureSession, AVCaptureVideoDat
     output: AVCaptureVideoDataOutput) throws {
     try device.lockForConfiguration()
     defer { device.unlockForConfiguration() }
-    try setMode(requested.mode, minimum: requested.duration, maximum: requested.duration, device: device)
+    try requested.mode.apply(to: device, minimum: requested.duration, maximum: requested.duration)
     let native = PixelFormatID(rawValue: requested.mode.pixel)
     let available = output.availableVideoPixelFormatTypes
-    if let deviceID, !available.isEmpty { plugin.rememberFallbacks(available, modeID: requested.mode.id, deviceID: deviceID) }
+    if let deviceID, !available.isEmpty {
+      plugin.rememberFallbacks(available, modeID: requested.mode.id, deviceID: deviceID,
+        device: ObjectIdentifier(device), token: claimToken)
+    }
     negotiatedFallback = nil
     if PixelFormatTable.entry(for: native)?.captureQualified != true, let fallback = requested.fallback {
       guard available.contains(fallback) else {
@@ -271,44 +274,6 @@ final class MacCameraCaptureSession: NSObject, CaptureSession, AVCaptureVideoDat
       output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: fallback]
       negotiatedFallback = fallback
     } else { output.videoSettings = [:] }
-  }
-
-  private func setMode(_ mode: MacCameraMode, minimum: CMTime?, maximum: CMTime?, device: AVCaptureDevice) throws {
-    guard device.isConnected, device.formats.contains(mode.format) else {
-      throw PluginError.unavailable("The capture format was removed before configuration.")
-    }
-    guard [minimum, maximum].compactMap({ $0 }).allSatisfy(mode.supports) else {
-      throw PluginError.unsupported("The requested frame duration is outside the camera's supported ranges.")
-    }
-    if device.activeFormat != mode.format { device.activeFormat = mode.format }
-    if let minimum, let maximum {
-      guard !device.isVideoFrameDurationLocked, !device.isFollowingExternalSyncDevice else {
-        throw PluginError.busy("The camera cadence is locked by another capture client or external sync.")
-      }
-      if device.isAutoVideoFrameRateEnabled {
-        guard mode.format.isAutoVideoFrameRateSupported else {
-          throw PluginError.unsupported("This camera does not permit changing its automatic Frame Rate.")
-        }
-        device.isAutoVideoFrameRateEnabled = false
-      }
-      let caps: [AVFrameRateRange?] = [
-        device.isCenterStageActive ? mode.format.videoFrameRateRangeForCenterStage : nil,
-        device.isPortraitEffectActive ? mode.format.videoFrameRateRangeForPortraitEffect : nil,
-        device.isStudioLightActive ? mode.format.videoFrameRateRangeForStudioLight : nil,
-        device.isBackgroundReplacementActive ? mode.format.videoFrameRateRangeForBackgroundReplacement : nil,
-        device.reactionEffectsInProgress.isEmpty ? nil : mode.format.videoFrameRateRangeForReactionEffectsInProgress
-      ]
-      guard caps.compactMap({ $0 }).allSatisfy({ $0.minFrameDuration <= minimum && maximum <= $0.maxFrameDuration }) else {
-        throw PluginError.unsupported("A macOS video effect limits the selected Frame Rate. Change the effect in Control Center or select another rate.")
-      }
-      if minimum > device.activeVideoMaxFrameDuration {
-        device.activeVideoMaxFrameDuration = maximum
-        device.activeVideoMinFrameDuration = minimum
-      } else {
-        device.activeVideoMinFrameDuration = minimum
-        device.activeVideoMaxFrameDuration = maximum
-      }
-    }
   }
 
   private func verify(_ requested: MacCameraCapturePlugin.RequestedMode, device: AVCaptureDevice) -> Bool {
@@ -556,7 +521,7 @@ final class MacCameraCaptureSession: NSObject, CaptureSession, AVCaptureVideoDat
       if audio.output != nil { audio.detach(from: graph) }
       if !captureModePreserved(), (try? device.lockForConfiguration()) != nil {
         defer { device.unlockForConfiguration() }
-        try? setMode(MacCameraMode(oldFormat), minimum: oldMinimum, maximum: oldMaximum, device: device)
+        try? MacCameraMode(oldFormat).apply(to: device, minimum: oldMinimum, maximum: oldMaximum)
         if oldAutoRate, !device.isAutoVideoFrameRateEnabled, device.activeFormat.isAutoVideoFrameRateSupported,
            !device.isVideoFrameDurationLocked, !device.isFollowingExternalSyncDevice {
           device.isAutoVideoFrameRateEnabled = true
@@ -875,10 +840,15 @@ final class MacCameraCaptureSession: NSObject, CaptureSession, AVCaptureVideoDat
       (sampleDescription.map { $0 === description || CFEqual($0, description) } ?? false)
     do {
       let candidate: SourceFormat
-      if sameDescription, let declaration, let admission, declaration.rate == cadence.rate, declaration.clock == domain {
+      let scan = try MacCameraMode.scan(description: description, image: image)
+      if sameDescription, let declaration, let admission, declaration.scan == scan,
+        declaration.rate == cadence.rate, declaration.clock == domain {
         try MacCameraMode.validateRange(description: description, image: image, entry: admission.entry)
         candidate = declaration
-      } else { candidate = try MacCameraMode.sourceFormat(rate: cadence.rate, clock: domain, sample: sample) }
+      } else {
+        candidate = try MacCameraMode.sourceFormat(description: description, image: image,
+          rate: cadence.rate, clock: domain, scan: scan)
+      }
       let duration = cadence.duration(for: sample.duration)
       if duration == nil, MacCameraMode.validDuration(sample.duration) {
         unresolvedDurations += 1

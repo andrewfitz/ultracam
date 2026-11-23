@@ -556,6 +556,8 @@ import XCTest
     var waiting = camera(1, running: false)
     waiting.automaticStart = true
     XCTAssertEqual(UIPresentationBuilder.menuBarIcon(separate([waiting])), .waiting)
+    waiting.captureManuallyStopped = true
+    XCTAssertEqual(UIPresentationBuilder.menuBarIcon(separate([waiting])), .stopped)
     for icon in [UIMenuBarIcon.stopped, .waiting, .noSignal, .live, .bypass, .recording, .attention] {
       XCTAssertTrue(icon.accessibilityLabel.hasPrefix("Ultracam"))
       XCTAssertFalse(icon.symbol.isEmpty)
@@ -740,6 +742,12 @@ import XCTest
     XCTAssertFalse(UIPresentationBuilder.session(separate([missing])).canStartAny, "Nothing can start without an input")
     XCTAssertTrue(UIPresentationBuilder.session(separate([missing, camera(2, running: false)])).canStartAny)
     XCTAssertFalse(UIPresentationBuilder.session(separate([])).canStartAny)
+    var disabled = camera(1, running: false)
+    disabled.enabled = false
+    let inactive = UIPresentationBuilder.session(separate([disabled]))
+    XCTAssertFalse(inactive.cameras[0].canStart)
+    XCTAssertFalse(inactive.canStartAny)
+    XCTAssertTrue(inactive.virtualCameras.isEmpty, "The extension publishes enabled cameras only")
   }
 
   func testTallyLabelsAreSentenceCase() {

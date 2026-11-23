@@ -129,7 +129,7 @@ private final class RecordingRGBWeakOwner {
     XCTAssertEqual(done.wait(timeout: .now() + 0.05), .timedOut)
     XCTAssertNotNil(retainedSource.value)
     XCTAssertNotNil(retainedDestination.value)
-    XCTAssertGreaterThan(budget.snapshot().bytes, 0)
+    XCTAssertEqual(budget.snapshot().allocations, 3, "Only source, destination and conversion parameters are retained")
     gate.signaledValue = 1
     XCTAssertEqual(done.wait(timeout: .now() + 2), .success)
     XCTAssertEqual(budget.snapshot().bytes, 0)
@@ -170,7 +170,7 @@ private final class RecordingRGBWeakOwner {
   }
   #endif
 
-  func testSubpageIOSurfaceUsesBoundedTextureCopyWithExactBGRACodes() throws {
+  func testSubpageIOSurfaceUsesBoundedTextureViewWithExactBGRACodes() throws {
     guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("Metal unavailable") }
     let converter = try RecordingRGBPixelConverter(device: device)
     var sourceBuffer: CVPixelBuffer?, outputBuffer: CVPixelBuffer?
@@ -204,7 +204,7 @@ private final class RecordingRGBWeakOwner {
     XCTAssertEqual(converter.budget.snapshot().bytes, 0)
   }
 
-  func testPrivateStagingBlitIsVisibleToDecodeAcrossConcurrentFrames() throws {
+  func testConcurrentPackedTextureConversionsPreserveEachFrame() throws {
     guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("Metal unavailable") }
     let converter = try RecordingRGBPixelConverter(device: device)
     let attributes = [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary
@@ -264,9 +264,9 @@ private final class RecordingRGBWeakOwner {
           format: .r12l, physicalStride: stride)
         XCTAssertEqual(layout.pixelFormat, .rgba16Uint)
         XCTAssertLessThanOrEqual(layout.width, 16384)
-        XCTAssertLessThanOrEqual(layout.copiedRowBytes, stride)
+        XCTAssertLessThanOrEqual(layout.viewRowBytes, stride)
         let rows = Array(Set([0, height / 2, height - 1])).sorted()
-        let columns = [0, 1, width / 2, width - 2, width - 1]
+        let columns = Array(0..<16) + [width / 2, width - 2, width - 1]
         CVPixelBufferLockBaseAddress(source, [])
         let bytes = try XCTUnwrap(CVPixelBufferGetBaseAddress(source)).assumingMemoryBound(to: UInt8.self)
         memset(bytes, 0, stride * height)
@@ -299,7 +299,7 @@ private final class RecordingRGBWeakOwner {
     // additional bytes of genuinely owned row padding, never a rounded VM span.
     XCTAssertThrowsError(try RecordingRGBPixelConverter.sourceTextureLayout(width: 3, height: 2, format: .r12l, physicalStride: 14))
     let padded = try RecordingRGBPixelConverter.sourceTextureLayout(width: 3, height: 2, format: .r12l, physicalStride: 16)
-    XCTAssertEqual(padded.copiedRowBytes, 16)
+    XCTAssertEqual(padded.viewRowBytes, 16)
     XCTAssertThrowsError(try RecordingRGBPixelConverter.sourceTextureLayout(width: 16385, height: 2, format: .r12l, physicalStride: 100000))
     XCTAssertThrowsError(try RecordingRGBPixelConverter.sourceTextureLayout(width: 3840, height: 16385, format: .r12l, physicalStride: 17280))
   }

@@ -134,21 +134,32 @@ pub fn analyze_events(events: Vec<StreamEvent>, config: SwitcherConfig) -> Resul
     }
 
     let mut ordered = ordered.into_iter().peekable();
+    let mut group_has_evidence = false;
     while let Some(event) = ordered.next() {
-        let explicit_tick = matches!(event, StreamEvent::Tick { .. });
         let time = observation_time(&event);
-        let outputs = director.process_event(event.clone());
+        let outputs = if let Some(accepted) = director.ingest_observation(&event) {
+            group_has_evidence |= accepted;
+            Vec::new()
+        } else {
+            // An explicit tick already evaluates this time after its observations.
+            group_has_evidence = false;
+            director.process_event(event.clone())
+        };
         timeline.record_event(event, outputs.clone());
         timeline.assume_cut_applications(&mut director, &outputs);
-        // Wait for every observation at this time, including any explicit tick.
+
         let next_time = ordered.peek().and_then(observation_time);
-        if !explicit_tick && time != next_time {
-            if let Some(time) = time {
+        if time != next_time {
+            // A late observation can supply evidence without rewinding the clock.
+            if let Some(time) = time.filter(|time| {
+                group_has_evidence && director.media_time().is_none_or(|last| *time >= last)
+            }) {
                 let tick = StreamEvent::Tick { time };
                 let outputs = director.process_event(tick.clone());
                 timeline.record_event(tick, outputs.clone());
                 timeline.assume_cut_applications(&mut director, &outputs);
             }
+            group_has_evidence = false;
         }
     }
     Ok(timeline.timeline)
@@ -163,7 +174,64 @@ fn observation_time(event: &StreamEvent) -> Option<f64> {
         StreamEvent::Audio { .. }
         | StreamEvent::Transcript { .. }
         | StreamEvent::Video { .. }
-        | StreamEvent::Tick { .. } => event_time(event),
+        | StreamEvent::Tick { .. } => {
+            // The sort must treat both zero encodings as one media timestamp.
+            event_time(event).map(|time| if time == 0.0 { 0.0 } else { time })
+        }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    fn analyze(events: Vec<Value>) -> OfflineAnalysis {
+        analyze_events(
+            events
+                .into_iter()
+                .map(|event| serde_json::from_value(event).unwrap())
+                .collect(),
+            SwitcherConfig::default(),
+        )
+        .unwrap()
+    }
+
+    fn ticks(analysis: &OfflineAnalysis) -> Vec<f64> {
+        analysis
+            .events
+            .iter()
+            .filter_map(|entry| match entry.event {
+                StreamEvent::Tick { time } => Some(time),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ignored_observations_cannot_synthesize_ticks_or_force_cuts() {
+        let analysis = analyze(vec![
+            json!({"type":"video","observation":{"camera_id":"unknown","time":75}}),
+            json!({"type":"video","observation":{"camera_id":"B","time":76,"session_generation":9}}),
+            json!({"type":"audio","cue":{"id":1,"time":77,"speech_energy":1e50}}),
+        ]);
+        assert!(ticks(&analysis).is_empty());
+        assert!(analysis.cuts.is_empty());
+    }
+
+    #[test]
+    fn accepted_evidence_advances_once_without_rewinding_the_clock() {
+        let analysis = analyze(vec![
+            json!({"type":"tick","time":-0.0}),
+            json!({"type":"video","observation":{"camera_id":"A","time":0.0}}),
+            json!({"type":"manualOverride","camera_id":"B","time":20}),
+            json!({"type":"audio","cue":{"id":1,"time":15,"speech_energy":0.5}}),
+            json!({"type":"video","observation":{"camera_id":"A","time":25}}),
+            json!({"type":"video","observation":{"camera_id":"B","time":25,"session_generation":9}}),
+            json!({"type":"audio","cue":{"id":2,"time":26,"speech_energy":0.5}}),
+            json!({"type":"tick","time":26}),
+        ]);
+        assert_eq!(ticks(&analysis), [0.0, 25.0, 26.0]);
     }
 }

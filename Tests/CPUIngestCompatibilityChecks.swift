@@ -45,6 +45,33 @@ import XCTest
     }
   }
 
+  func testPaddedRowsCanEndAtTheLastReadableByte() throws {
+    let length = 22
+    let raw = UnsafeMutableRawPointer.allocate(byteCount: length, alignment: 8)
+    defer { raw.deallocate() }
+    raw.initializeMemory(as: UInt8.self, repeating: 0xa5, count: length)
+    raw.storeBytes(of: UInt8(0xfe), toByteOffset: length - 1, as: UInt8.self)
+    let planes: [CapturedCPUMemoryFrame.Plane] = [
+      .init(offset: 0, bytesPerRow: 8, height: 2), .init(offset: 12, bytesPerRow: 8, height: 2)
+    ]
+    func frame(length: Int) -> CapturedCPUMemoryFrame {
+      CapturedCPUMemoryFrame(pointer: raw, width: 2, height: 2, bytesPerRow: 8,
+        allocation: NoCopyIngestAllocation(baseAddress: raw, length: length, generation: 1),
+        inspectVM: { _, _ in nil }, frameOwner: NSObject(), pixelFormat: 0x55595641, planes: planes)
+    }
+    XCTAssertEqual(try frame(length: length).validatedCPUReadableLength(), length)
+    XCTAssertThrowsError(try frame(length: length - 1).validatedCPUReadableLength()) {
+      XCTAssertEqual($0 as? NoCopyIngestError, .outsideAllocation)
+    }
+    let output = try CPUCompatibilityConverter(policy: .init(allowCPUConversion: true))
+      .copyIngest(frame(length: length), metal4Available: true)
+    XCTAssertEqual(CVPixelBufferLockBaseAddress(output.value, .readOnly), kCVReturnSuccess)
+    defer { CVPixelBufferUnlockBaseAddress(output.value, .readOnly) }
+    let alpha = try XCTUnwrap(CVPixelBufferGetBaseAddressOfPlane(output.value, 1))
+    let alphaStride = CVPixelBufferGetBytesPerRowOfPlane(output.value, 1)
+    XCTAssertEqual(alpha.load(fromByteOffset: alphaStride + 1, as: UInt8.self), 0xfe)
+  }
+
   func testMalformedOwnedExtentCannotUseCompatibility() {
     let raw = UnsafeMutableRawPointer.allocate(byteCount: 4, alignment: 1)
     defer { raw.deallocate() }

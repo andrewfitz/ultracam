@@ -63,7 +63,8 @@ public final class MonitorRenderer {
   /// scene's: a view sets its own screen's here, so one scene can be shown on two
   /// screens. Nil uses `scene.headroom`.
   public var displayHeadroom: Double?
-  /// What the target should be tagged with, resolved by `update()`.
+  /// What the target should be tagged with. Use `update(width:height:)`
+  /// when choosing the tag for a new target size.
   public private(set) var layerColor = MonitorLayerColor(primaries: .rec709, kind: .sdr(.bt1886))
   /// The headroom in effect.
   public private(set) var headroom = 1.0
@@ -83,12 +84,15 @@ public final class MonitorRenderer {
   private var overlays: [OverlayState] = []
   private var groups: [GroupState] = []
   private var needsRegroup = false
+  private var layerTarget: SIMD2<Int>?
   private var layerKey: LayerKey?
   private var generation: UInt64 = 0
   private var drawnKey: DrawKey?
   private var retired: [Retired] = []
   /// Encodes (classic) or submissions (Metal 4) known to have completed.
   private var completed: UInt64 = 0
+  /// A convenience driver tracks every buffer, including caller buffers committed out of order.
+  var usesExplicitClassicCompletion = false
   private var statusChanged = false
   private var graticuleChanged = false
   private let pass = MTLRenderPassDescriptor()
@@ -130,9 +134,9 @@ public final class MonitorRenderer {
 
   private static func retire(_ f: MonitorFrame?, _ a: MonitorLUT?, _ b: MonitorLUT?, to r: MonitorResidency) {
     if let f {
-      r.retire(f.packed, resident: nil)
-      r.retire(f.luma, resident: nil)
-      r.retire(f.chroma, resident: nil)
+      // Core Video may recycle the underlying pixels when its texture wrappers
+      // go away. Keep the complete frame alive alongside its Metal textures.
+      r.retire(f as AnyObject, resident: nil)
     }
     r.retire(a, resident: nil)
     r.retire(b, resident: nil)
@@ -154,7 +158,21 @@ public final class MonitorRenderer {
   /// Does not throw: what fails to build is skipped and recorded in `lastError`.
   @discardableResult
   public func update() throws -> Bool {
-    var changed = false
+    update(targetChanged: false)
+  }
+
+  /// Reads the scene for this target size, so a tile that rounds to zero
+  /// pixels cannot select the layer color. Call before tagging a drawable.
+  @discardableResult
+  public func update(width: Int, height: Int) throws -> Bool {
+    let size = SIMD2(width, height)
+    let changed = layerTarget != size
+    layerTarget = size
+    return update(targetChanged: changed)
+  }
+
+  private func update(targetChanged: Bool) -> Bool {
+    var changed = targetChanged
     let revision = scene.revision()
     if revision != sceneRevision {
       // Recorded first: a membership that fails to build is not retried every tick.
@@ -214,20 +232,39 @@ public final class MonitorRenderer {
       if now == 0 { now = Self.now() }
       if now >= due { changed = true }
     }
-    resolveLayer()
-    if changed { generation &+= 1 }
+    if changed {
+      resolveLayer()
+      generation &+= 1
+    }
     return changed
   }
 
   /// Whether a draw into a target of this size and format would differ from the
   /// last one: an unchanged scene can keep the picture already on screen.
   public func needsDisplay(width: Int, height: Int, pixelFormat: MTLPixelFormat) -> Bool {
-    drawnKey != DrawKey(
+    updateLayerTarget(width: width, height: height)
+    return drawnKey != DrawKey(
       width: width, height: height, pixelFormat: pixelFormat, pixelsPerPoint: pixelsPerPoint, generation: generation)
   }
 
   /// Forgets the last draw, so `needsDisplay` is true until the next encode.
   public func setNeedsDisplay() { drawnKey = nil }
+
+  /// A failed buffer may have carried analyses as well as the picture. Their
+  /// encoded keys do not establish that the GPU produced reusable results.
+  func invalidateGPUResults() {
+    for source in sources {
+      for feed in source.feeds {
+        feed.analyzed = nil
+        feed.feed.invalidateFocusMask()
+      }
+    }
+    for overlay in overlays {
+      overlay.accumulated = nil
+      overlay.renderer.invalidateGPUResults()
+    }
+    setNeedsDisplay()
+  }
 
   /// Draws the scene into `target` on a classic command buffer: focus analyses,
   /// scope accumulations, then one render pass that clears the target and draws
@@ -253,7 +290,7 @@ public final class MonitorRenderer {
   /// beforehand, to skip making a command buffer). Errors are recorded in `lastError`.
   @discardableResult
   public func encodeScopes(into commandBuffer: MTLCommandBuffer) -> Bool {
-    scopesEncoded(accumulate(path: .classic(commandBuffer), use: encodeCount))
+    accumulate(path: .classic(commandBuffer), use: encodeCount)
   }
 
   /// `encode(target:into:)` into a host's Metal 4 submission. The host makes the
@@ -275,7 +312,7 @@ public final class MonitorRenderer {
     usedMetal4 = true
     if submission.completedIndex > completed { completed = submission.completedIndex }
     defer { release(through: completed) }
-    return scopesEncoded(accumulate(path: .metal4(submission), use: submission.index))
+    return accumulate(path: .metal4(submission), use: submission.index)
   }
 
   /// Whether `encodeScopes` would encode an accumulation now. Reading it also
@@ -294,7 +331,9 @@ public final class MonitorRenderer {
     encodeCount &+= 1
     let use = encodeCount
     let window = UInt64(max(3, engine.framesInFlight))
-    defer { release(through: max(completed, use > window ? use - window : 0)) }
+    defer {
+      if !usesExplicitClassicCompletion, use > window { release(through: use - window) }
+    }
     try encode(target: target, path: .classic(commandBuffer), use: use, scopes: scopes)
   }
 
@@ -306,12 +345,6 @@ public final class MonitorRenderer {
     try encode(target: target, path: .metal4(submission), use: submission.index, scopes: scopes)
   }
 
-  /// New bins are drawn by the next draw, whatever else changes.
-  private func scopesEncoded(_ encoded: Bool) -> Bool {
-    if encoded { drawnKey = nil }
-    return encoded
-  }
-
   /// Reports that the GPU finished the encodes up to `index`: classic, the
   /// `encodeCount` after the encode in question; Metal 4, a submission index.
   /// What only those encodes still held is released now, not a few encodes later.
@@ -319,6 +352,12 @@ public final class MonitorRenderer {
     guard index > completed else { return }
     completed = index
     release(through: index)
+  }
+
+  /// Frames a convenience driver may need to hold past its own lifetime.
+  func uncompletedClassicFrames() -> [MonitorFrame] {
+    sources.compactMap { $0.lastUse > completed ? $0.frame : nil }
+      + retired.compactMap { $0.lastUse > completed ? $0.frame : nil }
   }
 
   /// For a paused or hidden view: releases what only completed GPU work held,
@@ -477,20 +516,10 @@ public final class MonitorRenderer {
     var spec: AnalysisSpec?
     var feedIndex = 0
     var prepared = false
-    /// What the handle holds (shares the pass's arrays, so comparing is an identity check).
-    var publishedStatus: MonitorStatus?
-    var publishedLayout: MonitorLayout?
-    var publishedViewport: MonitorViewport?
-    init(surface: MonitorSurface, source: SourceState, pass: MonitorPass, renderer: MonitorRenderer) {
+    init(surface: MonitorSurface, source: SourceState, pass: MonitorPass) {
       self.surface = surface
       self.source = source
       self.pass = pass
-      // What the handle still holds from this renderer's draw before the
-      // surface left the scene, or from a renderer that is gone: cleared if
-      // this one draws nothing. Another live view's publication is left alone.
-      let held = surface.publication(for: renderer.publisher)
-      publishedLayout = held.layout
-      publishedViewport = held.viewport
     }
   }
 
@@ -518,19 +547,13 @@ public final class MonitorRenderer {
     var accumulated: AccumulationKey?
     var viewport: MonitorViewport?
     var prepared = false
-    var publishedGraticule: ScopeGraticule?
-    var publishedViewport: MonitorViewport?
     init(
-      overlay: MonitorScopeOverlay, source: SourceState, accumulator: ScopeAccumulator, renderer: ScopeRenderer,
-      owner: MonitorRenderer
+      overlay: MonitorScopeOverlay, source: SourceState, accumulator: ScopeAccumulator, renderer: ScopeRenderer
     ) {
       self.overlay = overlay
       self.source = source
       self.accumulator = accumulator
       self.renderer = renderer
-      // As for a surface: a viewport the handle still holds from this renderer
-      // (or one that is gone) is cleared if this one draws nothing.
-      publishedViewport = overlay.publishedViewport(for: owner.publisher)
     }
   }
 
@@ -636,7 +659,7 @@ public final class MonitorRenderer {
       if let old = surfaces.first(where: { $0.surface === surface }), old.source === src {
         nextSurfaces.append(old)
       } else {
-        nextSurfaces.append(SurfaceState(surface: surface, source: src, pass: engine.makePass(), renderer: self))
+        nextSurfaces.append(SurfaceState(surface: surface, source: src, pass: engine.makePass()))
       }
     }
     var nextOverlays: [OverlayState] = []
@@ -651,7 +674,7 @@ public final class MonitorRenderer {
         let accumulator = try scopes.makeAccumulator(settings: overlay.settings)
         nextOverlays.append(
           OverlayState(
-            overlay: overlay, source: src, accumulator: accumulator, renderer: scopes.makeRenderer(), owner: self))
+            overlay: overlay, source: src, accumulator: accumulator, renderer: scopes.makeRenderer()))
         overlay.publish(statisticsReader: accumulator.statisticsReader)
       } catch {
         record(error)
@@ -662,6 +685,12 @@ public final class MonitorRenderer {
     for old in sources where !nextSources.contains(where: { $0 === old }) {
       retire(old.frame, old.feed.burnInLUT, old.feed.monitorLUT, lastUse: old.lastUse)
       for f in old.feeds { retire(feed: f.feed, lastUse: old.lastUse) }
+    }
+    for old in surfaces where !nextSurfaces.contains(where: { $0 === old }) {
+      clearPublication(for: old.surface)
+    }
+    for old in overlays where !nextOverlays.contains(where: { $0 === old }) {
+      if old.overlay.publish(graticule: nil, viewport: nil, by: publisher) { graticuleChanged = true }
     }
     sources = nextSources
     surfaces = nextSurfaces
@@ -832,6 +861,13 @@ public final class MonitorRenderer {
     }
   }
 
+  private func updateLayerTarget(width: Int, height: Int) {
+    let size = SIMD2(width, height)
+    guard size != layerTarget else { return }
+    layerTarget = size
+    resolveLayer()
+  }
+
   /// The layer tag and each surface's output colour. With a signal-native output
   /// the first surface with a frame keeps its native encoding and tags the layer;
   /// the rest are encoded explicitly for that tag.
@@ -839,7 +875,10 @@ public final class MonitorRenderer {
     var primary = -1
     var i = 0
     while i < surfaces.count {
-      if surfaces[i].source.frame != nil && surfaces[i].region.hasVisibleArea {
+      let surface = surfaces[i]
+      let visible = layerTarget.map { surface.region.viewport(width: $0.x, height: $0.y) != nil }
+        ?? surface.region.hasVisibleArea
+      if surface.source.frame != nil && visible {
         primary = i
         break
       }
@@ -870,6 +909,7 @@ public final class MonitorRenderer {
   private func encode(target: MTLTexture, path: Path, use: UInt64, scopes: Bool) throws {
     let width = target.width, height = target.height
     let format = MonitorRenderTargetFormat(colorPixelFormat: target.pixelFormat, sampleCount: target.sampleCount)
+    updateLayerTarget(width: width, height: height)
     assignFeeds(width: width, height: height)
     analyze(path: path, use: use)
     layoutOverlays(width: width, height: height)
@@ -1007,15 +1047,7 @@ public final class MonitorRenderer {
       i += 1
       s.viewport =
         s.source.frame == nil ? nil : s.region.viewport(width: width, height: height, pixelsPerPoint: pixelsPerPoint)
-      if s.viewport == nil, s.publishedLayout != nil || s.publishedViewport != nil {
-        let empty = MonitorStatus()
-        let statusDiffers = s.publishedStatus != empty
-        s.surface.publish(status: empty, layout: nil, viewport: nil, by: publisher)
-        s.publishedStatus = empty
-        s.publishedLayout = nil
-        s.publishedViewport = nil
-        if statusDiffers { statusChanged = true }
-      }
+      if s.viewport == nil { clearPublication(for: s.surface) }
       s.spec = s.viewport != nil && s.drawState.focus.enabled && !s.drawState.clean ? spec(s) : nil
       s.feedIndex = s.spec == nil ? 0 : -1
     }
@@ -1167,10 +1199,7 @@ public final class MonitorRenderer {
       // measuring apart from hidden statistics scopes that remain live.
       if measures != o.measures { needsRegroup = true }
       o.measures = measures
-      if !o.draws, o.publishedViewport != nil {
-        o.overlay.publish(graticule: nil, viewport: nil, by: publisher)
-        o.publishedViewport = nil
-      }
+      if !o.draws, o.overlay.publish(graticule: nil, viewport: nil, by: publisher) { graticuleChanged = true }
     }
   }
 
@@ -1226,8 +1255,11 @@ public final class MonitorRenderer {
         if now == 0 { now = Self.now() }
         var m = 0
         while m < g.members.count {
-          g.members[m].accumulated = key(g.members[m])
-          g.members[m].accumulatedAt = now
+          let member = g.members[m]
+          member.accumulated = key(member)
+          member.accumulatedAt = now
+          // Only a visible trace changes the next picture.
+          if member.draws { drawnKey = nil }
           m += 1
         }
         encoded = true
@@ -1247,25 +1279,21 @@ public final class MonitorRenderer {
   }
 
   private func publish(_ s: SurfaceState, viewport: MonitorViewport) {
-    let layout = s.pass.layout
-    let statusDiffers = s.publishedStatus != s.pass.status
-    guard statusDiffers || layout != s.publishedLayout || viewport != s.publishedViewport else { return }
-    s.surface.publish(
-      status: statusDiffers ? s.pass.status : nil, layout: layout, viewport: viewport, by: publisher)
-    if statusDiffers { s.publishedStatus = s.pass.status }
-    s.publishedLayout = layout
-    s.publishedViewport = viewport
-    if statusDiffers { statusChanged = true }
+    if s.surface.publish(status: s.pass.status, layout: s.pass.layout, viewport: viewport, by: publisher) {
+      statusChanged = true
+    }
+  }
+
+  private func clearPublication(for surface: MonitorSurface) {
+    if surface.publish(status: MonitorStatus(), layout: nil, viewport: nil, by: publisher) {
+      statusChanged = true
+    }
   }
 
   private func publish(_ o: OverlayState, viewport: MonitorViewport) {
-    let graticuleDiffers = o.publishedGraticule != o.renderer.graticule
-    guard graticuleDiffers || viewport != o.publishedViewport else { return }
-    o.overlay.publish(
-      graticule: graticuleDiffers ? o.renderer.graticule : nil, viewport: viewport, by: publisher)
-    if graticuleDiffers { o.publishedGraticule = o.renderer.graticule }
-    o.publishedViewport = viewport
-    if graticuleDiffers { graticuleChanged = true }
+    if o.overlay.publish(graticule: o.renderer.graticule, viewport: viewport, by: publisher) {
+      graticuleChanged = true
+    }
   }
 }
 

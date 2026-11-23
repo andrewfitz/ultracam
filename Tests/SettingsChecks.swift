@@ -44,6 +44,7 @@ import XCTest
     let json = """
       {"us.zoom.xos": {"videoMbps": 4, "pattern": "{date} Zoom", "folderPath": "/Volumes/Takes"},
        "com.microsoft.teams2": {"folderPath": "/Volumes/Teams"},
+       "com.example.invalid-bookmark": {"folderBookmark": "invalid bookmark"},
        "com.example.broken": 7}
       """
     defaults.set(Data(json.utf8), forKey: AppSettingsStore.recordingProfilesKey)
@@ -52,9 +53,18 @@ import XCTest
     XCTAssertEqual(profiles["us.zoom.xos"]?.pattern, "{date} Zoom")
     XCTAssertEqual(profiles["us.zoom.xos"]?.folderPath, "/Volumes/Takes")
     XCTAssertEqual(profiles["com.microsoft.teams2"]?.folderPath, "/Volumes/Teams")
+    let missingGrant = try XCTUnwrap(profiles["com.microsoft.teams2"])
+    XCTAssertTrue(missingGrant.hasCustomFolder)
+    XCTAssertThrowsError(try missingGrant.folder(), "A missing grant cannot redirect app recordings to the camera default")
+    XCTAssertNil(try AppRecordingProfile().folder())
     XCTAssertEqual(profiles["com.microsoft.teams2"]?.videoMbps, AppRecordingProfile.defaultVideoMbps)
     XCTAssertEqual(profiles["com.microsoft.teams2"]?.pattern, AppRecordingProfile.defaultPattern)
     XCTAssertNil(profiles["com.example.broken"])
+    let store = AppSettingsStore(defaults: defaults)
+    store.recordingProfiles = profiles
+    let invalidGrant = try XCTUnwrap(store.recordingProfiles["com.example.invalid-bookmark"])
+    XCTAssertTrue(invalidGrant.hasCustomFolder)
+    XCTAssertThrowsError(try invalidGrant.folder(), "A malformed grant without a display path still names a custom destination")
   }
 
   func testDockVisibilityPreferencePersistsIndependentlyOfFeedSettings() throws {

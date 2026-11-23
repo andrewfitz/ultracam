@@ -33,6 +33,12 @@ class Client:
         while True:
             yield self.read()
 
+    def shutdown(self):
+        try:
+            self.socket.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
 
 if __name__ == "__main__":
     cli = argparse.ArgumentParser()

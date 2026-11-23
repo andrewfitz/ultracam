@@ -11,14 +11,14 @@ import Foundation
 // - One producer: `process` is called from one thread at a time (the audio
 //   thread). `snapshot()` and the `reset` requests are safe from any thread at
 //   any time; they never block the producer.
-// - Snapshots are published lock-free (a sequence lock over atomic words), so a
+// - Snapshots are published lock-free using two slots of atomic words, so a
 //   reader always sees one consistent set of readings.
 
 /// The largest channel count a meter accepts (two 8-pair SDI groups).
 public let audioMeterMaximumChannelCount = 16
 
-@inline(__always) func amplitudeDB(_ value: Double) -> Float {
-  value > 0 ? Float(20 * log10(value)) : -.infinity
+@inline(__always) func amplitudeDB(_ value: Double, offset: Double = 0) -> Float {
+  value > 0 ? Float(20 * log10(value) + offset) : -.infinity
 }
 
 /// BS.1770-4 eq. 2: loudness from the channel-weighted mean square.

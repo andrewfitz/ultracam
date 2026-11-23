@@ -64,10 +64,14 @@ struct ClockMappedPCMBridge {
       let channelsPerBuffer = format.interleaved ? format.channels : 1
       let bytesPerBuffer = count * Int(asbd.mBytesPerFrame) // bounded by preflight
       guard buffers.count == bufferCount else { throw ClockMappedPCMError.invalidPacket }
-      let planes = try buffers.map { audio -> Data in
-        guard Int(audio.mNumberChannels) == channelsPerBuffer, Int(audio.mDataByteSize) == bytesPerBuffer,
-          let data = audio.mData else { throw ClockMappedPCMError.invalidPacket }
-        return Data(bytes: data, count: Int(audio.mDataByteSize))
+      // Core Media may allocate a contiguous block for a fragmented sample.
+      // Its AudioBuffer pointers are borrowed until the copies finish.
+      let planes = try withExtendedLifetime(retained) {
+        try buffers.map { audio -> Data in
+          guard Int(audio.mNumberChannels) == channelsPerBuffer, Int(audio.mDataByteSize) == bytesPerBuffer,
+            let data = audio.mData else { throw ClockMappedPCMError.invalidPacket }
+          return Data(bytes: data, count: Int(audio.mDataByteSize))
+        }
       }
       if outputDescription == nil { outputDescription = try makeDescription(source: description) }
       let chunk = try converter.convert(planes: planes, sampleFrameCount: count,

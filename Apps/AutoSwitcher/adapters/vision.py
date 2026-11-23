@@ -84,8 +84,9 @@ def main():
                 ok, frame = camera.read()
                 if not ok:
                     raise ValueError("camera disconnected")
-                stamp = client.request("state")["status"]["time"]
-                yield dict(camera_id=args.route, time=stamp), frame
+                snapshot = client.request("state")
+                yield dict(camera_id=args.route, time=snapshot["status"]["time"],
+                           session_generation=snapshot.get("session_generation", 0)), frame
                 time.sleep(max(0, 1 / args.fps - (time.monotonic() - started)))
         finally:
             camera.release()
@@ -97,16 +98,19 @@ def main():
         if frame is None:
             raise ValueError("unreadable image")
         frame = cv2.resize(frame, (320, 320), interpolation=cv2.INTER_AREA)
-        observation = dict(camera_id=route, time=sample["time"])
+        generation = sample.get("session_generation", 0)
+        observation = dict(camera_id=route, time=sample["time"], session_generation=generation)
         if detector is not None:
             observation["eye_contact"] = frontal_score(detector, frame)
         elif args.mode == "provider":
             observation["provider_score"] = provider_score(frame, args)
         else:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            prior = previous.get(route, gray)
+            prior_generation, prior = previous.get(route, (generation, gray))
+            if prior_generation != generation:
+                prior = gray
             observation["motion"] = cv2.countNonZero(cv2.inRange(cv2.absdiff(gray, prior), 21, 255)) / gray.size
-            previous[route] = gray
+            previous[route] = (generation, gray)
         client.event("video", observation=observation)
 
 

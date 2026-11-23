@@ -203,14 +203,12 @@ final class LUTProcessor: @unchecked Sendable {
   private final class SurfaceEntry {
     let surface: IOSurfaceRef
     let texture: MTLTexture
-    var lastUsed: UInt64
-    var lastUsedTime: TimeInterval
+    var lastUse: (sequence: UInt64, time: TimeInterval)?
+    var isPrepared = true
     let lease: GPUAllocationBudget.Lease
-    init(surface: IOSurfaceRef, texture: MTLTexture, lastUsed: UInt64, time: TimeInterval, lease: GPUAllocationBudget.Lease) {
+    init(surface: IOSurfaceRef, texture: MTLTexture, lease: GPUAllocationBudget.Lease) {
       self.surface = surface
       self.texture = texture
-      self.lastUsed = lastUsed
-      self.lastUsedTime = time
       self.lease = lease
     }
   }
@@ -667,6 +665,7 @@ final class LUTProcessor: @unchecked Sendable {
       CVPixelBufferGetWidth(buffer) == width, CVPixelBufferGetHeight(buffer) == height else {
       throw VideoError.message("The render target is not an IOSurface \(VideoContract.fourCC(configuration.pixelFormat)) buffer of \(width) × \(height).")
     }
+    try VideoBufferLayout.validate(buffer)
   }
 
   private final class Waiter: @unchecked Sendable {
@@ -690,10 +689,14 @@ final class LUTProcessor: @unchecked Sendable {
 
   private static let supportedInputFormats: Set<OSType> = Set(VideoContract.tenBit422).union([
     kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
-    kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+    kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange, kCVPixelFormatType_420YpCbCr10BiPlanarFullRange,
     kCVPixelFormatType_422YpCbCr8BiPlanarVideoRange,
     0x50323136, 0x32767579, 0x79757673, kCVPixelFormatType_32BGRA, kCVPixelFormatType_32RGBA,
     0x72323130, 0x5231324c, 0x55595641, 0x49343230, 0x50413136])
+
+  static func supportsInputFormat(_ pixelFormat: OSType) -> Bool {
+    supportedInputFormats.contains(pixelFormat)
+  }
 
   /// Returns true for an untouched configuration (the input is the output).
   private func validate(_ input: CVPixelBuffer, untouched: Bool) throws -> Bool {
@@ -701,7 +704,7 @@ final class LUTProcessor: @unchecked Sendable {
     guard width > 0, height > 0 else {
       throw VideoError.message("LUT input dimensions must be positive.")
     }
-    guard Self.supportedInputFormats.contains(CVPixelBufferGetPixelFormatType(input)) else {
+    guard Self.supportsInputFormat(CVPixelBufferGetPixelFormatType(input)) else {
       throw VideoError.message("Live processing does not support \(VideoContract.fourCC(CVPixelBufferGetPixelFormatType(input))) input.")
     }
     try VideoBufferLayout.validate(input)
@@ -740,28 +743,18 @@ final class LUTProcessor: @unchecked Sendable {
 
   private func validateSource(_ input: CVPixelBuffer, source: SourceAdmissionSnapshot,
     metadata: SourceAdmissionMetadata) throws {
-    // The snapshot may originate at the capture gate: independently require
-    // this consumer's route before allocating output or retaining GPU work.
-    let route = try SourceAdmissionSnapshot(format: source.format, epochID: source.epochID,
-      clockBindings: source.clockBindings, stage: .lut)
-    try route.validate(metadata, stage: .lut)
-    var actual = metadata
-    actual.width = CVPixelBufferGetWidth(input)
-    actual.height = CVPixelBufferGetHeight(input)
-    actual.pixel = PixelFormatID(rawValue: CVPixelBufferGetPixelFormatType(input))
-    actual.isPlanar = CVPixelBufferIsPlanar(input)
-    actual.planeCount = CVPixelBufferGetPlaneCount(input)
-    actual.rowBytes = CVPixelBufferGetBytesPerRow(input)
-    actual.dataSize = CVPixelBufferGetDataSize(input)
-    actual.planes = (0..<actual.planeCount).map {
-      VideoBufferLayout.Plane(width: CVPixelBufferGetWidthOfPlane(input, $0),
-        height: CVPixelBufferGetHeightOfPlane(input, $0), rowBytes: CVPixelBufferGetBytesPerRowOfPlane(input, $0))
-    }
-    try route.validate(actual, stage: .lut)
-    guard actual.width == metadata.width, actual.height == metadata.height,
-      actual.pixel == metadata.pixel, actual.isPlanar == metadata.isPlanar,
-      actual.planeCount == metadata.planeCount, actual.rowBytes == metadata.rowBytes,
-      actual.dataSize == metadata.dataSize else {
+    // validate checks the requested route even for a snapshot admitted at capture.
+    try source.validate(metadata, stage: .lut)
+    guard CVPixelBufferGetWidth(input) == metadata.width, CVPixelBufferGetHeight(input) == metadata.height,
+      CVPixelBufferGetPixelFormatType(input) == metadata.pixel.rawValue, CVPixelBufferIsPlanar(input) == metadata.isPlanar,
+      CVPixelBufferGetPlaneCount(input) == metadata.planeCount, CVPixelBufferGetBytesPerRow(input) == metadata.rowBytes,
+      CVPixelBufferGetDataSize(input) == metadata.dataSize,
+      metadata.planes.indices.allSatisfy({ index in
+        let plane = metadata.planes[index]
+        return CVPixelBufferGetWidthOfPlane(input, index) == plane.width
+          && CVPixelBufferGetHeightOfPlane(input, index) == plane.height
+          && CVPixelBufferGetBytesPerRowOfPlane(input, index) == plane.rowBytes
+      }) else {
       throw SourceAdmissionRefusal(stage: .lut, formatDescription: source.formatSignature,
         reason: "actual pixel buffer layout differs from source metadata")
     }
@@ -778,7 +771,7 @@ final class LUTProcessor: @unchecked Sendable {
     into renderTarget: CVPixelBuffer? = nil,
     isCurrent: () -> Bool = { true }, completion: @escaping Completion) throws {
     let preparedSequence = submitted
-    defer { if submitted == preparedSequence { discardUnsubmittedOutputTextures(sequence: preparedSequence) } }
+    defer { if submitted == preparedSequence { discardUnsubmittedOutputTextures() } }
     let submittedAt = ProcessInfo.processInfo.systemUptime
     if try validate(input, untouched: configuration.untouched && colorConversion == .none && destinationColorimetry == nil) {
       throw VideoError.message("An untouched configuration has no GPU work; use passthrough.")
@@ -786,9 +779,13 @@ final class LUTProcessor: @unchecked Sendable {
     guard CVPixelBufferGetIOSurface(input) != nil else { throw LiveFrameRouteError.unshareableStorage }
     let applied = configuration.applyLUT ? lut : nil
     guard !configuration.applyLUT || applied != nil else { throw VideoError.message("Load a LUT or turn off Apply LUT.") }
+    let type = CVPixelBufferGetPixelFormatType(input)
+    let rgbBits: Int? = [kCVPixelFormatType_32BGRA, kCVPixelFormatType_32RGBA].contains(type) ? 8 :
+      (type == 0x72323130 ? 10 : (type == 0x5231324c ? 12 : nil))
     let sourceColour = (try declaredSourceColorimetry ?? Self.sourceColorimetry(input))
       .overridingRGBEncoding(with: configuration.sourceColorimetryOverride)
-    guard sourceColour.matrix != .unspecified, sourceColour.primaries != .unspecified,
+    guard sourceColour.matrix != .unspecified, sourceColour.matrix != .identity || rgbBits != nil,
+      sourceColour.primaries != .unspecified,
       sourceColour.transfer != .unspecified else { throw LiveFrameRouteError.missingColour }
     let nativeOutput = sourceColour.centeredVideoOutput
     if configuration.applyLUT, let negotiated = configuration.lutOutputColorimetry,
@@ -806,7 +803,6 @@ final class LUTProcessor: @unchecked Sendable {
       throw LiveFrameRouteError.unsupportedColourConversion("Unsupported LUT output range, matrix, primaries or transfer function.")
     }
     let width = CVPixelBufferGetWidth(input), height = CVPixelBufferGetHeight(input)
-    let type = CVPixelBufferGetPixelFormatType(input)
     let matrix: String? = sourceColour.matrix == .rec2020 ? kCVImageBufferYCbCrMatrix_ITU_R_2020 as String :
       (sourceColour.matrix == .rec601 ? kCVImageBufferYCbCrMatrix_ITU_R_601_4 as String : kCVImageBufferYCbCrMatrix_ITU_R_709_2 as String)
     var parameters = Self.parameters(for: input, matrix: matrix, lut: applied)
@@ -831,8 +827,6 @@ final class LUTProcessor: @unchecked Sendable {
     // RGB samples are unpacked in native code units before normalization.
     // Range belongs to the authoritative transport declaration, independently
     // of a manual gamut/transfer interpretation or a LUT's RGB encoding.
-    let rgbBits: Int? = [kCVPixelFormatType_32BGRA, kCVPixelFormatType_32RGBA].contains(type) ? 8 :
-      (type == 0x72323130 ? 10 : (type == 0x5231324c ? 12 : nil))
     if let rgbBits {
       let maximum = Float((1 << rgbBits) - 1), scale = Float(1 << (rgbBits - 8))
       parameters.decodeRange = SIMD4(sourceColour.range == .full ? 0 : 16 * scale,
@@ -878,9 +872,7 @@ final class LUTProcessor: @unchecked Sendable {
     let uvEntry = try outputTexture(output, plane: 1, format: configuration.outputColor.isEightBit ? .rg8Unorm : .rg16Unorm)
     let y = yEntry.texture, uv = uvEntry.texture
     var inputs: [MTLTexture] = []
-    // Keep the output views and their budget leases with this frame, alongside
-    // its input wrappers; no search through the whole output cache is needed.
-    var wrappers: [AnyObject] = [yEntry, uvEntry]
+    var wrappers: [AnyObject] = []
     let rgbKind: UInt32?
     switch type {
     case kCVPixelFormatType_32BGRA: rgbKind = 1
@@ -936,10 +928,10 @@ final class LUTProcessor: @unchecked Sendable {
     // Frames in flight may still use it: release at an idle moment (normally
     // the next frame) rather than wait for the GPU on the capture thread.
     if !resizing, horizontalTexture != nil, framesInFlight == 0 { releaseIntermediate() }
-    stampAttachments(output, from: input, configuration: configuration, destination: destination, geometryConverted: resizing, colourEncodingChanged: !LUTColorSpaceContract.sameRGBEncoding(sourceColour, destination))
     // The frame retains its LUT and keeps its texture resident until it completes.
     let lutTexture = applied?.texture ?? placeholderLUT
-    try encode(output: output, retained: wrappers + [input] + (applied.map { [$0] } ?? []) + (horizontal.map { [$0] } ?? []),
+    try encode(output: output, outputEntries: [yEntry, uvEntry],
+      retained: wrappers + [input] + (applied.map { [$0] } ?? []) + (horizontal.map { [$0] } ?? []),
       inputResidency: inputs + (applied.map { [$0.texture] } ?? []),
       usesIntermediate: horizontal != nil, timing: FrameTiming(submitted: submittedAt), isCurrent: isCurrent,
       label: "LUT → Lanczos → output format", completion: completion) { encoder, slot in
@@ -981,6 +973,8 @@ final class LUTProcessor: @unchecked Sendable {
         encoder.setComputePipelineState(state)
         dispatchBlocks(encoder, state: state, width: width, height: height, is420: configuration.outputColor.is420)
       }
+      stampAttachments(output, from: input, configuration: configuration, destination: destination,
+        geometryConverted: resizing, colourEncodingChanged: !LUTColorSpaceContract.sameRGBEncoding(sourceColour, destination))
       return true
     }
   }
@@ -990,12 +984,21 @@ final class LUTProcessor: @unchecked Sendable {
   static var declaredColorimetryAttachmentKey: CFString { "UltracamColorimetryContract" as CFString }
 
   static func sourceColorimetry(_ image: CVPixelBuffer) throws -> Colorimetry {
-    if let payload = CVBufferCopyAttachment(image, declaredColorimetryAttachmentKey, nil) as? Data {
+    if let declaration = CVBufferCopyAttachment(image, declaredColorimetryAttachmentKey, nil) {
+      guard let payload = declaration as? Data else {
+        throw VideoError.message("Unsupported source colour declaration attachment.")
+      }
       return try JSONDecoder().decode(ColorimetryContract.self, from: payload).colorimetry
     }
-    func tag(_ key: CFString) -> String? { CVBufferCopyAttachment(image, key, nil) as? String }
+    func tag(_ key: CFString) throws -> String? {
+      guard let attachment = CVBufferCopyAttachment(image, key, nil) else { return nil }
+      guard let value = attachment as? String else {
+        throw VideoError.message("Unsupported source colour attachment.")
+      }
+      return value
+    }
     func read<T>(_ key: CFString, values: [(CFString, T)], fallback: T) throws -> T {
-      guard let value = tag(key) else { return fallback }
+      guard let value = try tag(key) else { return fallback }
       guard let match = values.first(where: { $0.0 as String == value }) else {
         throw VideoError.message("Unsupported source colour attachment.")
       }
@@ -1015,7 +1018,7 @@ final class LUTProcessor: @unchecked Sendable {
         (kCVImageBufferYCbCrMatrix_ITU_R_2020, .rec2020), (kCVImageBufferYCbCrMatrix_ITU_R_601_4, .rec601)], fallback: .rec709)
     let horizontal: Colorimetry.ChromaSiting
     let vertical: Colorimetry.ChromaSiting
-    switch tag(kCVImageBufferChromaLocationTopFieldKey) ?? (kCVImageBufferChromaLocation_Left as String) {
+    switch try tag(kCVImageBufferChromaLocationTopFieldKey) ?? (kCVImageBufferChromaLocation_Left as String) {
     case let location where location == kCVImageBufferChromaLocation_Left as String: horizontal = .left; vertical = .center
     case let location where location == kCVImageBufferChromaLocation_Center as String: horizontal = .center; vertical = .center
     case let location where location == kCVImageBufferChromaLocation_TopLeft as String: horizontal = .left; vertical = .top
@@ -1129,7 +1132,7 @@ final class LUTProcessor: @unchecked Sendable {
   func submitPassthrough(_ input: CVPixelBuffer, isCurrent: () -> Bool = { true },
     completion: @escaping Completion) throws {
     let preparedSequence = submitted
-    defer { if submitted == preparedSequence { discardUnsubmittedOutputTextures(sequence: preparedSequence) } }
+    defer { if submitted == preparedSequence { discardUnsubmittedOutputTextures() } }
     let submittedAt = ProcessInfo.processInfo.systemUptime
     let width = CVPixelBufferGetWidth(input), height = CVPixelBufferGetHeight(input)
     let type = CVPixelBufferGetPixelFormatType(input)
@@ -1156,13 +1159,14 @@ final class LUTProcessor: @unchecked Sendable {
     passthroughSlotBytes = CVPixelBufferGetIOSurface(output).map { IOSurfaceGetAllocSize($0.takeUnretainedValue()) } ?? 0
     flushTextureCache()
     var copies: [(MTLTexture, MTLTexture, CopyPlane)] = []
+    var outputEntries: [SurfaceEntry] = []
     var wrappers: [AnyObject] = []
     var inputs: [MTLTexture] = []
     for plane in planes {
       let (wrapper, source) = try view(input, plane: plane.index, format: plane.format, width: plane.width, height: plane.height)
       let target = try outputTexture(output, plane: plane.index, format: plane.format, width: plane.width, height: plane.height)
       wrappers.append(wrapper)
-      wrappers.append(target)
+      outputEntries.append(target)
       inputs.append(source)
       copies.append((source, target.texture, plane))
     }
@@ -1171,7 +1175,7 @@ final class LUTProcessor: @unchecked Sendable {
     // A copy owns independent storage: nonpropagating attachments can hold
     // source SDK leases and must not follow it. Preserve only standard image
     // interpretation metadata when a producer marked that metadata local.
-    for key in [kCVImageBufferCGColorSpaceKey, kCVImageBufferICCProfileKey,
+    for key in [Self.declaredColorimetryAttachmentKey, kCVImageBufferCGColorSpaceKey, kCVImageBufferICCProfileKey,
       kCVImageBufferColorPrimariesKey, kCVImageBufferTransferFunctionKey,
       kCVImageBufferYCbCrMatrixKey, kCVImageBufferGammaLevelKey,
       kCVImageBufferChromaLocationTopFieldKey, kCVImageBufferChromaLocationBottomFieldKey,
@@ -1187,7 +1191,7 @@ final class LUTProcessor: @unchecked Sendable {
         CVBufferSetAttachment(output, key, value, mode)
       }
     }
-    try encode(output: output, retained: wrappers + [input], inputResidency: inputs,
+    try encode(output: output, outputEntries: outputEntries, retained: wrappers + [input], inputResidency: inputs,
       usesIntermediate: false, timing: FrameTiming(submitted: submittedAt),
       isCurrent: isCurrent, label: "Passthrough", completion: completion) { encoder, _ in
       for (source, target, plane) in copies {
@@ -1203,7 +1207,7 @@ final class LUTProcessor: @unchecked Sendable {
   /// Waits for a slot, encodes into it and commits. Everything fallible
   /// except encoder creation happened before, so a sequence number is always
   /// committed once taken.
-  private func encode(output: CVPixelBuffer, retained: [AnyObject], inputResidency inputs: [MTLTexture],
+  private func encode(output: CVPixelBuffer, outputEntries: [SurfaceEntry], retained: [AnyObject], inputResidency inputs: [MTLTexture],
     usesIntermediate: Bool,
     timing: FrameTiming, isCurrent: () -> Bool, label: String, completion: @escaping Completion,
     body: (MTL4ComputeCommandEncoder, Slot) -> Bool) throws {
@@ -1242,10 +1246,17 @@ final class LUTProcessor: @unchecked Sendable {
       slotPermits.signal()
       throw VideoError.message("Missing GPU pipeline for \(label).")
     }
+    outputCacheLock.withLock {
+      let now = monotonicNow()
+      for entry in outputEntries {
+        entry.lastUse = (sequence, now)
+        entry.isPrepared = false
+      }
+    }
     submitted &+= 1
     var timing = timing
     timing.committed = ProcessInfo.processInfo.systemUptime
-    let record = InFlight(output: output, retained: retained, completion: completion, timing: timing,
+    let record = InFlight(output: output, retained: retained + outputEntries, completion: completion, timing: timing,
       slotIndex: Int(sequence % UInt64(slots.count)))
     stateLock.withLock {
       pending[sequence] = record
@@ -1282,6 +1293,12 @@ final class LUTProcessor: @unchecked Sendable {
       if ProcessInfo.processInfo.systemUptime - start > 2 {
         throw VideoError.message("The GPU stopped responding: \(VideoContract.maxFramesInFlight) frames have been in flight for over 2 seconds.")
       }
+    }
+    // An epoch can end just before the slot becomes available, including
+    // when the wait succeeds immediately and never enters the timeout loop.
+    guard isCurrent() else {
+      slotPermits.signal()
+      throw VideoError.cancelled
     }
   }
 
@@ -1430,8 +1447,7 @@ final class LUTProcessor: @unchecked Sendable {
     }
     let key = SurfaceKey(id: IOSurfaceGetID(surface), plane: plane, format: format.rawValue)
     if let entry = outputTextures[key], entry.surface === surface {
-      entry.lastUsed = submitted
-      entry.lastUsedTime = monotonicNow()
+      entry.isPrepared = true
       return entry
     }
     if let stale = outputTextures[key], stale.surface !== surface {
@@ -1458,7 +1474,7 @@ final class LUTProcessor: @unchecked Sendable {
       evictIdleOutputTextures(pressure: true)
       lease = try allocationBudget.acquire(backingID: UInt64(IOSurfaceGetID(surface)), bytes: bytes, generation: 0, owner: surface)
     }
-    let entry = SurfaceEntry(surface: surface, texture: texture, lastUsed: submitted, time: monotonicNow(), lease: lease)
+    let entry = SurfaceEntry(surface: surface, texture: texture, lease: lease)
     outputTextures[key] = entry
     scheduleAgeSweepLocked()
     outputResidency.addAllocation(texture)
@@ -1466,16 +1482,20 @@ final class LUTProcessor: @unchecked Sendable {
     return entry
   }
 
-  /// Preparing a frame may fail before a command is committed. Those views
-  /// have no GPU user and must not strand a byte-budget reservation.
-  private func discardUnsubmittedOutputTextures(sequence: UInt64) {
+  /// A failed submission releases new views and leaves the last committed use
+  /// of existing views available for eviction once that work completes.
+  private func discardUnsubmittedOutputTextures() {
     outputCacheLock.withLock {
-      let unused = outputTextures.filter { $0.value.lastUsed == sequence }
+      let unused = outputTextures.filter { $0.value.isPrepared && $0.value.lastUse == nil }
+      for entry in outputTextures.values { entry.isPrepared = false }
       for (key, entry) in unused {
         outputTextures.removeValue(forKey: key)
         outputResidency.removeAllocation(entry.texture)
       }
-      if !unused.isEmpty { outputResidency.commit() }
+      if !unused.isEmpty {
+        outputResidency.commit()
+        outputResidencyDirty = false
+      }
     }
   }
 
@@ -1485,9 +1505,9 @@ final class LUTProcessor: @unchecked Sendable {
     outputCacheLock.lock(); defer { outputCacheLock.unlock() }
     let completed = stateLock.withLock { nextCompletion }
     let now = monotonicNow()
-    let stale = outputTextures.filter {
-      $0.value.lastUsed < completed && (pressure ||
-        (now >= $0.value.lastUsedTime && now - $0.value.lastUsedTime >= cacheIdleAge))
+    let stale = outputTextures.filter { _, entry in
+      guard !entry.isPrepared, let use = entry.lastUse, use.sequence < completed else { return false }
+      return pressure || (now >= use.time && now - use.time >= cacheIdleAge)
     }
     guard !stale.isEmpty else { return }
     for (key, entry) in stale {
@@ -1642,10 +1662,9 @@ final class LUTProcessor: @unchecked Sendable {
     }
     CVBufferRemoveAttachment(output, Self.declaredColorimetryAttachmentKey)
     Self.canonicalizeOutputGeometry(output)
-    // Encoders average each pair/block, producing centered chroma even if input
-    // samples were left-cosited. Never carry the source's location onto output.
-    CVBufferSetAttachment(output, kCVImageBufferChromaLocationTopFieldKey, kCVImageBufferChromaLocation_Center, .shouldPropagate)
-    CVBufferRemoveAttachment(output, kCVImageBufferChromaLocationBottomFieldKey)
+    // The encoded pixel format supplies its subsampling and has no alpha.
+    CVBufferRemoveAttachment(output, kCVImageBufferChromaSubsamplingKey)
+    CVBufferRemoveAttachment(output, kCVImageBufferAlphaChannelModeKey)
     if geometryConverted {
       CVBufferRemoveAttachment(output, kCVImageBufferPixelAspectRatioKey)
       CVBufferRemoveAttachment(output, kCVImageBufferCleanApertureKey)
@@ -1661,6 +1680,7 @@ final class LUTProcessor: @unchecked Sendable {
     if configuration.applyLUT || colourEncodingChanged {
       CVBufferRemoveAttachment(output, kCVImageBufferMasteringDisplayColorVolumeKey)
       CVBufferRemoveAttachment(output, kCVImageBufferContentLightLevelInfoKey)
+      CVBufferRemoveAttachment(output, kCVImageBufferAmbientViewingEnvironmentKey)
     }
   }
 }

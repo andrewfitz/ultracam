@@ -366,8 +366,10 @@ fn load_config(path: Option<PathBuf>) -> Result<SwitcherConfig> {
     // Automatic camera jumps have a ten-second safety floor. Keep the library
     // configurable for deterministic unit tests, but never let the CLI run a
     // production session with a shorter interval.
-    if config.strategy == auto_switcher::model::Strategy::TalkingHead {
-        config.minimum_shot_duration = config.minimum_shot_duration.max(10.0);
+    if config.strategy == auto_switcher::model::Strategy::TalkingHead
+        && (0.0..10.0).contains(&config.minimum_shot_duration)
+    {
+        config.minimum_shot_duration = 10.0;
     }
     config.validate().map_err(anyhow::Error::msg)?;
     Ok(config)

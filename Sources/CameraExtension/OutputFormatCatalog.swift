@@ -49,15 +49,11 @@ enum OutputFormatCatalog {
   static func matchingIndex(_ requested: ExtensionFormatContract,
                             duration: CMTime,
                             installed: [ExtensionFormatContract] = published) -> Int? {
-    guard requested.allows(duration: duration), ExtensionFormatCatalog.installedPrefixMatchesPublished(installed),
-      let index = installed.firstIndex(of: requested),
-      published.contains(requested) else { return nil }
-    return index
+    try? ExtensionFormatCatalog.negotiate(requested: requested, duration: duration, installed: installed)
   }
 
   static func validateAppendOnly(previous: [ExtensionFormatContract],
                                  proposed: [ExtensionFormatContract]) -> Bool {
-    proposed.count >= previous.count && Array(proposed.prefix(previous.count)) == previous &&
-      Set(proposed.map(\.id)).count == proposed.count
+    (try? ExtensionFormatCatalog.validateAppendOnly(previous: previous, proposed: proposed)) != nil
   }
 }

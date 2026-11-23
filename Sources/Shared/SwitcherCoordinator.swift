@@ -213,12 +213,16 @@ struct SwitcherCoordinator {
   /// would select at once instead of cutting), and a pending cut would vanish
   /// without the abandoned report its requester waits for.
   mutating func carryProgramTimeline(from previous: SwitcherCoordinator) {
-    programOutput.carryTimeline(from: previous.programOutput, keeping: Set(feedIDs))
-    for (id, healthy) in previous.feedHealth where feedIDs.contains(id) {
+    let remainingFeeds = Set(feedIDs)
+    programOutput.carryTimeline(from: previous.programOutput, keeping: remainingFeeds)
+    if previous.selectedFeedID == selectedFeedID {
+      fixedIntervalOrigin = previous.fixedIntervalOrigin
+    }
+    for (id, healthy) in previous.feedHealth where remainingFeeds.contains(id) {
       feedHealth[id] = healthy
       programOutput.setSourceHealth(id, healthy: healthy)
     }
-    cutIneligible = previous.cutIneligible.intersection(feedIDs)
+    cutIneligible = previous.cutIneligible.intersection(remainingFeeds)
     if programOutput.hasPendingCut {
       automaticRequestPending = previous.automaticRequestPending
     }
@@ -235,13 +239,10 @@ struct SwitcherCoordinator {
   mutating func updateSettings(_ settings: SwitcherSettings) {
     var settings = settings
     settings.selectedFeedID = selectedFeedID
-    let changed = self.settings != settings
+    guard self.settings != settings else { return }
     self.settings = settings
-    if changed {
-      cancelPendingCut()
-    }
+    cancelPendingCut()
     fixedIntervalOrigin = .nan
-    automaticRequestPending = false
     reconcilePendingState()
   }
 
@@ -278,12 +279,11 @@ struct SwitcherCoordinator {
   /// Evaluate fixed interval policy at a caller supplied media time. The first
   /// evaluation establishes the interval origin, making replay deterministic.
   mutating func evaluate(at mediaTime: CMTime) -> SwitcherEvaluation {
+    // Cut expiry uses the scheduler's wall clock, independently of the
+    // analysis strategy or the validity of this media sample.
+    expirePendingCutIfNeeded()
     guard let now = validSeconds(mediaTime) else { return .idle }
     guard settings.strategy != .dynamicAnalysis else { return .dynamicAnalysisUnavailable }
-    // Expire first: a cut that can no longer land must release the latch
-    // before the latch is consulted.
-    programOutput.expirePendingCutIfNeeded()
-    reconcilePendingState()
     guard settings.automatic, settings.strategy == .fixedInterval else { return .idle }
     let health: [UInt8] = feedIDs.map { isFeedHealthy($0) ? 1 : 0 }
     let current = selectedFeedID.flatMap { feedIDs.firstIndex(of: $0) } ?? -1
@@ -393,7 +393,7 @@ struct SwitcherCoordinator {
 }
 
 private func validSeconds(_ time: CMTime) -> TimeInterval? {
-  guard time.isValid, time.isNumeric else { return nil }
+  guard time.isValid, time.isNumeric, time.epoch == 0, time.timescale > 0 else { return nil }
   let seconds = CMTimeGetSeconds(time)
   return seconds.isFinite && seconds >= 0 ? seconds : nil
 }

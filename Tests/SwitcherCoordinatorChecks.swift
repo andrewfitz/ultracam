@@ -99,6 +99,23 @@ import XCTest
     XCTAssertEqual(coordinator.evaluate(at: time(8)), .cutQueued(b))
   }
 
+  func testUnchangedSettingsAndAddingAFeedPreserveTheCurrentInterval() {
+    let a = feed("A"), b = feed("B")
+    let settings = SwitcherSettings(selectedFeedID: a, automatic: true,
+      intervalSeconds: 2, strategy: .fixedInterval)
+    var coordinator = SwitcherCoordinator(settings: settings, feedIDs: [a, b])
+    XCTAssertEqual(coordinator.evaluate(at: time(20)), .idle)
+    coordinator.updateSettings(settings)
+    XCTAssertEqual(coordinator.evaluate(at: time(21)), .idle)
+
+    var rebuilt = SwitcherCoordinator(settings: settings, feedIDs: [a, b, feed("C")])
+    rebuilt.carryProgramTimeline(from: coordinator)
+    XCTAssertEqual(rebuilt.evaluate(at: time(22)), .cutQueued(b))
+    rebuilt.updateSettings(settings)
+    XCTAssertTrue(rebuilt.isAutomaticRequestPending)
+    XCTAssertEqual(rebuilt.pendingCut, b)
+  }
+
   func testDynamicAnalysisIsAnExplicitDisabledStub() {
     let a = feed("A")
     let settings = SwitcherSettings(selectedFeedID: a, automatic: true,
@@ -107,6 +124,25 @@ import XCTest
     XCTAssertEqual(coordinator.statusMessage, "Coming later.")
     XCTAssertEqual(coordinator.evaluate(at: time(10)), .dynamicAnalysisUnavailable)
     XCTAssertNil(coordinator.pendingCut)
+  }
+
+  func testEvaluationExpiresCutsWhenAnalysisIsUnavailableOrMediaTimeIsInvalid() {
+    let a = feed("A"), b = feed("B")
+    let settings = SwitcherSettings(selectedFeedID: a, automatic: true, strategy: .dynamicAnalysis)
+    var coordinator = SwitcherCoordinator(settings: settings, feedIDs: [a, b])
+    var now = 0.0
+    coordinator.setPendingCutClock({ now }, timeout: 2)
+    _ = coordinator.ingest(frame(a, 0))
+
+    guard case .queued = coordinator.requestManualCut(to: b) else { return XCTFail("First cut did not queue") }
+    now = 2
+    XCTAssertEqual(coordinator.evaluate(at: time(1)), .dynamicAnalysisUnavailable)
+    XCTAssertEqual(coordinator.takeAbandonedCut()?.1, .expired)
+
+    guard case .queued = coordinator.requestManualCut(to: b) else { return XCTFail("Second cut did not queue") }
+    now = 4
+    XCTAssertEqual(coordinator.evaluate(at: .invalid), .idle)
+    XCTAssertEqual(coordinator.takeAbandonedCut()?.1, .expired)
   }
 
   /// PROG-2: a fixed-interval cut that expires (or is cancelled by health)

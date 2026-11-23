@@ -244,7 +244,9 @@ public struct MonitorUniformRing: ~Copyable {
   private let label: String
 
   public init(slotLength: Int, label: String) {
-    self.slotLength = (max(1, slotLength) + 255) / 256 * 256
+    // If rounding up cannot fit in Int, retain an aligned size that still
+    // exceeds any device limit so slot allocation reports the error.
+    self.slotLength = align256(min(max(1, slotLength), Int.max - 255))
     self.label = label
   }
 
@@ -305,7 +307,11 @@ public struct MonitorUniformRing: ~Copyable {
   /// A new shared, write-combined buffer of `slots` slots (the CPU only writes
   /// it); the old one is retired with its last use.
   private mutating func grow(_ device: MTLDevice, _ residency: MonitorResidency, slots: Int) throws {
-    let length = max(1, slots) * slotLength
+    let capacity = max(1, slots)
+    let (length, overflow) = capacity.multipliedReportingOverflow(by: slotLength)
+    guard !overflow, length <= device.maxBufferLength else {
+      throw MonitorKitError.gpu("The uniform ring exceeds the device's maximum buffer length.")
+    }
     guard let next = device.makeBuffer(length: length, options: [.storageModeShared, .cpuCacheModeWriteCombined])
     else { throw MonitorKitError.gpu("Cannot allocate a \(length)-byte uniform ring.") }
     next.label = label
@@ -320,8 +326,8 @@ public struct MonitorUniformRing: ~Copyable {
     }
     buffer = next
     // Every slot starts free; generations are invalid until written.
-    lastUse = [UInt64](repeating: 0, count: max(1, slots))
-    held = [UInt64](repeating: .max, count: max(1, slots))
+    lastUse = [UInt64](repeating: 0, count: capacity)
+    held = [UInt64](repeating: .max, count: capacity)
     current = -1
   }
 

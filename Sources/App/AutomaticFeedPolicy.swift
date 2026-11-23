@@ -1,5 +1,21 @@
 import CoreMedia
 
+extension PipelineConfiguration {
+  /// Apply the effects switch without losing source geometry, clock or transport settings.
+  func applyingPipelineSwitch(_ enabled: Bool) -> Self {
+    var result = self
+    if !enabled {
+      result.applyLUT = false
+      result.downscale = false
+      result.convertTo420 = false
+      result.reduceFrameRate = false
+    }
+    // A manual RGB profile interprets the source only while burning in its LUT.
+    if !result.applyLUT { result.sourceColorimetryOverride = nil }
+    return result
+  }
+}
+
 /// Source ownership and transport demand are independent of the UI selection.
 enum FeedLifecycleDemandPolicy {
   /// Any running camera keeps the sink open, not just the one on air: with none of its
@@ -34,13 +50,7 @@ enum FeedLifecycleDemandPolicy {
 
   static func programContract(configuration: PipelineConfiguration, pipelineEnabled: Bool,
                               detectedSourceDuration: CMTime?, source: SourceFormat? = nil) -> PipelineConfiguration {
-    var result = configuration
-    if !pipelineEnabled {
-      result.applyLUT = false
-      result.downscale = false
-      result.convertTo420 = false
-      result.reduceFrameRate = false
-    }
+    var result = configuration.applyingPipelineSwitch(pipelineEnabled)
     if let source {
       result.sourceWidth = source.width
       result.sourceHeight = source.height
@@ -54,8 +64,7 @@ enum FeedLifecycleDemandPolicy {
         result.downscale = true
         result.resizeTarget = .source
       }
-    }
-    if let duration = detectedSourceDuration,
+    } else if let duration = detectedSourceDuration,
        duration.isNumeric, duration.epoch == 0, CMTimeCompare(duration, .zero) > 0 {
       result.sourceDuration = duration
     }

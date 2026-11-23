@@ -45,7 +45,9 @@ final class FixturePublisher: ProgramStreamPublishing, @unchecked Sendable {
     didConnect()
   }
 
-  func setMediaEpoch(_ epoch: CMTime) { transport.setMediaEpoch(epoch) }
+  func setMediaEpoch(_ epoch: CMTime, includesAudio: Bool) {
+    transport.setMediaEpoch(epoch, includesAudio: includesAudio)
+  }
 
   func appendVideo(_ sample: CMSampleBuffer) {
     if lock.withLock({

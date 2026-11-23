@@ -316,6 +316,7 @@ struct NativeFrameContract {
   long width = 3840, height = 2160;
   CMTime duration;
   BMDPixelFormat pixel = bmdFormat10BitYUV;
+  CMTimeScale streamTimeScale = 0;
 };
 static std::optional<NativeFrameContract> nativeFrameContract(IDeckLinkDisplayMode *mode) {
   if (!mode || mode->GetFieldDominance() != bmdProgressiveFrame) return std::nullopt;
@@ -356,17 +357,14 @@ static NSArray<UltracamMode *> *supportedModes(IDeckLinkInput *input, BMDVideoCo
   IDeckLinkDisplayMode *raw = nullptr;
   while (iterator->Next(&raw) == S_OK) {
     ComRef<IDeckLinkDisplayMode> mode; mode.value = raw;
-    BMDTimeValue duration = 0; BMDTimeScale scale = 0;
-    mode->GetFrameRate(&duration, &scale);
     auto contract = nativeFrameContract(mode.value);
-    if (!contract || mode->GetWidth() != contract->width || mode->GetHeight() != contract->height ||
-        mode->GetFieldDominance() != bmdProgressiveFrame) continue;
+    if (!contract) continue;
     bool supported = false;
     if (input->DoesSupportVideoMode(connection, mode->GetDisplayMode(),
       bmdFormat10BitYUV, bmdNoVideoInputConversion, bmdSupportedVideoModeDefault, nullptr, &supported) != S_OK || !supported) continue;
     UltracamMode *description = [UltracamMode new];
-    description.width = mode->GetWidth(); description.height = mode->GetHeight();
-    description.frameDuration = CMTimeMake(duration, (int32_t)scale);
+    description.width = contract->width; description.height = contract->height;
+    description.frameDuration = contract->duration;
     CFStringRef name = nullptr; mode->GetName(&name);
     description.name = name ? (__bridge NSString *)name : @"4K";
     if (name) CFRelease(name);
@@ -453,19 +451,21 @@ static void applyColorimetry(CVPixelBufferRef buffer, BMDColorspace colorspace, 
   // on its last frame. The marker records that value, so a later signal change replaces our
   // own stale write while an attachment the SDK set is still left alone.
   auto set = [buffer](CFStringRef key, CFStringRef marker, CFStringRef value, bool authoritative) {
-    if (!authoritative) {
+    if (!authoritative || !value) {
       CFTypeRef existing = CVBufferCopyAttachment(buffer, key, nullptr);
       CFTypeRef written = CVBufferCopyAttachment(buffer, marker, nullptr);
       const bool ours = existing && written && CFEqual(existing, written);
       if (existing) CFRelease(existing);
       if (written) CFRelease(written);
-      if (existing && !ours) return;
+      if (existing && !ours) {
+        if (written) CVBufferRemoveAttachment(buffer, marker);
+        return;
+      }
       if (!value) {
         if (ours) { CVBufferRemoveAttachment(buffer, key); CVBufferRemoveAttachment(buffer, marker); }
         return;
       }
     }
-    if (!value) return;
     CVBufferSetAttachment(buffer, key, value, kCVAttachmentMode_ShouldPropagate);
     CVBufferSetAttachment(buffer, marker, value, kCVAttachmentMode_ShouldNotPropagate);
   };
@@ -622,12 +622,12 @@ struct TimecodeReader {
       if (sameSecond && frames == lastFrames) {
         // Only a pair counter repeats; two repeats in a row fit neither.
         fullRateSteps = 0;
-        pairSteps = lastWasRepeat ? 0 : pairSteps + 1;
+        pairSteps = lastWasRepeat ? 0 : std::min(pairSteps + 1, kEvidenceSteps);
         lastWasRepeat = true;
       } else if (sameSecond && frames == lastFrames + 1) {
         // A pair counter never advances twice in a row.
-        fullRateSteps += 1;
-        pairSteps = lastWasRepeat ? pairSteps + 1 : 0;
+        fullRateSteps = std::min(fullRateSteps + 1, kEvidenceSteps);
+        pairSteps = lastWasRepeat ? std::min(pairSteps + 1, kEvidenceSteps) : 0;
         lastWasRepeat = false;
       } else if (total == (lastSeconds + 1) % 86400 && frames <= 4) {
         // A second boundary: fits both. Drop-frame skips labels 00-03 at
@@ -663,16 +663,15 @@ struct TimecodeReader {
     }
     BMDTimecodeFlags flags = timecode->GetFlags();
     unsigned frameLabel = frames;
+    const unsigned labels = nominalFPS ? nominalFPS : highFrameRate ? 60 : 30;
     if (highFrameRate && !hfr && nominalFPS <= 60) {
       observe(hours, minutes, seconds, frames);
-      // Before the cadence is known a label above 29 cannot be a pair
-      // counter's; show it as is, without deciding anything. Below 30, the
-      // previously latched cadence (pairs if none) decides.
+      // Before cadence is known, only the lower half of the label range
+      // can represent a pair counter (0–24 at 50 fps, 0–29 at 59.94).
       const bool pairs = cadence == Cadence::pairs ||
-        (cadence == Cadence::unknown && frames < 30 && previousCadence != Cadence::fullRate);
+        (cadence == Cadence::unknown && frames * 2u < labels && previousCadence != Cadence::fullRate);
       if (pairs) frameLabel = frames * 2u + ((flags & bmdTimecodeFieldMark) ? 1u : 0u);
     }
-    const unsigned labels = nominalFPS ? nominalFPS : highFrameRate ? 60 : 30;
     if (hours > 23 || minutes > 59 || seconds > 59 || frameLabel >= labels) return nil;
     const bool dropFrame = flags & bmdTimecodeIsDropFrame;
     const uint32_t key = (uint32_t(hours) << 20) | (uint32_t(minutes) << 14) | (uint32_t(seconds) << 8) |
@@ -799,81 +798,47 @@ struct AutoModeMailbox {
 // sample-frame count and the configured stream format. Keep this helper
 // bounded: a bad driver packet must never make the callback walk an
 // untrusted allocation.
-static void reportMedia(NSString *timecodeString, IDeckLinkAudioInputPacket *audio,
-  UltracamMediaStatsHandler handler, NSUInteger channels = 2) {
-  if (!handler) return;
+static void reportAudio(NSString *timecode, IDeckLinkAudioInputPacket *audio, NSUInteger channels,
+  UltracamMediaStatsHandler mediaHandler, UltracamRawAudioHandler rawHandler) {
+  if (!mediaHandler && !rawHandler) return;
   CMTime packetTime = kCMTimeInvalid;
-  NSUInteger sampleFrames = 0;
-  NSUInteger bytes = 0;
-  float leftPeak = 0.0f, rightPeak = 0.0f;
-  float leftRMS = 0.0f, rightRMS = 0.0f;
-  BOOL present = NO;
-  if (audio) {
-    long count = audio->GetSampleFrameCount();
-    // A normal callback contains a video-frame-sized audio packet (typically
-    // 800 or 1600 frames).  96k frames is a generous two-second bound and
-    // prevents overflow or pathological work on malformed driver data.
-    if (count > 0 && static_cast<uint64_t>(count) <= 96000) {
+  const int32_t *samples = nullptr;
+  NSUInteger frames = 0;
+  if (audio && (channels == 2 || channels == 8 || channels == 16)) {
+    const long count = audio->GetSampleFrameCount();
+    // A normal packet spans one video frame. Bound both the meter scan and PCM copy to two seconds.
+    if (count > 0 && count <= 96000) {
       BMDTimeValue timestamp = 0;
       if (audio->GetPacketTime(&timestamp, bmdAudioSampleRate48kHz) == S_OK && timestamp >= 0)
         packetTime = CMTimeMake(timestamp, bmdAudioSampleRate48kHz);
       void *raw = nullptr;
-      const NSUInteger frameCount = static_cast<NSUInteger>(count);
-      const NSUInteger expectedBytes = frameCount * channels * sizeof(int32_t);
-      if (audio->GetBytes(&raw) == S_OK && raw && expectedBytes > 0) {
-        const int32_t *samples = static_cast<const int32_t *>(raw);
-        double leftSum = 0.0, rightSum = 0.0;
-        double leftMaximum = 0.0, rightMaximum = 0.0;
-        for (NSUInteger index = 0; index < frameCount; ++index) {
-          const double left = static_cast<double>(samples[index * channels]) / 2147483648.0;
-          const double right = static_cast<double>(samples[index * channels + 1]) / 2147483648.0;
-          leftMaximum = std::max(leftMaximum, std::abs(left));
-          rightMaximum = std::max(rightMaximum, std::abs(right));
-          leftSum += left * left;
-          rightSum += right * right;
-        }
-        sampleFrames = frameCount;
-        bytes = expectedBytes;
-        leftPeak = static_cast<float>(std::min(1.0, leftMaximum));
-        rightPeak = static_cast<float>(std::min(1.0, rightMaximum));
-        leftRMS = static_cast<float>(std::sqrt(leftSum / frameCount));
-        rightRMS = static_cast<float>(std::sqrt(rightSum / frameCount));
-        present = YES;
+      if (audio->GetBytes(&raw) == S_OK && raw) {
+        samples = static_cast<const int32_t *>(raw);
+        frames = NSUInteger(count);
       }
     }
   }
-  handler(timecodeString, packetTime, sampleFrames, present ? channels : 0, leftPeak, rightPeak,
-    leftRMS, rightRMS, bytes, present);
-}
-
-// Raw audio packets (always bmdAudioSampleType32bitInteger) are copied before
-// the callback returns. Keep the same conservative frame bound as the stats path
-// so malformed driver metadata cannot produce an oversized allocation.
-static void reportRawAudio(IDeckLinkAudioInputPacket *audio, UltracamRawAudioHandler handler, NSUInteger channels = 2) {
-  if (!handler) return;
-  constexpr NSUInteger bytesPerSample = sizeof(int32_t);
-  CMTime packetTime = kCMTimeInvalid;
-  NSData *samplesData = nil;
-  NSUInteger sampleFrames = 0;
-  if (audio) {
-    long count = audio->GetSampleFrameCount();
-    if (count > 0 && static_cast<uint64_t>(count) <= 96000) {
-      BMDTimeValue timestamp = 0;
-      if (audio->GetPacketTime(&timestamp, bmdAudioSampleRate48kHz) == S_OK && timestamp >= 0)
-        packetTime = CMTimeMake(timestamp, bmdAudioSampleRate48kHz);
-      const NSUInteger frameCount = static_cast<NSUInteger>(count);
-      const NSUInteger bytesPerFrame = channels * bytesPerSample;
-      if (frameCount <= (std::numeric_limits<NSUInteger>::max() / bytesPerFrame)) {
-        const NSUInteger expectedBytes = frameCount * bytesPerFrame;
-        void *raw = nullptr;
-        if (audio->GetBytes(&raw) == S_OK && raw && expectedBytes > 0) {
-          samplesData = [NSData dataWithBytes:raw length:expectedBytes];
-          sampleFrames = frameCount;
-        }
-      }
+  const NSUInteger bytes = frames * channels * sizeof(int32_t);
+  const NSUInteger reportedChannels = samples ? channels : 0;
+  if (mediaHandler) {
+    double leftPeak = 0, rightPeak = 0, leftSum = 0, rightSum = 0;
+    for (NSUInteger index = 0; index < frames; ++index) {
+      const double left = double(samples[index * channels]) / 2147483648.0;
+      const double right = double(samples[index * channels + 1]) / 2147483648.0;
+      leftPeak = std::max(leftPeak, std::abs(left));
+      rightPeak = std::max(rightPeak, std::abs(right));
+      leftSum += left * left;
+      rightSum += right * right;
     }
+    mediaHandler(timecode, packetTime, frames, reportedChannels, float(leftPeak), float(rightPeak),
+      frames ? float(std::sqrt(leftSum / frames)) : 0, frames ? float(std::sqrt(rightSum / frames)) : 0,
+      bytes, samples != nullptr);
   }
-  handler(samplesData, packetTime, sampleFrames, samplesData ? channels : 0, bytesPerSample);
+  if (rawHandler) {
+    // SDK storage is borrowed through this callback. The recording path may retain its own copy.
+    NSData *owned = samples ? [NSData dataWithBytes:samples length:bytes] : nil;
+    rawHandler(owned, packetTime, frames, reportedChannels, sizeof(int32_t));
+  }
 }
 
 #include "OwnedCaptureAllocator.inc"
@@ -892,7 +857,11 @@ class CaptureCallback final : public IDeckLinkInputCallback {
   std::atomic<BMDDisplayMode> streamingMode;
   BMDVideoConnection connection = bmdVideoConnectionHDMI;
   std::shared_ptr<const NativeFrameContract> activeContract;
-  void setActiveContract(const NativeFrameContract &contract) {
+  void setActiveContract(NativeFrameContract contract) {
+    // Keep the usual stream clock where it can represent a whole frame.
+    // 95.90 fps needs 1001/96000, or 2502.5 ticks on the 240 kHz clock.
+    CMTime converted = CMTimeConvertScale(contract.duration, preferredTimeScale, kCMTimeRoundingMethod_Default);
+    contract.streamTimeScale = CMTimeCompare(converted, contract.duration) == 0 ? preferredTimeScale : contract.duration.timescale;
     std::atomic_store(&activeContract, std::make_shared<const NativeFrameContract>(contract));
   }
   std::atomic<bool> audioEnabled{false};
@@ -921,7 +890,7 @@ class CaptureCallback final : public IDeckLinkInputCallback {
   bool supportsHDRMetadata = false;
   bool supportsColorspaceMetadata = false;
   std::shared_ptr<SessionStats> stats = std::make_shared<SessionStats>();
-  CMTimeScale timeScale;
+  const CMTimeScale preferredTimeScale;
   NSUInteger audioChannels = 2;
   void (^audioFormatHandler)(NSInteger) = nil;
   void (^cpuMemoryFrameHandler)(UCDeckLinkOwnedMemoryFrame *, CMTime, CMTime) = nil;
@@ -943,7 +912,7 @@ class CaptureCallback final : public IDeckLinkInputCallback {
   CaptureCallback(BMDDisplayMode mode, CMTimeScale scale,
     void (^frames)(CVPixelBufferRef, CMTime, BOOL), void (^events)(NSString *),
     UltracamMediaStatsHandler media = nil, UltracamRawAudioHandler rawAudio = nil)
-    : requestedMode(mode), streamingMode(mode), timeScale(scale), frameHandler([frames copy]), mediaHandler([media copy]),
+    : requestedMode(mode), streamingMode(mode), preferredTimeScale(scale), frameHandler([frames copy]), mediaHandler([media copy]),
       rawAudioHandler([rawAudio copy]), eventHandler([events copy]) {
     if (auto contract = nativeFrameContract(mode)) setActiveContract(*contract);
     // The automatic-format path intentionally leaves the ordinary frame
@@ -973,10 +942,13 @@ class CaptureCallback final : public IDeckLinkInputCallback {
     @autoreleasepool {
       if (!accepting) return S_OK;
       BMDColorspace colorspace = mode ? colorspaceFromModeFlags(mode->GetFlags()) : 0;
+      // An explicit change can also withdraw the previously reported colorspace.
+      const bool colorspaceChanged = (colorspace || (events & bmdVideoInputColorspaceChanged)) &&
+        signalColorspace.exchange(colorspace) != colorspace;
       if (modeHandler) {
-        DetectedInput detection = describeInput(mode, flags);
-        uint64_t signature = detectionSignature(detection.mode, flags);
+        uint64_t signature = detectionSignature(mode ? mode->GetDisplayMode() : bmdModeUnknown, flags);
         if (lastDetection.exchange(signature) != signature) {
+          DetectedInput detection = describeInput(mode, flags);
           // Only the format flags moved (for example 10-bit to 12-bit) and the
           // running mode still captures it as 10-bit YUV: no gap, no restart.
           const auto active = std::atomic_load(&activeContract);
@@ -985,22 +957,14 @@ class CaptureCallback final : public IDeckLinkInputCallback {
             gateCountsLosses = detection.supported;
             framesEnabled = false;
           }
-          if (colorspace) signalColorspace = colorspace;
-          // An explicit colorspace notification with no mode flag means the
-          // driver no longer reports a colorspace. Do not carry the previous
-          // signal into the next refresh as if it were still authoritative.
-          else if (events & bmdVideoInputColorspaceChanged) signalColorspace = 0;
           modeHandler(detection, keepFrames);
-        } else if ((colorspace && signalColorspace.exchange(colorspace) != colorspace) ||
-            (events & bmdVideoInputColorspaceChanged)) {
+        } else if (colorspaceChanged || (events & bmdVideoInputColorspaceChanged)) {
           // The mode|flags signature is unchanged, so only colorimetry moved
           // (colorspace or HDR transfer). Report it without a driver restart.
           if (colorimetryHandler) colorimetryHandler();
         }
         return S_OK;
       }
-      if (colorspace) signalColorspace = colorspace;
-      else if (events & bmdVideoInputColorspaceChanged) signalColorspace = 0;
       if (!mode || mode->GetDisplayMode() != requestedMode.load()) {
         reportFatal(@"Input changed from the selected HDMI 10-bit YUV mode. Check the FX3 HDMI output and selected frame rate, then restart.");
       }
@@ -1015,27 +979,27 @@ class CaptureCallback final : public IDeckLinkInputCallback {
         void (^handler)(void);
         ~GroupEndScope() { if (handler) handler(); }
       } groupEndScope{groupEnd};
+      const bool signalValid = frame && !(frame->GetFlags() & bmdFrameHasNoInputSource);
+      if (frame) stats->signalPresent = signalValid ? 1 : 0;
+      const int prior = frame ? signalState.exchange(signalValid ? 1 : 0) : -1;
+      const bool signalChanged = frame && prior != int(signalValid);
       BMDTimeValue timestamp = 0, duration = 0;
-      HRESULT timeStatus = frame ? frame->GetStreamTime(&timestamp, &duration, timeScale) : E_FAIL;
-      const auto active = std::atomic_load(&activeContract);
+      const auto active = signalValid ? std::atomic_load(&activeContract) : nullptr;
+      const CMTimeScale timeScale = active ? active->streamTimeScale : preferredTimeScale;
+      HRESULT timeStatus = signalValid ? frame->GetStreamTime(&timestamp, &duration, timeScale) : E_FAIL;
       const bool timeValid = timeStatus == S_OK && timestamp >= 0 && duration > 0 && active &&
         CMTimeCompare(CMTimeMake(duration, timeScale), active->duration) == 0;
-      bool signalValid = false, signalChanged = false;
-      if (frame) {
-        signalValid = !(frame->GetFlags() & bmdFrameHasNoInputSource);
-        stats->signalPresent = signalValid ? 1 : 0;
-        const int prior = signalState.exchange(signalValid ? 1 : 0);
-        signalChanged = prior != (signalValid ? 1 : 0);
-        if (signalValid) trackStreamTime(timeValid, timestamp, duration, prior == 0);
-        else if (signalChanged) timecodes.reset();
-      }
-      // Above 30 fps: 1001/60000 stream durations, or the opened mode before time is valid.
-      const bool highFrameRate = timeValid ? duration * 30 < timeScale :
-        requestedMode.load() == bmdMode4K2160p5994;
+      if (signalValid) trackStreamTime(timeValid, timestamp, duration, timeScale, prior == 0);
+      else if (signalChanged) timecodes.reset();
       if (resetTimecodeCadence.load(std::memory_order_relaxed) && resetTimecodeCadence.exchange(false)) timecodes.reset();
       // Apply the clock boundary before this frame can influence cadence.
-      const unsigned nominalFPS = active ? unsigned(std::ceil(1.0 / CMTimeGetSeconds(active->duration))) : 0;
-      NSString *timecode = signalValid && (mediaHandler || timecodeHandler) ? timecodes.read(frame, highFrameRate, nominalFPS) : nil;
+      NSString *timecode = nil;
+      if (signalValid && (mediaHandler || timecodeHandler)) {
+        const bool highFrameRate = timeValid ? duration * 30 < timeScale :
+          requestedMode.load() == bmdMode4K2160p5994;
+        const unsigned nominalFPS = active ? unsigned(std::ceil(1.0 / CMTimeGetSeconds(active->duration))) : 0;
+        timecode = timecodes.read(frame, highFrameRate, nominalFPS);
+      }
       if (timecodeHandler) timecodeHandler(timecode);
       // The callback's video frame is wrapped and handed off first, so the
       // frame consumers (recording admission, the capture queue) never wait
@@ -1045,8 +1009,7 @@ class CaptureCallback final : public IDeckLinkInputCallback {
       // source reconnect), and the media path owns its own clock, so it never
       // acquires an artificial audio hole for want of a video object.
       if (frame) deliverVideo(frame, active.get(), timeValid, timestamp, duration, signalValid, signalChanged);
-      if (mediaHandler) reportMedia(timecode, audioPacket, mediaHandler, audioChannels);
-      reportRawAudio(audioPacket, rawAudioHandler, audioChannels);
+      reportAudio(timecode, audioPacket, audioChannels, mediaHandler, rawAudioHandler);
     }
     return S_OK;
   }
@@ -1074,6 +1037,7 @@ class CaptureCallback final : public IDeckLinkInputCallback {
     if (!timeValid) {
       reportFatal(@"UltraStudio supplied an invalid frame timestamp."); return;
     }
+    const CMTimeScale timeScale = contract->streamTimeScale;
     // SDK 16 reports the buffer length (IDeckLinkVideoBuffer::GetSize, manual
     // 2.5.53.2). A short buffer would let GPU readers run past the image.
     ComRef<IDeckLinkVideoBuffer> videoBuffer;
@@ -1166,8 +1130,8 @@ class CaptureCallback final : public IDeckLinkInputCallback {
   // InputLoopThrough sample counts drops the same way). Signal loss and driver
   // restarts begin a new run. Steps beyond the elapsed-time bound are clock
   // discontinuities; a frame-count cutoff would change meaning with cadence.
-  void trackStreamTime(bool valid, BMDTimeValue timestamp, BMDTimeValue duration, bool signalReturned) {
-    if (signalReturned || (resetStreamClock.load(std::memory_order_relaxed) && resetStreamClock.exchange(false)))
+  void trackStreamTime(bool valid, BMDTimeValue timestamp, BMDTimeValue duration, CMTimeScale timeScale, bool signalReturned) {
+    if ((resetStreamClock.load(std::memory_order_relaxed) && resetStreamClock.exchange(false)) || signalReturned)
       lastStreamTime = -1;
     if (!valid || timestamp < 0 || duration <= 0 || timeScale <= 0) return;
     if (lastStreamTime >= 0 && timestamp < lastStreamTime) {
@@ -1801,6 +1765,8 @@ class DeviceRegistry {
       std::lock_guard<std::mutex> guard(mutex);
       for (auto it = sessions.begin(); it != sessions.end(); ++it) {
         if (it->callback != capture) continue;
+        auto stats = statsByDevice.find(std::string(it->identifier.UTF8String ?: ""));
+        if (stats != statsByDevice.end() && stats->second == capture->stats) statsByDevice.erase(stats);
         released = it->callback; sessions.erase(it); break;
       }
     }
@@ -1950,13 +1916,12 @@ class DeviceRegistry {
       } else readIdleStatus(item.device, next);
       item.device->Release();
       std::lock_guard<std::mutex> guard(mutex);
-      if (!session) {
-        // A start that began during the read, or the session it attached, made the
-        // device busy for us: that read isn't another app's.
-        const std::string key(item.identifier.UTF8String ?: "");
-        auto stats = statsByDevice.find(key);
-        if (starting.count(key) || (stats != statsByDevice.end() && stats->second && stats->second->active.load())) continue;
-      }
+      const std::string key(item.identifier.UTF8String ?: "");
+      const auto stats = statsByDevice.find(key);
+      const bool stillActive = stats != statsByDevice.end() && stats->second->active.load();
+      // Discard readings from either side of a session change. An idle read
+      // during startup can also report our own capture as another app's.
+      if (session ? !stillActive || stats->second != item.stats : stillActive || starting.count(key)) continue;
       UCDeckLinkDeviceStatus *previous = statuses[item.identifier];
       if (session && previous) { next.pcieWidth = previous.pcieWidth; next.pcieGeneration = previous.pcieGeneration; }
       if ([next isEqual:previous]) continue;
@@ -2126,7 +2091,7 @@ class DeviceRegistry {
     os_log(backendLog(), "Device removed: %{public}@ (%{public}@)", name, identifier);
     // Not the driver thread: CaptureController hops to its own queue and stops.
     for (CaptureCallback *capture : affected) {
-      capture->reportFatal(@"UltraStudio disconnected. Reconnect it to resume capture.");
+      if (capture->accepting) capture->reportFatal(@"UltraStudio disconnected. Reconnect it to resume capture.");
       capture->Release();
     }
     if (edid) edid->Release();
@@ -2354,6 +2319,10 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
 
 + (id)addDeviceListObserver:(void (^)(NSArray<UltracamDevice *> *))handler {
   return DeviceRegistry::shared().addObserver(handler);
+}
+
++ (BOOL)deviceListDiscoveryActive {
+  return DeviceRegistry::shared().isDiscovering();
 }
 
 + (void)setAdvertisesHDRToCameras:(BOOL)enabled {
@@ -2664,11 +2633,11 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
     if (status != S_OK || !supported)
       return fail(error, @"The device does not support the requested HDMI 10-bit YUV mode.", status);
   }
-  auto callback = new CaptureCallback(requestedMode, inputFast ? 60000 : 30000, frameHandler, eventHandler,
+  const CMTimeScale preferredTimeScale = autoFrameHandler || selectedContract ? 240000 : inputFast ? 60000 : 30000;
+  auto callback = new CaptureCallback(requestedMode, preferredTimeScale, frameHandler, eventHandler,
     mediaHandler, rawAudioHandler);
   if (openDetected && detected->contract) callback->setActiveContract(*detected->contract);
   else if (selectedContract) callback->setActiveContract(*selectedContract);
-  if (autoFrameHandler || selectedContract) callback->timeScale = 240000;
   callback->audioChannels = embeddedAudioChannels(capabilities, selectedConnection);
   callback->audioFormatHandler = [_audioFormatHandler copy];
   callback->cpuMemoryFrameHandler = [_cpuMemoryFrameHandler copy];
@@ -2868,12 +2837,12 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
     os_log(backendLog(), "Desktop Video preferences moved the input to connection 0x%llx; reselecting HDMI",
       (unsigned long long)current);
     HRESULT result = current == lease->selected ? S_OK : lease->configuration->SetInt(bmdDeckLinkConfigVideoInputConnection, lease->selected);
-    int64_t actual = 0;
-    if (result == S_OK) result = lease->configuration->GetInt(bmdDeckLinkConfigVideoInputConnection, &actual);
-    if (result == S_OK && actual != lease->selected) result = E_FAIL;
     if (result == S_OK && current != lease->selected) {
       lease->previous = current; lease->changed = true;
     }
+    int64_t actual = 0;
+    if (result == S_OK) result = lease->configuration->GetInt(bmdDeckLinkConfigVideoInputConnection, &actual);
+    if (result == S_OK && actual != lease->selected) result = E_FAIL;
     if (result == S_OK && currentAudio != bmdAudioConnectionEmbedded) {
       result = lease->configuration->SetInt(bmdDeckLinkConfigAudioInputConnection, bmdAudioConnectionEmbedded);
       if (result == S_OK) { lease->previousAudio = currentAudio; lease->audioChanged = true; }
@@ -2941,7 +2910,7 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
   ++_generation;
   if (_pollTimer) { dispatch_source_cancel(_pollTimer); _pollTimer = nil; }
   if (_autoMode) { _autoMode->cancel(); _autoMode.reset(); }
-  if (_callback) _registry->detachSession(_callback);
+  if (_callback) _callback->accepting = false;
   // Unsubscribe before the device and its input are released.
   _notifications.reset();
   if (_input) {
@@ -2957,7 +2926,10 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
   if (_statistics) { _statistics->Release(); _statistics = nullptr; }
   if (_status) { _status->Release(); _status = nullptr; }
   if (_device) { _device->Release(); _device = nullptr; }
-  if (_callback) { _callback->Release(); _callback = nullptr; }
+  if (_callback) {
+    _registry->detachSession(_callback);
+    _callback->Release(); _callback = nullptr;
+  }
   _stats->active = false;
   _hostOffset.reset();
   _hasDetected = NO;
@@ -3151,8 +3123,9 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
   dispatch_queue_t observers = dispatch_queue_create("org.ultracam.tests.sdk16", DISPATCH_QUEUE_SERIAL);
   BOOL result = NO;
   {
+    enum class FailedStep { videoReadback, audioWrite, audioReadback };
     for (auto initial : {bmdVideoConnectionSDI, bmdVideoConnectionHDMI}) {
-     for (bool failReadback : {false, true}) {
+     for (auto failedStep : {FailedStep::videoReadback, FailedStep::audioWrite, FailedStep::audioReadback}) {
       FakeDeckLink partial;
       DeviceRegistry partialRegistry(observers);
       _registry = &partialRegistry;
@@ -3169,8 +3142,9 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
       if (!opened) { _registry = &DeviceRegistry::shared(); return fail(error, partialError.localizedDescription); }
       partial.configuration.connection = bmdVideoConnectionOpticalSDI;
       partial.configuration.audioConnection = bmdAudioConnectionAnalog;
-      partial.configuration.audioWriteResult = failReadback ? S_OK : E_FAIL;
-      partial.configuration.failAudioReadback = failReadback;
+      partial.configuration.failConnectionReadback = failedStep == FailedStep::videoReadback;
+      partial.configuration.audioWriteResult = failedStep == FailedStep::audioWrite ? E_FAIL : S_OK;
+      partial.configuration.failAudioReadback = failedStep == FailedStep::audioReadback;
       partial.notification.post(bmdPreferencesChanged, 0);
       [self onControlQueue:^{}];
       [self stop];
@@ -3544,6 +3518,12 @@ static const void *UltracamControlQueueKey = &UltracamControlQueueKey;
   callback->VideoInputFormatChanged(bmdVideoInputDisplayModeChanged, &mode, flags);
   [self onControlQueue:^{}];
   if (input.calls != expected) return fail(error, @"Repeated auto detection restarted the input.");
+  mode.flags = 0;
+  callback->VideoInputFormatChanged(bmdVideoInputColorspaceChanged, &mode, flags);
+  [self onControlQueue:^{}];
+  if (callback->signalColorspace != 0 || input.calls != expected || ![lastEvent containsString:@"unreported colorspace"])
+    return fail(error, @"An unchanged mode retained a colorspace the source withdrew.");
+  mode.flags = bmdDisplayModeColorspaceRec709;
   mode.mode = bmdMode4K2160p5994;
   callback->VideoInputFormatChanged(bmdVideoInputDisplayModeChanged, &mode, flags);
   [self onControlQueue:^{}];
@@ -3927,9 +3907,9 @@ BOOL UltracamRunExpandedModeSyntheticChecks(NSError **error) {
   auto packet = new FakeRawAudioPacket({1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16});
   packet->channelCount = 8;
   @autoreleasepool {
-    reportRawAudio(packet, ^(NSData *data, CMTime, NSUInteger, NSUInteger channels, NSUInteger) {
+    reportAudio(nil, packet, 8, nil, ^(NSData *data, CMTime, NSUInteger, NSUInteger channels, NSUInteger) {
       reportedChannels = channels; ownedPCM = data;
-    }, 8);
+    });
   }
   std::fill(packet->samples.begin(), packet->samples.end(), -1);
   packet->Release();
@@ -3953,6 +3933,21 @@ BOOL UltracamRunExpandedModeSyntheticChecks(NSError **error) {
   if (frames != 1 || !destroyed) return fail(error, @"SDK-declared 720p frame was not admitted with owned storage.");
   mode.width = 1920; mode.height = 1080; mode.rateScale = 120000;
   if (!describeInput(&mode, flags).supported) return fail(error, @"Hardware-reported 119.88 fps was refused.");
+  mode.rateScale = 96000; mode.mode = bmdModeHD1080p9590;
+  auto fractionalMode = describeInput(&mode, flags);
+  if (!fractionalMode.supported) return fail(error, @"Hardware-reported 95.90 fps was refused.");
+  __block CMTime deliveredDuration = kCMTimeInvalid;
+  callback = new CaptureCallback(mode.mode, 240000, nil, nil);
+  callback->setActiveContract(*fractionalMode.contract);
+  callback->autoFrameHandler = ^(CVPixelBufferRef, CMTime, CMTime duration, BOOL) { deliveredDuration = duration; };
+  destroyed = false; frame = new FakeFrame(&destroyed);
+  frame->streamTimeScale = 96000;
+  frame->width = frame->wrappedWidth = mode.width;
+  frame->height = frame->wrappedHeight = mode.height;
+  callback->VideoInputFrameArrived(frame, nullptr);
+  frame->Release(); callback->Release();
+  if (!CMTIME_IS_NUMERIC(deliveredDuration) || CMTimeCompare(deliveredDuration, fractionalMode.duration) != 0)
+    return fail(error, @"Capture rejected or rounded the 1001/96000 source cadence.");
   return YES;
 }
 BOOL UltracamRunPixelNegotiationSyntheticChecks(NSError **error) {
@@ -4085,6 +4080,21 @@ BOOL UltracamRunElapsedGapSyntheticChecks(NSError **error) {
   if (skips(1001, 599 * 1001) != 598) return fail(error, @"59.94 fps behavior changed inside the ten-second gap bound.");
   if (skips(1001, 601 * 1001) != 0) return fail(error, @"59.94 fps gap beyond ten seconds was counted as device drops.");
   if (skips(1001, INT64_MAX) != 0) return fail(error, @"Timestamp gap arithmetic overflowed at Int64 maximum.");
+  {
+    bool destroyed = false;
+    ComRef<FakeFrame> frame; frame.value = new FakeFrame(&destroyed);
+    ComRef<CaptureCallback> callback;
+    callback.value = new CaptureCallback(bmdMode4K2160p5994, 60000, nil, nil);
+    frame->noSignal = true;
+    callback->VideoInputFrameArrived(frame.value, nullptr);
+    callback->resetStreamClock = true;
+    frame->noSignal = false; frame->streamTime = 0;
+    callback->VideoInputFrameArrived(frame.value, nullptr);
+    frame->streamTime = 3003;
+    callback->VideoInputFrameArrived(frame.value, nullptr);
+    if (callback->stats->deviceDrops != 2)
+      return fail(error, @"A simultaneous stream restart and signal recovery reset two consecutive frames.");
+  }
   // A raw label that happens to continue the old sequence must not be the
   // final piece of cadence evidence when the stream clock was reset.
   for (BMDTimeValue boundary : {BMDTimeValue(0), BMDTimeValue(605 * 1001)}) {
@@ -4234,6 +4244,7 @@ BOOL UltracamRunConnectorSyntheticChecks(NSError **error) {
 }
 BOOL UltracamRunNativeAuditSyntheticChecks(NSError **error) {
   FakeDeckLink device; device.configuration.ignoreConnectionWrites = true;
+  FakeDeckLink second;
   HDMILease lease;
   if (lease.select(&device) == S_OK) return fail(error, @"Capture lease accepted a connector write without readback.");
   device.configuration.ignoreConnectionWrites = false;
@@ -4241,6 +4252,8 @@ BOOL UltracamRunNativeAuditSyntheticChecks(NSError **error) {
   DeviceRegistry registry(observers); registry.arrived(&device); registry.drain();
   auto callback = new CaptureCallback(bmdMode4K2160p5994, 60000, nil, nil);
   registry.attachSession(@"decklink:000000001234abcd", callback, callback->stats);
+  auto reusedStats = callback->stats;
+  reusedStats->active = true;
   callback->stats->setSignal(@"Detected 1920 × 1080 input");
   bool destroyed = false; auto frame = new FakeFrame(&destroyed);
   callback->VideoInputFrameArrived(frame, nullptr);
@@ -4253,6 +4266,25 @@ BOOL UltracamRunNativeAuditSyntheticChecks(NSError **error) {
   if (![registry.diagnostics(@"decklink:000000001234abcd").signalPresent isEqual:@YES])
     return fail(error, @"Signal recovery did not update diagnostics.");
   frame->Release(); registry.detachSession(callback); callback->Release();
+
+  second.attributes.persistentID = 0x222;
+  registry.arrived(&second); registry.drain();
+  NSString *firstID = @"decklink:000000001234abcd";
+  NSString *secondID = @"decklink:0000000000000222";
+  {
+    ComRef<CaptureCallback> secondSession;
+    secondSession.value = new CaptureCallback(bmdMode4K2160p5994, 60000, nil, nil);
+    secondSession->stats = reusedStats;
+    registry.attachSession(secondID, secondSession.value, reusedStats);
+    registry.refreshStatus(); registry.drain();
+    const bool attributed = !registry.diagnostics(firstID).sessionActive && registry.diagnostics(secondID).sessionActive &&
+      !registry.status(firstID).sessionActive && registry.status(secondID).sessionActive;
+    const HRESULT connectorStatus = registry.setDeviceConnector(firstID, bmdVideoConnectionHDMI);
+    registry.detachSession(secondSession.value);
+    if (!attributed || connectorStatus != S_OK)
+      return fail(error, @"A stopped device retained a reused backend's live session and blocked connector selection.");
+  }
+  registry.removed(&second); registry.drain();
   auto rgb = new CaptureCallback(bmdMode4K2160p5994, 60000, nil, nil);
   rgb->setActiveContract(NativeFrameContract{64, 16, CMTimeMake(1001, 60000), bmdFormat10BitRGB});
   rgb->stats->hostOffsetValid = true; rgb->stats->hostOffsetMicros = 5000000;

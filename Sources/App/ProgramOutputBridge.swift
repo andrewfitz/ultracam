@@ -487,20 +487,24 @@ final class ProgramOutputBridge: @unchecked Sendable {
     pacedGeneration &+= 1
   }
 
+  private func discardPacedSchedule() {
+    locked { statistics.clockSkipped &+= UInt64(pacedRemaining); statistics.pacingDiscontinuities &+= 1 }
+    clearPacing()
+    if route.pendingCount > 0 { schedulePump() }
+  }
+
   private func wakePacer(at deadline: CMTime) {
     if let scheduled = pacedWakeTime, CMTimeCompare(scheduled, deadline) <= 0 { return }
     pacedWakeTime = deadline
     let generation = pacedGeneration
     let wake: @Sendable () -> Void = { [weak self] in
-      guard let self else { return }
-      self.sendQueue.async { [weak self] in
-        guard let self, self.pacedGeneration == generation else { return }
-        self.pacedWakeTime = nil
-        self.pumpPacedOnSendQueue()
-      }
+      guard let self, self.pacedGeneration == generation, self.pacedWakeTime == deadline else { return }
+      self.pacedWakeTime = nil
+      self.pumpPacedOnSendQueue()
     }
-    if let scheduleHostWake { scheduleHostWake(deadline, wake) }
-    else {
+    if let scheduleHostWake {
+      scheduleHostWake(deadline) { [sendQueue] in sendQueue.async(execute: wake) }
+    } else {
       sendQueue.asyncAfter(deadline: .now() + max(0, CMTimeGetSeconds(CMTimeSubtract(deadline, hostClock()))), execute: wake)
     }
   }
@@ -525,6 +529,9 @@ final class ProgramOutputBridge: @unchecked Sendable {
       outputAdmission = nil
     }
     let now = hostClock()
+    // A publish-triggered pump may run before a timer queued for the same slot.
+    // Retire that wake so it cannot suppress the next deadline.
+    if let wake = pacedWakeTime, CMTimeCompare(now, wake) >= 0 { pacedWakeTime = nil }
     if let deadline = pacedNextTime, CMTimeCompare(now, deadline) < 0 {
       wakePacer(at: deadline)
       return
@@ -540,8 +547,8 @@ final class ProgramOutputBridge: @unchecked Sendable {
       }
       if let lease = route.dequeue() {
         guard let image = lease.payload, let metadata = lease.metadata,
-          metadata.duration.isNumeric, metadata.duration.value > 0,
-          metadata.presentationTime.isNumeric,
+          metadata.duration.isNumeric, metadata.duration.epoch == 0, metadata.duration.timescale > 0, metadata.duration.value > 0,
+          metadata.presentationTime.isNumeric, metadata.presentationTime.epoch == 0,
           CVPixelBufferGetWidth(image) == metadata.width,
           CVPixelBufferGetHeight(image) == metadata.height,
           CVPixelBufferGetPixelFormatType(image) == OSType(metadata.pixelFormat) else {
@@ -577,9 +584,7 @@ final class ProgramOutputBridge: @unchecked Sendable {
     let duration = frame.metadata.duration
     if let fresh = pacedFreshTime, CMTimeCompare(now, fresh) > 0,
       CMTimeGetSeconds(CMTimeSubtract(now, fresh)) >= frame.metadata.maximumRepeatDuration {
-      locked { statistics.clockSkipped &+= UInt64(pacedRemaining); statistics.pacingDiscontinuities &+= 1 }
-      clearPacing()
-      if route.pendingCount > 0 { schedulePump() }
+      discardPacedSchedule()
       return
     }
     var time = pacedNextTime ?? lastSentTime.map { CMTimeMaximum(now, CMTimeAdd($0, duration)) } ?? now
@@ -590,10 +595,20 @@ final class ProgramOutputBridge: @unchecked Sendable {
     }
     // A starved send queue consumes missed scheduled slots, rather than
     // replaying an old schedule after the host clock has passed its window.
-    if CMTimeGetSeconds(CMTimeSubtract(now, time)) > 2 * duration.seconds {
-      let missed = Int(ceil(CMTimeGetSeconds(CMTimeSubtract(now, time)) / duration.seconds))
+    let lateness = CMTimeSubtract(now, time)
+    guard lateness.isNumeric, lateness.timescale > 0 else { discardPacedSchedule(); return }
+    // Exact cross products avoid rounding a due slot upward at fractional cadences.
+    let elapsedTicks = Int128(lateness.value) * Int128(duration.timescale)
+    let slotTicks = Int128(duration.value) * Int128(lateness.timescale)
+    if elapsedTicks > 2 * slotTicks {
+      let slots = (elapsedTicks + slotTicks - 1) / slotTicks
+      guard let missed = Int(exactly: slots), let offset = Int64(exactly: slots * Int128(duration.value)) else {
+        discardPacedSchedule()
+        return
+      }
+      time = CMTimeAdd(time, CMTime(value: offset, timescale: duration.timescale))
+      guard time.isNumeric else { discardPacedSchedule(); return }
       pacedRemaining = max(0, pacedRemaining - missed)
-      time = CMTimeAdd(time, CMTimeMultiplyByFloat64(duration, multiplier: Double(missed)))
       locked { statistics.clockSkipped &+= UInt64(missed); statistics.pacingDiscontinuities &+= 1 }
       if CMTimeCompare(time, now) > 0 {
         pacedNextTime = time

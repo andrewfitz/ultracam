@@ -27,6 +27,25 @@ import XCTest
     update.frames = 101
     XCTAssertEqual(firstFrame, CaptureUpdateState(update))
   }
+
+#if ULTRACAM_TEST_SUPPORT
+  @MainActor func testTakeTelemetryClampsFileSizeToPresentationRange() throws {
+    let suite = "org.ultracam.tests.telemetry.\(UUID().uuidString)"
+    let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+    defer { defaults.removePersistentDomain(forName: suite) }
+    let previousWarning = AudioMeterTap.warningLevel
+    defer { AudioMeterTap.setWarningLevel(Double(previousWarning)) }
+    let model = AppModel(settingsStore: AppSettingsStore(defaults: defaults),
+      registryStore: VirtualCameraRegistryStore(defaults: defaults), registryPublisher: SyntheticRegistryPublisher(),
+      recordingFolderStore: RecordingFolderStore(defaults: defaults), hardware: .offline)
+    let bridge = UISessionBridge(model: model, interface: UIInterfaceState(defaults: defaults))
+    var recording = UICameraRecording()
+    bridge.applyTake(model.selectedFeedID, statistics: RecordingStatistics(fileBytes: .max),
+      drives: [], to: &recording)
+    XCTAssertEqual(recording.fileBytes, Int64.max)
+  }
+#endif
+
   /// The CPU copy count is a total since Start. A window opened (or reopened) long after a
   /// camera stopped copying reads that total first: no "CPU copy" pill for it; only growth
   /// after that first reading lights it, for a second.
@@ -39,5 +58,8 @@ import XCTest
     XCTAssertTrue(100.5 - grew.lastChange < 1, "Copying now lights the pill")
     let quiet = UILiveSource.ingestActivity(previous: grew, count: 503, now: 101.75)
     XCTAssertFalse(101.75 - quiet.lastChange < 1, "A second without growth turns it off")
+    let restarted = UILiveSource.ingestActivity(previous: grew, count: 2, now: 100.75)
+    XCTAssertEqual(restarted.lastChange, -.infinity, "A lower total after restart establishes a new baseline")
+    XCTAssertEqual(UILiveSource.ingestActivity(previous: restarted, count: 3, now: 101).lastChange, 101)
   }
 }

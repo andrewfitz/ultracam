@@ -34,7 +34,8 @@ enum CameraControlReconnectPolicy {
     /// `jitter` in 0...1 adds up to a tenth, so bodies that dropped together don't retry in step.
     static func delay(step: Int, jitter: Double) -> Duration {
         let base = delays[min(max(step, 0), delays.count - 1)]
-        return .milliseconds(Int((base * (1 + 0.1 * min(max(jitter, 0), 1)) * 1000).rounded()))
+        let boundedJitter = jitter.isNaN ? 0 : min(max(jitter, 0), 1)
+        return .milliseconds(Int((base * (1 + 0.1 * boundedJitter) * 1000).rounded()))
     }
     /// Only a passing failure is tried again. A changed identity, a rejected or missing
     /// sign-in, an unsupported body or a Keychain error waits for the operator.
@@ -222,12 +223,23 @@ extension CameraControlAssignmentPersisting {
     @ObservationIgnored private let refreshSleep: @MainActor (Duration) async throws -> Void
     private var states: [String: CameraControlFeedState] = [:]
     private var routes: [String: String] = [:]
-    private var preparedRequests: [String: ControlPreparationRequest] = [:]
+    private var preparedRequests: [PreparationIdentity: ControlPreparationRequest] = [:]
     private var persistenceWritable = true
     private var pendingCameras: [String: ControlCamera] = [:]
     private var removed: Set<String> = []
     private var manuallyDisconnected: Set<String> = []
-    private var savedCredentialIdentities: Set<String> = []
+    private struct CredentialIdentity: Hashable {
+        let plugin: String
+        let camera: String
+        let fingerprint: String?
+    }
+    private struct PreparationIdentity: Hashable {
+        let camera: CredentialIdentity
+        let transport: ControlTransport
+        let address: String
+        let authentication: ControlAuthenticationMode
+    }
+    private var savedCredentialIdentities: Set<CredentialIdentity> = []
     private var restored = false
     private var requestedWork = false
     private final class PendingCleanup {
@@ -288,7 +300,7 @@ extension CameraControlAssignmentPersisting {
             ?? pendingCameras.first { $0.key != feedID && $0.value.pluginID == pluginID && $0.value.id == cameraID }?.key
     }
     func discover(pluginID: String, force: Bool = true) async {
-        guard !shuttingDown, let plugin = plugins[pluginID] else { return }
+        guard !Task.isCancelled, !shuttingDown, let plugin = plugins[pluginID], plugin.descriptor.id == pluginID else { return }
         if let task = discoveryTasks[pluginID] { await task.value; return }
         if !force, let date = lastSuccessfulDiscovery[pluginID] {
             let age = now().timeIntervalSince(date)
@@ -300,11 +312,13 @@ extension CameraControlAssignmentPersisting {
             do {
                 let discovered = try await plugin.discover()
                 guard !self.shuttingDown, !Task.isCancelled else { return }
+                guard discovered.allSatisfy({ $0.pluginID == pluginID && !$0.id.isEmpty }),
+                    Set(discovered.map(\.id)).count == discovered.count else {
+                    throw ControlError(code: .invalidRequest, retryable: false, message: "Camera discovery returned invalid or duplicate identities.")
+                }
                 let detected = Set(discovered.map(\.id))
                 let manual = (self.cameras[pluginID] ?? []).filter { camera in
-                    guard !detected.contains(camera.id), let request = self.preparedRequests[self.cameraKey(camera)] else { return false }
-                    if case .endpoint = request { return true }
-                    return false
+                    !detected.contains(camera.id) && self.preparedRequests[self.preparationKey(camera)] != nil
                 }
                 self.cameras[pluginID] = discovered + manual
                 self.lastSuccessfulDiscovery[pluginID] = self.now()
@@ -321,7 +335,8 @@ extension CameraControlAssignmentPersisting {
     func discoverIfNeeded(pluginID: String) async { await discover(pluginID: pluginID, force: false) }
     func prepare(pluginID: String, request: ControlPreparationRequest, feedID: String) async -> ControlPreparationResult? {
         let state = state(for: feedID)
-        guard !state.busy, !state.connected, !shuttingDown, !removed.contains(feedID), let plugin = plugins[pluginID] else { return nil }
+        guard !Task.isCancelled, !state.busy, !state.connected, !shuttingDown, !removed.contains(feedID),
+            let plugin = plugins[pluginID], plugin.descriptor.id == pluginID else { return nil }
         let generation = begin(feedID, pluginID)
         defer {
             if Task.isCancelled, state.generation == generation { retire(feedID) }
@@ -332,7 +347,7 @@ extension CameraControlAssignmentPersisting {
             guard current(feedID, generation) else { return nil }
             if case .endpoint = request, let known = cameras[pluginID]?.first(where: { $0.id == result.camera.id }), !known.name.isEmpty { result.camera.name = known.name }
             try validate(result.camera, feedID: feedID, pluginID: pluginID)
-            preparedRequests[cameraKey(result.camera)] = request
+            if case .endpoint = request { preparedRequests[preparationKey(result.camera)] = request }
             addCamera(result.camera)
             return result
         } catch { report(error, feedID, generation); return nil }
@@ -342,16 +357,21 @@ extension CameraControlAssignmentPersisting {
     func connect(camera: ControlCamera, to feedID: String, credentials supplied: ControlCredentials? = nil, saveCredentials: Bool = true,
         automatic: Bool = false) async {
         let state = state(for: feedID)
-        guard !state.busy, !state.connected, !shuttingDown, !removed.contains(feedID), let plugin = plugins[camera.pluginID] else { return }
+        guard !Task.isCancelled, !state.busy, !state.connected, !shuttingDown, !removed.contains(feedID),
+            let plugin = plugins[camera.pluginID], plugin.descriptor.id == camera.pluginID else { return }
+        connectFailures.removeValue(forKey: feedID)
+        do { try validate(camera, feedID: feedID, pluginID: camera.pluginID) }
+        catch { state.message = error.localizedDescription; return }
         manuallyDisconnected.remove(feedID)
         if !automatic { setAutoReconnect(true, for: feedID) }
-        connectFailures.removeValue(forKey: feedID)
         let generation = begin(feedID, camera.pluginID)
         defer {
-            if state.generation == generation { pendingCameras.removeValue(forKey: feedID) }
-            if Task.isCancelled {
+            if Task.isCancelled, state.generation == generation {
+                retire(feedID)
+                enqueueCleanup(feedID: feedID, generation: generation, plugin: plugin)
                 Task { @MainActor [weak self] in await self?.cancel(feedID: feedID, generation: generation, plugin: plugin) }
             }
+            if state.generation == generation { pendingCameras.removeValue(forKey: feedID) }
             finish(feedID, generation)
         }
         do {
@@ -366,35 +386,50 @@ extension CameraControlAssignmentPersisting {
                 guard current(feedID, generation) else { return }
             }
             guard current(feedID, generation) else { return }
-            let request = preparedRequests[cameraKey(camera)] ?? assignment(for: feedID)?.preparationRequest ?? .camera(camera)
+            let saved = assignment(for: feedID)
+            let key = preparationKey(camera)
+            let savedRequest = saved.flatMap { preparationKey($0.camera) == key ? $0.preparationRequest : nil }
+            let request = preparedRequests[key] ?? savedRequest ?? .camera(camera)
             var prepared = try await plugin.prepare(request)
             guard current(feedID, generation) else { return }
             try validate(prepared.camera, feedID: feedID, pluginID: camera.pluginID)
-            guard prepared.camera.id == camera.id, camera.fingerprint == nil || prepared.camera.fingerprint == camera.fingerprint else {
+            guard prepared.camera.id == camera.id, prepared.camera.authenticationMode == camera.authenticationMode,
+                camera.fingerprint == nil || prepared.camera.fingerprint == camera.fingerprint else {
                 throw ControlError(code: .changedIdentity, retryable: false, message: "Camera identity changed after selection. Check the camera again before signing in.")
             }
             if case .endpoint = request, !camera.name.isEmpty { prepared.camera.name = camera.name }
-            if prepared.camera.firmware == nil { prepared.camera.firmware = assignment(for: feedID)?.camera.firmware }
+            if prepared.camera.firmware == nil { prepared.camera.firmware = saved?.camera.firmware }
             let resolved = prepared.camera
             pendingCameras[feedID] = resolved
             let credential: ControlCredentials?
             switch prepared.pairingRequirement {
-            case .none: credential = nil
+            case .none:
+                guard resolved.authenticationMode == .none else {
+                    throw ControlError(code: .changedIdentity, retryable: false, message: "Camera authentication could not be verified.")
+                }
+                credential = nil; state.hasSavedCredentials = false
             case .unsupported(let reason): throw ControlError(code: .unsupported, retryable: false, message: reason)
             case .usernamePassword(let fingerprint):
-                guard resolved.fingerprint == fingerprint, !fingerprint.isEmpty else {
+                guard resolved.authenticationMode == .usernamePassword, camera.fingerprint == fingerprint,
+                    resolved.fingerprint == fingerprint, !fingerprint.isEmpty else {
                     throw ControlError(code: .changedIdentity, retryable: false, message: "Camera identity could not be verified.")
                 }
-                if let supplied { credential = supplied }
+                if let supplied {
+                    credential = supplied
+                    state.hasSavedCredentials = hasSavedCredentials(for: resolved)
+                }
                 else {
                     credential = try await credentials.load(service: plugin.credentialService,
                         account: plugin.credentialAccount(for: resolved, fingerprint: fingerprint))
                     guard current(feedID, generation) else { return }
                     state.hasSavedCredentials = credential != nil
+                    if credential != nil { savedCredentialIdentities.insert(credentialKey(resolved)) }
+                    else { savedCredentialIdentities.remove(credentialKey(resolved)) }
                 }
                 guard credential != nil else { throw ControlError(code: .authentication, retryable: false, message: "Camera sign-in is required.") }
             }
             try await withTaskCancellationHandler {
+                try Task.checkCancellation()
                 try await plugin.connect(feedID: feedID, generation: generation, camera: resolved, credentials: credential)
             } onCancel: {
                 Task { @MainActor [weak self] in await self?.cancel(feedID: feedID, generation: generation, plugin: plugin) }
@@ -437,23 +472,34 @@ extension CameraControlAssignmentPersisting {
             if !state.connected { _ = await cleanupConnection(feedID: feedID, generation: generation, plugin: plugin) }
         }
     }
-    func hasSavedCredentials(for camera: ControlCamera) -> Bool { savedCredentialIdentities.contains(credentialKey(camera)) }
-    private func credentialKey(_ camera: ControlCamera) -> String { cameraKey(camera) + "|" + (camera.fingerprint ?? "") }
+    func hasSavedCredentials(for camera: ControlCamera) -> Bool {
+        camera.authenticationMode == .usernamePassword && savedCredentialIdentities.contains(credentialKey(camera))
+    }
+    private func credentialKey(_ camera: ControlCamera) -> CredentialIdentity {
+        CredentialIdentity(plugin: camera.pluginID, camera: camera.id, fingerprint: camera.fingerprint)
+    }
+    private func preparationKey(_ camera: ControlCamera) -> PreparationIdentity {
+        PreparationIdentity(camera: credentialKey(camera), transport: camera.transport, address: camera.address,
+            authentication: camera.authenticationMode)
+    }
     /// The Keychain only: showing the sign-in row never contacts the body or scans (only
     /// Find Camera Bodies does). Connecting re-verifies the body's identity before the
     /// saved sign-in is read or sent.
     func checkSavedCredentials(for camera: ControlCamera, feedID: String) async {
-        guard camera.authenticationMode == .usernamePassword, !shuttingDown,
-            let plugin = plugins[camera.pluginID], let fingerprint = camera.fingerprint else { return }
-        let generation = state(for: feedID).generation
+        guard !Task.isCancelled, camera.authenticationMode == .usernamePassword, !shuttingDown, !removed.contains(feedID),
+            let plugin = plugins[camera.pluginID], plugin.descriptor.id == camera.pluginID,
+            let fingerprint = camera.fingerprint, !fingerprint.isEmpty else { return }
+        let state = state(for: feedID), key = credentialKey(camera)
+        guard !state.busy, assignment(for: feedID).map({ credentialKey($0.camera) == key }) != false else { return }
+        let generation = state.generation
         do {
             let saved = try await credentials.load(service: plugin.credentialService,
                 account: plugin.credentialAccount(for: camera, fingerprint: fingerprint)) != nil
-            guard current(feedID, generation) else { return }
-            if saved { savedCredentialIdentities.insert(credentialKey(camera)) }
-            else { savedCredentialIdentities.remove(credentialKey(camera)) }
-            state(for: feedID).hasSavedCredentials = saved
-        } catch { report(error, feedID, generation) }
+            guard current(feedID, generation), !state.busy else { return }
+            if saved { savedCredentialIdentities.insert(key) }
+            else { savedCredentialIdentities.remove(key) }
+            state.hasSavedCredentials = saved
+        } catch { if !state.busy { report(error, feedID, generation) } }
     }
     func connectUsingSavedCredentials(_ camera: ControlCamera, to feedID: String) async {
         await connect(camera: camera, to: feedID, saveCredentials: false)
@@ -514,7 +560,7 @@ extension CameraControlAssignmentPersisting {
     }
     func refresh(_ feedID: String) async {
         let state = state(for: feedID)
-        guard state.connected, !state.busy, !shuttingDown, let plugin = plugin(for: feedID) else { return }
+        guard !Task.isCancelled, state.connected, !state.busy, !shuttingDown, let plugin = plugin(for: feedID) else { return }
         let generation = state.generation, revision = state.invalidationRevision
         state.busy = true; state.message = nil
         // This read stands in for any that was waiting; the next notice schedules afresh.
@@ -532,7 +578,7 @@ extension CameraControlAssignmentPersisting {
     }
     func set(_ property: ControlProperty, value: ControlValue, feedID: String) async {
         let state = state(for: feedID)
-        guard state.connected, !state.busy, !shuttingDown,
+        guard !Task.isCancelled, state.connected, !state.busy, !shuttingDown,
             let currentProperty = state.properties.first(where: { $0.id == property.id }),
             currentProperty.writable, value.isValid,
             currentProperty.options.isEmpty || currentProperty.options.contains(where: { $0.value == value }),
@@ -587,11 +633,11 @@ extension CameraControlAssignmentPersisting {
     }
     func forgetCredentials(_ feedID: String) async {
         let state = state(for: feedID)
-        guard let camera = assignment(for: feedID)?.camera, let fingerprint = camera.fingerprint,
-            let plugin = plugins[camera.pluginID], !shuttingDown, !state.busy else { return }
+        guard !Task.isCancelled, !shuttingDown, !removed.contains(feedID), !state.busy,
+            let camera = assignment(for: feedID)?.camera, camera.authenticationMode == .usernamePassword,
+            let fingerprint = camera.fingerprint, !fingerprint.isEmpty,
+            let plugin = plugins[camera.pluginID], plugin.descriptor.id == camera.pluginID else { return }
         let generation = state.generation, revision = state.invalidationRevision
-        manuallyDisconnected.insert(feedID)
-        clearRetry(feedID)
         state.busy = true; state.message = nil
         refreshTasks.removeValue(forKey: feedID)?.cancel()
         defer {
@@ -600,9 +646,9 @@ extension CameraControlAssignmentPersisting {
         }
         do {
             try await credentials.delete(service: plugin.credentialService, account: plugin.credentialAccount(for: camera, fingerprint: fingerprint))
-            guard current(feedID, generation) else { return }
-            state.hasSavedCredentials = false
             savedCredentialIdentities.remove(credentialKey(camera))
+            guard !shuttingDown, state.generation == generation else { return }
+            state.hasSavedCredentials = false
             await disconnect(feedID)
         } catch { report(error, feedID, generation) }
     }

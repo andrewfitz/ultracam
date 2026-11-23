@@ -7,23 +7,81 @@ import sys
 import re
 from pathlib import Path
 
-def class_test_methods(source, name):
-    # Strip comments and Swift string literals before balancing class braces.
-    literals = r'"""[\s\S]*?"""|"(?:\\.|[^"\\])*"|//[^\n]*|/\*[\s\S]*?\*/'
-    source = re.sub(literals, lambda match: '\n' * match.group().count('\n'), source)
-    declaration = re.search(r'\bclass\s+' + re.escape(name) + r'\s*:\s*XCTestCase\s*\{', source)
-    if declaration is None:
-        raise ValueError(f'{name}: XCTestCase declaration missing')
-    depth, index, start = 1, declaration.end(), declaration.end()
-    while depth and index < len(source):
-        depth += (source[index] == '{') - (source[index] == '}')
+# A triple quote opens a multiline literal only before the line break. For
+# example, #"""# is a single-line raw literal containing a double quote.
+SWIFT_LITERAL = r'//|/\*|(?P<hashes>#*)(?P<quotes>"""(?=[ \t]*\r?\n)|")'
+SWIFT_LITERAL_START = re.compile(SWIFT_LITERAL)
+SWIFT_INTERPOLATION_TOKEN = re.compile(SWIFT_LITERAL + r'|[()]')
+SWIFT_COMMENT_DELIMITER = re.compile(r'/\*|\*/')
+SWIFT_TEST_MEMBER = re.compile(r'\bfunc\s+(test\w+)\s*\(\s*\)|[{}]')
+SWIFT_SUITE = re.compile(r'\bclass\s+(\w+)\s*:\s*XCTestCase\s*\{')
+
+
+def literal_end(source, start):
+    if start[0] == '//':
+        end = source.find('\n', start.end())
+        return len(source) if end == -1 else end
+    if start[0] == '/*':
+        depth = 1
+        for delimiter in SWIFT_COMMENT_DELIMITER.finditer(source, start.end()):
+            depth += 1 if delimiter[0] == '/*' else -1
+            if depth == 0:
+                return delimiter.end()
+        return len(source)
+
+    closing = start['quotes'] + start['hashes']
+    escape = '\\' + start['hashes']
+    index = start.end()
+    while index < len(source):
+        if source.startswith(closing, index):
+            return index + len(closing)
+        if source.startswith(escape, index):
+            index += len(escape)
+            if source.startswith('(', index):
+                index = interpolation_end(source, index + 1)
+                continue
         index += 1
-    if depth:
-        raise ValueError(f'{name}: unterminated XCTestCase declaration')
-    methods = re.findall(r'^\s*(?:@\w+(?:\([^\n]*\))?\s+)*func\s+(test\w+)\s*\(', source[start:index-1], re.MULTILINE)
-    if not methods or len(methods) != len(set(methods)):
-        raise ValueError(f'{name}: no methods or duplicate method names')
-    return methods
+    return len(source)
+
+
+def interpolation_end(source, index):
+    depth = 1
+    while token := SWIFT_INTERPOLATION_TOKEN.search(source, index):
+        index = token.end()
+        if token[0] == '(':
+            depth += 1
+        elif token[0] == ')':
+            depth -= 1
+            if depth == 0:
+                return index
+        else:
+            index = literal_end(source, token)
+    return len(source)
+
+
+def swift_code(source):
+    pieces, index = [], 0
+    while start := SWIFT_LITERAL_START.search(source, index):
+        pieces.append(source[index:start.start()])
+        index = literal_end(source, start)
+        pieces.append(' ' + '\n' * source.count('\n', start.start(), index))
+    pieces.append(source[index:])
+    return ''.join(pieces)
+
+
+def test_members(code, start, name):
+    depth, methods = 1, []
+    for token in SWIFT_TEST_MEMBER.finditer(code, start):
+        if token[0] == '{':
+            depth += 1
+        elif token[0] == '}':
+            depth -= 1
+            if depth == 0:
+                return methods
+        elif depth == 1:
+            methods.append(token[1])
+    raise ValueError(f'{name}: unterminated XCTestCase declaration or extension')
+
 
 def verify_coverage(log, expected):
     failures = []
@@ -39,7 +97,7 @@ def verify_coverage(log, expected):
 
 def expected_counts(root):
     root = Path(root)
-    registered = re.findall(r"forTestCaseClass: (\w+)\.self", (root / "Tests/main.swift").read_text())
+    registered = re.findall(r"forTestCaseClass:\s*(\w+)\.self", swift_code((root / "Tests/main.swift").read_text()))
     if len(registered) != len(set(registered)):
         raise ValueError("Duplicate XCTest suite registration")
     sources = list((root / "Tests").glob("*.swift"))
@@ -50,35 +108,29 @@ def expected_counts(root):
         [sys.executable, str(root / "scripts/vendors.py"), "query", "--root", str(root),
          "--membership", "test", "--kind", "swift-sources"], text=True)
     sources += [Path(path) for path in vendor_sources.splitlines() if path]
-    sources = list(dict.fromkeys(sources))
+    sources = {path: swift_code(path.read_text()) for path in dict.fromkeys(sources)}
     expected = {}
-    for path in sources:
-        source = path.read_text()
-        for name in re.findall(r"\bclass\s+(\w+)\s*:\s*XCTestCase\b", source):
+    for path, code in sources.items():
+        for declaration in SWIFT_SUITE.finditer(code):
+            name = declaration[1]
             if name not in registered:
                 raise ValueError(f"{path}: unregistered XCTest suite {name}")
             if name in expected:
                 raise ValueError(f"Duplicate XCTest suite declaration: {name}")
-            expected[name] = len(class_test_methods(source, name))
+            expected[name] = test_members(code, declaration.end(), name)
     missing = set(registered) - expected.keys()
     if missing:
         raise ValueError("Registered XCTest suite missing from compiled sources: " + ", ".join(sorted(missing)))
     # Count extensions separately, including several in the same file.
-    for path in sources:
-        source = path.read_text()
-        literals = r'"""[\s\S]*?"""|"(?:\\.|[^"\\])*"|//[^\n]*|/\*[\s\S]*?\*/'
-        source = re.sub(literals, lambda match: "\n" * match.group().count("\n"), source)
-        for declaration in re.finditer(r"\bextension\s+(\w+)\s*\{", source):
+    for code in sources.values():
+        for declaration in re.finditer(r"\bextension\s+(\w+)\s*\{", code):
             name = declaration.group(1)
-            if name not in expected:
-                continue
-            depth, index = 1, declaration.end()
-            while depth and index < len(source):
-                depth += (source[index] == "{") - (source[index] == "}")
-                index += 1
-            body = source[declaration.end():index-1]
-            expected[name] += len(re.findall(r"^\s*(?:@\w+(?:\([^\n]*\))?\s+)*func\s+(test\w+)\s*\(", body, re.MULTILINE))
-    return expected
+            if name in expected:
+                expected[name].extend(test_members(code, declaration.end(), name))
+    for name, methods in expected.items():
+        if not methods or len(methods) != len(set(methods)):
+            raise ValueError(f'{name}: no methods or duplicate method names')
+    return {name: len(methods) for name, methods in expected.items()}
 
 
 def verify_skips(log, required=False):

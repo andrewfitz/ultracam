@@ -187,6 +187,29 @@ import XCTest
     })
   }
 
+  func testFieldMetadataCannotPassAsProgressiveVideo() throws {
+    let session = MacCameraCaptureSession(plugin: MacCameraCapturePlugin())
+    let transcript = MacCameraVideoTranscript()
+    defer { session.stop() }
+    session.startFixture(handlers: CaptureHandlers(deliver: { transcript.append($0) }))
+    session.deliverFixtureFrame(try Self.sample(at: .zero, duration: Self.duration30))
+    let tags: [(CFString, CFTypeRef)] = [
+      (kCVImageBufferFieldDetailKey, kCVImageBufferFieldDetailTemporalTopFirst),
+      (kCVImageBufferFieldCountKey, NSNumber(value: 1.5)),
+      (kCVImageBufferFieldCountKey, NSNumber(value: 2))
+    ]
+    for (index, tag) in tags.enumerated() {
+      let pts = CMTime(value: Int64(index + 1), timescale: 30)
+      let sample = try Self.sample(at: pts, duration: Self.duration30)
+      // A driver can attach metadata to the buffer that its format description omits.
+      CVBufferSetAttachment(try XCTUnwrap(sample.imageBuffer), tag.0, tag.1, .shouldNotPropagate)
+      session.deliverFixtureFrame(sample)
+    }
+    XCTAssertEqual(transcript.frames.map(\.info.presentationTime), [.zero])
+    XCTAssertEqual(transcript.declarations.count, 1)
+    XCTAssertEqual(session.counters.conversionFailures, 3)
+  }
+
   func testVariableVideoDeliversValidTimingImmediatelyAndInfersMissingDuration() throws {
     let session = MacCameraCaptureSession(plugin: MacCameraCapturePlugin())
     let transcript = MacCameraVideoTranscript()

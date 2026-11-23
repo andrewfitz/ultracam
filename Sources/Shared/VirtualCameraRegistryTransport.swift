@@ -157,8 +157,10 @@ enum VirtualCameraRegistryTransport {
     let text = try VirtualCameraRegistryWire.encode(candidate) as CFString
     var reference = Unmanaged.passUnretained(text).toOpaque()
     var property = address(VirtualCameraRegistryWire.selector)
-    try check(CMIOObjectSetPropertyData(provider, &property, 0, nil,
-      UInt32(MemoryLayout<CFString>.size), &reference), "Cannot update virtual-camera registry")
+    try withExtendedLifetime(text) {
+      try check(CMIOObjectSetPropertyData(provider, &property, 0, nil,
+        UInt32(MemoryLayout<CFString>.size), &reference), "Cannot update virtual-camera registry")
+    }
     // DAL caches custom properties and delivers the provider's change
     // notification asynchronously. Await that acknowledgement before the
     // caller attempts device discovery; this wait exists only at publication.

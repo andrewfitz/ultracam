@@ -35,7 +35,7 @@ struct SignalHealthTracker {
       state.lostSince = state.lostSince ?? now
       state.steadySince = nil
     case .waiting:
-      break
+      state.steadySince = nil
     }
     cameras[id] = state
   }
@@ -45,19 +45,17 @@ struct SignalHealthTracker {
 
   mutating func tick(now: TimeInterval) -> [Change] {
     var changes: [Change] = []
-    for (id, state) in cameras.sorted(by: { $0.key.rawValue < $1.key.rawValue }) {
-      var next = state
-      if !next.unhealthy, let lost = next.lostSince, now - lost >= Self.lossHold {
-        next.unhealthy = true
+    for (id, state) in cameras {
+      if !state.unhealthy, let lost = state.lostSince, now - lost >= Self.lossHold {
+        cameras[id]?.unhealthy = true
         changes.append(.unhealthy(id))
-      }
-      if next.unhealthy, let steady = next.steadySince, now - steady >= Self.returnHold {
-        next.unhealthy = false
-        next.steadySince = nil
+      } else if state.unhealthy, let steady = state.steadySince, now - steady >= Self.returnHold {
+        cameras[id]?.unhealthy = false
+        cameras[id]?.steadySince = nil
         changes.append(.eligible(id))
       }
-      cameras[id] = next
     }
+    changes.sort { $0.feedID.rawValue < $1.feedID.rawValue }
     return changes
   }
 
@@ -73,6 +71,12 @@ struct SignalHealthTracker {
   func secondsUntilEligible(_ id: FeedID, now: TimeInterval) -> TimeInterval? {
     guard let state = cameras[id], state.unhealthy, let steady = state.steadySince else { return nil }
     return max(0, Self.returnHold - (now - steady))
+  }
+}
+
+private extension SignalHealthTracker.Change {
+  var feedID: FeedID {
+    switch self { case .unhealthy(let id), .eligible(let id): id }
   }
 }
 

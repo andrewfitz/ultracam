@@ -96,11 +96,12 @@ struct UIFalseColorSettingsForm: View {
 
   var body: some View {
     let profile = preferences.signal.logProfileID
-    let mode = preferences.state.falseColor.mode
+    let selection = UIMonitorToolBindings.falseColorMode($preferences)
+    let mode = selection.wrappedValue
     let fc = $preferences.state.falseColor
     UIToolColumns {
       UIToolGroup("Mode") {
-        Picker("Mode", selection: UIMonitorToolBindings.falseColorMode($preferences)) {
+        Picker("Mode", selection: selection) {
           ForEach(UIFalseColorChoices.modes, id: \.self) { choice in
             Text(UIMonitorToolText.falseColor(choice)).tag(choice)
               .disabled(!UIFalseColorChoices.isAvailable(choice, profile: profile, isProgram: isProgram))
@@ -146,7 +147,7 @@ struct UIFalseColorSettingsForm: View {
       if mode == .custom {
         UIFalseColorBandEditor(settings: fc)
       }
-      UIFalseColorLegendSection(cameraID: cameraID, settings: preferences.state.falseColor,
+      UIFalseColorLegendSection(cameraID: cameraID, settings: mode == .off ? FalseColorSettings() : preferences.state.falseColor,
         declaration: preferences.signal)
     }
   }

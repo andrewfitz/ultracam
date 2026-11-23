@@ -32,6 +32,28 @@ import CoreVideo
     XCTAssertNil(weakOwner, "Released subscription retained its consumer")
     XCTAssertEqual(UltracamNativeObserverCount(), initialCount)
   }
+  func testDeviceObservationUsesIteratorOnlyWithoutNativeDiscovery() {
+    let status = DriverStatus(installed: true, supported: true, version: "16", reason: nil, title: "Desktop Video 16")
+    let device = CaptureDeviceInfo(id: "decklink:iterator", name: "Iterator capture", connectors: [.hdmi],
+      shareable: false, mayPause: nil, supportedModes: "")
+    let fallback = DeckLinkCapturePlugin.observedDeviceSnapshot(status: status, discovered: [], discoveryActive: false,
+      enumerate: { [device] })
+    XCTAssertEqual(fallback.devices.map(\.id), [device.id])
+    XCTAssertNil(fallback.error)
+
+    let failed = DeckLinkCapturePlugin.observedDeviceSnapshot(status: status, discovered: [], discoveryActive: false,
+      enumerate: { throw PluginError.unavailable("Iterator unavailable") })
+    XCTAssertTrue(failed.devices.isEmpty)
+    XCTAssertEqual(failed.error, .unavailable("Iterator unavailable"))
+
+    let unplugged = DeckLinkCapturePlugin.observedDeviceSnapshot(status: status, discovered: [], discoveryActive: true,
+      enumerate: {
+        XCTFail("An empty discovery snapshot represents a real removal")
+        return [device]
+      })
+    XCTAssertTrue(unplugged.devices.isEmpty)
+    XCTAssertNil(unplugged.error)
+  }
 
   func testNativeAuditHostTimeConnectorReadbackAndSignalPresence() {
     var error: NSError?
@@ -119,6 +141,14 @@ import CoreVideo
     XCTAssertEqual(formats[2].0.colour.transfer, .hlg)
     XCTAssertNotEqual(formats[1].1, formats[2].1)
     XCTAssertTrue(formats.allSatisfy { $0.0.colour.range == .video && $0.0.colour.horizontalChromaSiting == .unspecified })
+    for (format, epoch) in formats.dropFirst() {
+      XCTAssertTrue(values.contains {
+        if case .event(.discontinuity) = $0.payload, $0.epochID == epoch {
+          return $0.formatSignature == format.signature
+        }
+        return false
+      })
+    }
     let timestamps = values.compactMap { value -> CMTime? in
       if case .cpuMemory(_, let info) = value.payload { return info.captureHostTime }; return nil
     }
@@ -226,6 +256,11 @@ import CoreVideo
     CVBufferSetAttachment(buffer, kCVImageBufferFieldCountKey, NSNumber(value: 2), .shouldPropagate)
     session.deliverFixtureFrame(buffer, at: .zero)
     XCTAssertFalse(recorder.values.contains { if case .frame = $0.payload { true } else { false } })
+    let refusal = try XCTUnwrap(recorder.values.compactMap { value -> String? in
+      if case .event(.fatal(let reason)) = value.payload { return reason }
+      return nil
+    }.first)
+    XCTAssertTrue(refusal.contains("interlaced scan has no supported capture route"), refusal)
     XCTAssertEqual(session.counters.conversionFailures, 1)
   }
   func testAdapterRefusesNonSquareAndFractionalAspectMetadata() throws {
@@ -303,6 +338,12 @@ import CoreVideo
     XCTAssertNotEqual(frames[1].epochID, frames[2].epochID)
     XCTAssertNotEqual(frames[1].formatSignature, frames[2].formatSignature)
     XCTAssertEqual(declarations[1].colour.transfer, .hlg)
+    let boundary = try XCTUnwrap(values.first {
+      if case .event(.discontinuity) = $0.payload { return true }
+      return false
+    })
+    XCTAssertEqual(boundary.formatSignature, frames[2].formatSignature)
+    XCTAssertEqual(boundary.clockBindings, frames[2].clockBindings)
     XCTAssertEqual(session.counters.conversionFailures, 1)
   }
   func testWholeNativeCallbackGroupIncludingAudioOnlyAndEvents() {
@@ -360,6 +401,46 @@ import CoreVideo
     session.stop(); session.stop()
     XCTAssertThrowsError(try session.start(deviceID: "synthetic:missing", timing: .automatic,
       handlers: CaptureHandlers(deliver: { _ in })))
+  }
+  func testStartFromDeliveryReturnsWithoutWaitingForControlQueue() throws {
+    let delivered = expectation(description: "Capture callback completes its reentrant starts")
+    let buffer = CapturedPixelBuffer(immutable: try fixtureBuffer())
+    DispatchQueue.global().async {
+      let session = DeckLinkCaptureSession()
+      defer { session.stop(); delivered.fulfill() }
+      let deviceID = "fixture:decklink"
+      let replacement = CaptureHandlers(deliver: { _ in XCTFail("Reentrant start replaced the active handler") })
+      session.startFixture(deviceID: deviceID, handlers: CaptureHandlers(deliver: { value in
+        switch value.payload {
+        case .event(.audioFormatChanged(.unknown)):
+          do {
+            try session.start(deviceID: deviceID, timing: .automatic, handlers: replacement)
+            XCTFail("Reentrant start succeeded before capture was running")
+          } catch PluginError.invalidState {
+          } catch {
+            XCTFail("Expected the pending start to reject reentry, got \(error)")
+          }
+        case .frame:
+          do {
+            try session.start(deviceID: deviceID, timing: .automatic, handlers: replacement)
+          } catch {
+            XCTFail("A same-configuration reentrant start threw \(error)")
+          }
+          do {
+            try session.start(deviceID: "fixture:other", timing: .automatic, handlers: replacement)
+            XCTFail("A different configuration started during active delivery")
+          } catch PluginError.invalidState {
+          } catch {
+            XCTFail("Expected a different configuration to be rejected, got \(error)")
+          }
+        default:
+          break
+        }
+      }))
+      session.deliverFixtureFrame(buffer.value, at: .zero)
+      session.deliverFixtureFrame(buffer.value, at: VideoContract.slowDuration)
+    }
+    wait(for: [delivered], timeout: 5)
   }
   func testDiagnosticsPreserveNativeCapabilities() {
     let native = UltracamDeviceDiagnostics()

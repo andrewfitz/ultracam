@@ -404,13 +404,6 @@ uint2 mk_clampPixel(float2 p, constant mk_FrameParams& f) {
   return uint2(clamp(floor(p), float2(0), float2(f.shape.y - 1, f.shape.z - 1)));
 }
 
-// A non-finite float RGB sample reads as NaN → 0, ±inf → ±65504 (the widest value
-// any target keeps): inf - inf in a filter, or a NaN, would otherwise reach the
-// tools and overlay mixes. Finite values, and every unorm value, are unchanged.
-inline float3 mk_finiteRGB(float3 v) {
-  return select(select(v, clamp(v, -65504.0f, 65504.0f), isinf(v)), float3(0), isnan(v));
-}
-
 // Codes of pixel xy for code-space filtering: (Y', Cb - centre, Cr - centre) in
 // stored codes, or the stored RGB. Decoding is affine in these, so a weighted sum
 // of codes decodes to the same weighted sum of pictures with one conversion, and
@@ -1018,14 +1011,16 @@ float4 mk_pictureAt(float2 position, thread const mk_Inputs& in, texture2d<float
       if (MK_ZEBRAS && p.zebra.z != 0) {
         int period = int(p.zebra.w), stripe = period / 2;
         float inverse = p.reciprocals.w != 0 ? p.reciprocals.w : 1.0f / float(period);
+        // A finite sample past FLT_MAX / 100 must not overflow to inf here: the
+        // lower-limit top and the clip indicator's off levels are ±inf.
         if (p.zebra.z & 1) {
-          float ire = mk_stageLuma(s, p.zebra.x, p) * 100;
+          float ire = clamp(mk_stageLuma(s, p.zebra.x, p) * 100, -FLT_MAX, FLT_MAX);
           if (ire >= p.zebra0.x && ire < p.zebra0.y && mk_modulo(px.x + px.y, period, inverse) < stripe)
             c = mix(c, p.zebraColors[0].rgb, p.zebra0.z);
         }
         if (p.zebra.z & 2) {
           // The second set slants the other way, so both read at once.
-          float ire = mk_stageLuma(s, p.zebra.y, p) * 100;
+          float ire = clamp(mk_stageLuma(s, p.zebra.y, p) * 100, -FLT_MAX, FLT_MAX);
           if (ire >= p.zebra1.x && ire < p.zebra1.y && mk_modulo(px.x - px.y, period, inverse) < stripe)
             c = mix(c, p.zebraColors[1].rgb, p.zebra1.z);
         }
@@ -1034,8 +1029,8 @@ float4 mk_pictureAt(float2 position, thread const mk_Inputs& in, texture2d<float
         // Each enabled channel at or above the over level (or else at or below the
         // under level) sets its bit; the bits pick the colour. Over wins.
         uint stage = p.colorFlags.w, mask = p.colorFlags.z;
-        float3 v = mk_stage(s, stage) * 100;
-        float y = mk_stageLuma(s, stage, p) * 100;
+        float3 v = clamp(mk_stage(s, stage) * 100, -FLT_MAX, FLT_MAX);
+        float y = clamp(mk_stageLuma(s, stage, p) * 100, -FLT_MAX, FLT_MAX);
         uint3 bits = uint3(1, 2, 4) & uint3(mask);
         uint3 o = select(uint3(0), bits, v >= p.clipLevels.x), u = select(uint3(0), bits, v <= p.clipLevels.y);
         uint over = o.x | o.y | o.z, under = u.x | u.y | u.z;

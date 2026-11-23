@@ -57,10 +57,31 @@ final class ScopeMTL4: @unchecked Sendable {
     host.commit()
   }
 
-  struct Pending {
+  final class Pending {
     let commandBuffer: MTL4CommandBuffer
     let allocator: MTL4CommandAllocator
     let submission: MonitorSubmission
+    fileprivate var committed = false
+    private let host: ScopeMTL4
+
+    fileprivate init(commandBuffer: MTL4CommandBuffer, allocator: MTL4CommandAllocator, submission: MonitorSubmission, host: ScopeMTL4) {
+      self.commandBuffer = commandBuffer
+      self.allocator = allocator
+      self.submission = submission
+      self.host = host
+    }
+
+    deinit {
+      // No GPU work can reference an abandoned index. Close its gap even if encoding threw.
+      if !committed { host.finish(submission.index) }
+    }
+  }
+
+  private func finish(_ index: UInt64) {
+    state.withLock { s in
+      s.done.insert(index)
+      while s.done.remove(s.completed + 1) != nil { s.completed += 1 }
+    }
   }
 
   func begin(uniforms: (any MonitorUniformAllocator)? = nil) -> Pending {
@@ -73,11 +94,13 @@ final class ScopeMTL4: @unchecked Sendable {
     }
     return Pending(
       commandBuffer: cb, allocator: allocator,
-      submission: MonitorSubmission(commandBuffer: cb, index: index, completedIndex: completed, uniforms: uniforms))
+      submission: MonitorSubmission(commandBuffer: cb, index: index, completedIndex: completed, uniforms: uniforms), host: self)
   }
 
   /// Commits without waiting; `done` runs with the GPU time in ms (nil on error).
   func commit(_ p: Pending, done: (@Sendable (Double?) -> Void)? = nil) {
+    precondition(!p.committed)
+    p.committed = true
     p.commandBuffer.endCommandBuffer()
     let options = MTL4CommitOptions()
     let index = p.submission.index
@@ -85,10 +108,7 @@ final class ScopeMTL4: @unchecked Sendable {
     options.addFeedbackHandler { [self] feedback in
       let ms = feedback.error == nil ? (feedback.gpuEndTime - feedback.gpuStartTime) * 1000 : nil
       if let error = feedback.error { print("MTL4 feedback error: \(error)") }
-      state.withLock { s in
-        s.done.insert(index)
-        while s.done.remove(s.completed + 1) != nil { s.completed += 1 }
-      }
+      finish(index)
       allocator.reset()
       freeLock.withLock { freeAllocators.append(allocator) }
       done?(ms)

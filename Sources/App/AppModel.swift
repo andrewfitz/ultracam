@@ -313,7 +313,8 @@ final class AppModel {
     didSet {
       guard recordingProfiles != oldValue else { return }
       settingsStore.recordingProfiles = recordingProfiles
-      if recordingProfiles.compactMapValues(\.folderBookmark) != oldValue.compactMapValues(\.folderBookmark) {
+      if recordingProfiles.compactMapValues(\.folderBookmark) != oldValue.compactMapValues(\.folderBookmark) ||
+        recordingProfiles.compactMapValues(\.folderPath) != oldValue.compactMapValues(\.folderPath) {
         reconcileAutomaticFeed()
       }
     }
@@ -489,6 +490,7 @@ final class AppModel {
   private var lutLoadingFeeds: Set<FeedID> = [] { didSet { expireResolvedStartRefusals() } }
   private let demandMonitor = CameraDemandMonitor()
   private var persistedSnapshot = AppSettingsSnapshot()
+  @ObservationIgnored private var publishedCameraDevices: [VirtualCameraDescriptor]?
   private var nextDirectorAttempt: TimeInterval = 0
   private var autoSwitcherBridge: AutoSwitcherBridge?
   /// The cameras the running director cuts between, fixed when it was built.
@@ -647,10 +649,13 @@ final class AppModel {
       let held = self.heldRecordingApps(for: id, at: ProcessInfo.processInfo.systemUptime)
       self.recordingAttempted[id, default: []].formUnion(held)
     }
-    recordingModel.onRecordingStarted = { [weak self] feedID, url in
+    recordingModel.onRecordingAttempted = { [weak self] feedID in
       guard let self else { return }
       self.acknowledgedTakes.remove(feedID)
       if self.unexpectedStops[feedID]?.cameraStopped == false { self.unexpectedStops[feedID] = nil }
+    }
+    recordingModel.onRecordingStarted = { [weak self] feedID, url in
+      guard let self else { return }
       self.beginTakeAudio(feedID, outputURL: url)
       // A take can be what starts the director, and it binds to that director's timeline.
       self.reconcileAutomaticFeed()
@@ -707,8 +712,8 @@ final class AppModel {
       guard let self, let decisionID = self.pendingAutoDecision?.id,
         self.pendingAutoDecision?.targetFeedID == feedID else { return }
       self.pendingAutoDecision = nil
-      self.autoSwitcherTimeline?.recordApplied(decisionID: decisionID, target: feedID,
-        sourceTime: sourceTime, programTime: programTime, directorAppliedAt: nil)
+      self.autoSwitcherTimeline?.markCutApplied(decisionID: decisionID, target: feedID,
+        sourceTime: sourceTime, programTime: programTime)
       // The director clock is one camera's audio time. The frame that
       // landed the cut has a different source's video PTS, so acknowledging
       // with that PTS moves the director onto the wrong timeline. Nil keeps
@@ -719,7 +724,9 @@ final class AppModel {
       publisher.onSynchronizationResult = { [weak self] result in
         switch result {
         case .success: self?.clearProblem("registry-sync")
-        case .failure(let error): self?.reportRegistryError(error, key: "registry-sync")
+        case .failure(let error):
+          self?.publishedCameraDevices = nil
+          self?.reportRegistryError(error, key: "registry-sync")
         }
       }
     }
@@ -748,9 +755,10 @@ final class AppModel {
     refresh()
     // Hot-plug: arrivals and removals update the list without a manual refresh.
     deviceListObserver = hardware.observeDevices { [weak self] list in
-      self?.driverWarning = hardware.driverWarning()
-      self?.captureStatusRevision &+= 1
-      self?.applyDevices(list, fromDiscovery: true)
+      guard let self, !self.terminating, !self.settingsResetPending else { return }
+      self.driverWarning = hardware.driverWarning()
+      self.captureStatusRevision &+= 1
+      self.applyDevices(list, fromDiscovery: true)
     }
     if !hardware.captureVendors().isEmpty {
       appActivationObservation = NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification).sink { [weak self] _ in
@@ -824,6 +832,7 @@ final class AppModel {
     guard !terminating, !settingsResetPending else { return }
     do {
       applyDevices(try hardware.devices(), fromDiscovery: false)
+      clearProblem("inputs")
     } catch {
       // Enumeration failed before it could report which inputs are present.
       reportProblem(error.localizedDescription, key: "inputs")
@@ -835,7 +844,7 @@ final class AppModel {
   private func applyDevices(_ next: [InputDevice], fromDiscovery: Bool) {
     // Discovery reports every arrival, including devices already listed.
     if fromDiscovery, next == devices { return }
-    for device in next { lastInputNames[device.id] = device.name }
+    lastInputNames.merge(next.map { ($0.id, $0.name) }) { _, new in new }
     devices = next
     hardwareInventory.devicesListed(next.map(\.id))
     for device in next {
@@ -1083,9 +1092,9 @@ final class AppModel {
   /// A take that ended by itself stays on the list until someone has seen it, as does one
   /// a stopped camera took with it. A take stopped by hand needs nothing.
   private func noteTakeFinished(_ id: FeedID, saved url: URL?) {
-    let state = recordingModel.feeds.first { $0.id == id }
-    let statistics = state?.statistics
-    let failed = statistics?.failed == true || state?.error != nil
+    guard let state = recordingModel.feeds.first(where: { $0.id == id }), !state.failedToStart else { return }
+    let statistics = state.statistics
+    let failed = statistics?.failed == true || state.error != nil
     guard failed || unexpectedStops[id] != nil else { return }
     var result: UnexpectedTakeResult?
     if let url {
@@ -1096,7 +1105,7 @@ final class AppModel {
     if unexpectedStops[id] != nil {
       unexpectedStops[id]?.take = result
     } else {
-      unexpectedStops[id] = UnexpectedStop(reason: state?.error ?? statistics?.lastError ?? "The take ended early.",
+      unexpectedStops[id] = UnexpectedStop(reason: state.error ?? statistics?.lastError ?? "The take ended early.",
         at: Date(), cameraStopped: false, take: result)
     }
   }
@@ -1113,7 +1122,8 @@ final class AppModel {
   /// running/removal guard and moves the selection to the first remaining camera.
   @discardableResult
   func removeFeed(_ id: FeedID) -> Bool {
-    guard canRemoveCamera(id) else { return false }
+    guard canRemoveCamera(id), descriptor(for: id) != nil,
+      validatedRegistry(for: feedDescriptors.filter { $0.id != id }) != nil else { return false }
     guard feedCoordinator.remove(id) else { return false }
     if streamSnapshot.active, streamSnapshot.audioFeedID == id.rawValue {
       streamAudioController?.setProgramStreamAudioTap(nil)
@@ -1201,7 +1211,7 @@ final class AppModel {
     switchingRevision &+= 1
     if let oldDecisionID {
       pendingAutoDecision = nil
-      autoSwitcherTimeline?.recordRejected(decisionID: oldDecisionID)
+      autoSwitcherTimeline?.markCutRejected(decisionID: oldDecisionID)
       autoSwitcherBridge?.reject(decisionID: oldDecisionID)
     }
     switch result {
@@ -1241,8 +1251,7 @@ final class AppModel {
     }
     if let decisionID = pendingAutoDecision?.id, pendingAutoDecision?.targetFeedID == feedID {
       pendingAutoDecision = nil
-      if reason == .expired { autoSwitcherTimeline?.recordExpired(decisionID: decisionID) }
-      else { autoSwitcherTimeline?.recordRejected(decisionID: decisionID) }
+      autoSwitcherTimeline?.markCutRejected(decisionID: decisionID, expired: reason == .expired)
       autoSwitcherBridge?.reject(decisionID: decisionID)
     }
   }
@@ -1320,72 +1329,10 @@ final class AppModel {
       recordingTimelines[feedID] = timeline
       timeline.recordingStarted(feedID: feedID, url: take.url, mediaStart: take.mediaStart)
     }
-    bridge.onControlEvent = { [weak self, weak timeline, weak bridge] event in
+    bridge.setEventsReadyHandler { [weak self, weak bridge, weak timeline] in
       Task { @MainActor in
-        guard let self, let bridge, self.autoSwitcherBridge === bridge else { return }
-        timeline?.recordControlEvent(event)
-      }
-    }
-    bridge.onAudioCue = { [weak self, weak timeline, weak bridge] cue in
-      Task { @MainActor in
-        guard let self, let bridge, self.autoSwitcherBridge === bridge else { return }
-        timeline?.recordAudioCue(cue)
-      }
-    }
-    bridge.onTranscriptCue = { [weak self, weak timeline, weak bridge] cue in
-      Task { @MainActor in
-        guard let self, let bridge, self.autoSwitcherBridge === bridge else { return }
-        timeline?.recordTranscript(cue)
-      }
-    }
-    bridge.onInstruction = { [weak self, weak bridge] instruction in
-      Task { @MainActor [weak self] in
-        guard let self, let bridge, self.autoSwitcherBridge === bridge else { return }
-        self.autoSwitcherTimeline?.recordInstruction(instruction,
-          from: self.switcherSelectedFeedID)
-        // `cutTime` is on the director's audio clock, not on the target
-        // camera's video PTS. Using it as a frame bound waits for a timestamp
-        // the target will never reach and drops the current program source.
-        let result = self.feedCoordinator.requestProgramCut(to: instruction.targetCameraID,
-          noEarlierThan: nil)
-        self.switchingRevision &+= 1
-        switch result {
-        case .queued, .coalesced:
-          self.pendingAutoDecision = PendingAutoDecision(id: instruction.decisionID,
-            targetFeedID: instruction.targetCameraID)
-        case .selectedImmediately:
-          // Nothing was on air, so the selection moved at once and no cut lands to
-          // acknowledge. The director hears it as it hears an operator's selection, or it
-          // would go on asking for the camera Program already shows.
-          self.autoSwitcherTimeline?.recordRejected(decisionID: instruction.decisionID)
-          bridge.reject(decisionID: instruction.decisionID)
-          bridge.manualOverride(cameraID: instruction.targetCameraID, at: self.directorClock())
-          self.persistProgramSelection()
-          self.reconcileProgramTransportDemand()
-        case .ignoredSameSource, .rejectedMissingSource:
-          self.autoSwitcherTimeline?.recordRejected(decisionID: instruction.decisionID)
-          bridge.reject(decisionID: instruction.decisionID)
-        }
-      }
-    }
-    bridge.onError = { [weak self, weak bridge] message in
-      Task { @MainActor [weak self] in
-        guard let self, let bridge, self.autoSwitcherBridge === bridge else { return }
-        self.autoSwitcherTimeline?.recordError(message)
-        if bridge.connectionLost {
-          self.nextDirectorAttempt = ProcessInfo.processInfo.systemUptime + 3
-          self.stopAutoSwitcher()
-        }
-        self.reportProblem("Auto director: \(message)", key: "director")
-      }
-    }
-    bridge.onDecisionExpired = { [weak self, weak bridge] decisionID in
-      Task { @MainActor [weak self] in
-        guard let self, let bridge, self.autoSwitcherBridge === bridge,
-          self.pendingAutoDecision?.id == decisionID else { return }
-        self.pendingAutoDecision = nil
-        self.autoSwitcherTimeline?.recordExpired(decisionID: decisionID)
-        self.feedCoordinator.cancelProgramCut()
+        guard let self, let bridge, let timeline, self.autoSwitcherBridge === bridge else { return }
+        self.drainDirectorEvents(from: bridge, into: timeline)
       }
     }
     autoSwitcherBridge = bridge
@@ -1409,6 +1356,57 @@ final class AppModel {
     bridge.manualOverride(cameraID: directorShotSeed(anchor: anchor, emphasis: emphasis), at: directorClock())
   }
 
+  private func drainDirectorEvents(from bridge: AutoSwitcherBridge, into timeline: AutoSwitcherTimelineRecorder) {
+    for event in bridge.takeEvents() {
+      let running = autoSwitcherBridge === bridge
+      switch event {
+      case .control(let event):
+        timeline.recordControlEvent(event)
+      case .audio(let cue):
+        timeline.recordAudioCue(cue)
+      case .transcript(let cue):
+        timeline.recordTranscript(cue)
+      case .instruction(let instruction):
+        timeline.recordInstruction(instruction, from: switcherSelectedFeedID)
+        if running { requestDirectorCut(instruction, bridge: bridge, timeline: timeline) }
+      case .decisionExpired(let decisionID):
+        timeline.recordExpired(decisionID: decisionID)
+        guard running, pendingAutoDecision?.id == decisionID else { continue }
+        pendingAutoDecision = nil
+        feedCoordinator.cancelProgramCut()
+      case .error(let message, let connectionLost):
+        timeline.recordError(message)
+        guard running else { continue }
+        if connectionLost {
+          nextDirectorAttempt = ProcessInfo.processInfo.systemUptime + 3
+          stopAutoSwitcher()
+        }
+        reportProblem("Auto director: \(message)", key: "director")
+      }
+    }
+  }
+
+  private func requestDirectorCut(_ instruction: AutoSwitcherInstruction, bridge: AutoSwitcherBridge,
+                                  timeline: AutoSwitcherTimelineRecorder) {
+    // The director's audio clock cannot bound the target camera's video PTS.
+    let result = feedCoordinator.requestProgramCut(to: instruction.targetCameraID, noEarlierThan: nil)
+    switchingRevision &+= 1
+    switch result {
+    case .queued, .coalesced:
+      pendingAutoDecision = PendingAutoDecision(id: instruction.decisionID, targetFeedID: instruction.targetCameraID)
+    case .selectedImmediately:
+      // With nothing on air, selection changed without a frame-boundary cut.
+      timeline.markCutRejected(decisionID: instruction.decisionID)
+      bridge.reject(decisionID: instruction.decisionID)
+      bridge.manualOverride(cameraID: instruction.targetCameraID, at: directorClock())
+      persistProgramSelection()
+      reconcileProgramTransportDemand()
+    case .ignoredSameSource, .rejectedMissingSource:
+      timeline.markCutRejected(decisionID: instruction.decisionID)
+      bridge.reject(decisionID: instruction.decisionID)
+    }
+  }
+
   /// The camera the director's shot starts on. It knows only its two: with a third on
   /// Program it starts on its anchor, as it would anyway, but from now. An override naming
   /// the third is ignored and leaves the shot starting at zero on a stream clock that may
@@ -1425,12 +1423,15 @@ final class AppModel {
     // in the Program scheduler to switch after the UI has disabled automation.
     // A cut the operator asked for isn't the director's to cancel.
     if directorCutPending { feedCoordinator.cancelProgramCut() }
-    autoSwitcherBridge?.stop()
+    let bridge = autoSwitcherBridge
+    let timeline = autoSwitcherTimeline
     autoSwitcherBridge = nil
+    autoSwitcherTimeline = nil
     directorCameras = nil
     directorClockOwner = nil
-    autoSwitcherTimeline?.finish()
-    autoSwitcherTimeline = nil
+    bridge?.stop()
+    if let bridge, let timeline { drainDirectorEvents(from: bridge, into: timeline) }
+    timeline?.finish()
   }
 
   private func feedAutoSwitcherAudio(_ update: CaptureUpdate) {
@@ -1453,7 +1454,6 @@ final class AppModel {
       autoSwitcherBridge?.ingestAudio(time: update.audioInterruptionTime.map { CMTimeMaximum(time, $0) } ?? time,
         rms: 0, peak: 0, present: false)
     } else {
-      autoSwitcherTimeline?.recordTick(time: time)
       autoSwitcherBridge?.tick(time: time)
     }
   }
@@ -1480,11 +1480,14 @@ final class AppModel {
   private func saveSettings(reason: String) {
     guard !launching, !settingsResetPending else { return }
     let next = feedCoordinator.snapshot
-    guard let registry = validatedRegistry(for: next.feeds) else { return }
+    let devices = feedCoordinator.virtualCameraDescriptors
+    let needsPublication = devices != publishedCameraDevices
+    let registry = needsPublication ? validatedRegistry(for: next.feeds) : nil
+    guard !needsPublication || registry != nil else { return }
     persistedSnapshot = next
     settingsStore.saveSnapshot(persistedSnapshot)
-    demandMonitor.setRoutes(feedCoordinator.virtualCameraDescriptors)
-    publishVirtualCameraRegistry(registry, reason: reason)
+    demandMonitor.setRoutes(devices)
+    if let registry { publishVirtualCameraRegistry(registry, reason: reason) }
     let available = programAvailable
     // A monitor that lost Program takes frames again from a new generation, and a Program
     // camera published again has had nothing written to it.
@@ -1539,7 +1542,13 @@ final class AppModel {
   }
 
   private func validatedRegistry(for feeds: [FeedDescriptor]) -> VirtualCameraRegistrySnapshot? {
-    let candidate = VirtualCameraRegistrySnapshot.forFeeds(feeds, previous: virtualCameraRegistryStore.load(),
+    let previous = virtualCameraRegistryStore.load()
+    // Retrying the same device set should synchronize the saved generation,
+    // including when there is no generation left for topology changes.
+    if let previous, previous.generation > 0, previous.devices == VirtualCameraRegistrySnapshot.devices(for: feeds) {
+      return previous
+    }
+    let candidate = VirtualCameraRegistrySnapshot.forFeeds(feeds, previous: previous,
       appGroupIdentifier: virtualCameraRegistryStore.groupIdentifier)
     do {
       _ = try VirtualCameraRegistryWire.encodedData(candidate)
@@ -1564,6 +1573,7 @@ final class AppModel {
       try virtualCameraRegistryStore.save(candidate)
       registryLog.notice("Registry publish: generation \(candidate.generation, privacy: .public), \(candidate.devices.filter(\.enabled).count, privacy: .public) devices, reason: \(reason, privacy: .public)")
       registryPublisher.publish(candidate)
+      publishedCameraDevices = candidate.devices
       clearProblem("registry")
     } catch {
       reportRegistryError(error, key: "registry")
@@ -1704,7 +1714,7 @@ final class AppModel {
     directorClockOwner = feedID
     if let decisionID = pendingAutoDecision?.id {
       pendingAutoDecision = nil
-      autoSwitcherTimeline?.recordRejected(decisionID: decisionID)
+      autoSwitcherTimeline?.markCutRejected(decisionID: decisionID)
       feedCoordinator.cancelProgramCut()
     }
     bridge.rebaseClock(at: time, onAir: directorShotSeed(anchor: cameras.anchor, emphasis: cameras.emphasis),
@@ -1745,7 +1755,7 @@ final class AppModel {
     appliedPipelines[id] = pipeline(for: id)
     cameraUpdates[id] = CaptureUpdate(message: "Opening input device…")
     cameraStateRevision &+= 1
-    if programMoved?.from == descriptor.name { programMoved = nil }
+    if programMoved?.fromID == id.rawValue { programMoved = nil }
     reconcileAutoSwitcher()
     reconcileProgramTransportDemand()
     updateLiveWatch()
@@ -1876,9 +1886,11 @@ final class AppModel {
     guard let descriptor = descriptor(for: id), descriptor.enabled, !descriptor.selectedDevice.isEmpty,
       !feedCoordinator.isFeedRunning(id), !isCaptureAuthorizationPending(id) else { return false }
     let deviceID = descriptor.selectedDevice
-    return captureAuthorization(for: deviceID) == .requestable
-      ? !lutLoadingFeeds.contains(id) && inputInUse(by: id) == nil
-      : canStart(id)
+    switch captureAuthorization(for: deviceID) {
+    case .authorized: return canStart(id)
+    case .requestable: return !lutLoadingFeeds.contains(id) && inputInUse(by: id) == nil
+    case .unavailable: return false
+    }
   }
 
   /// What the interface calls an input: its label while listed (`UIInputLabels`),
@@ -2047,7 +2059,7 @@ final class AppModel {
       let id = descriptor.id
       let isRunning = feedCoordinator.isFeedRunning(id)
       let wantsBackup = descriptor.recordWithCameraApps && heldRecordingApps(for: id, at: now, allowRelease: isRunning).contains {
-        recordingModel.outputFolder(for: id) != nil || recordingProfiles[$0]?.folderBookmark != nil
+        recordingModel.outputFolder(for: id) != nil || recordingProfiles[$0]?.hasCustomFolder == true
       }
       let recording = recordingModel.feeds.contains {
         $0.id == id && ($0.status == .recording || $0.status == .paused)
@@ -2120,7 +2132,7 @@ final class AppModel {
     // Nobody is told about a selection no one can see.
     if programPicture, let from = descriptor(for: onAir)?.name, let to = descriptor(for: next)?.name {
       let settings = switcherSettings
-      programMoved = UIProgramMove(from: from, to: to,
+      programMoved = UIProgramMove(fromID: onAir.rawValue, from: from, to: to,
         heldShot: settings.automatic && settings.naturalTalkingHead.manualHold, cause: cause)
     }
   }
@@ -2468,7 +2480,7 @@ final class AppModel {
       captureLog.notice("Signal steady \(id.rawValue, privacy: .public): eligible for Program again")
       feedCoordinator.setProgramSourceCutEligible(id, eligible: true)
       autoSwitcherBridge?.setCameraHealth(cameraID: id, healthy: true, at: directorClock())
-      if programMoved?.from == descriptor(for: id)?.name { programMoved = nil }
+      if programMoved?.fromID == id.rawValue { programMoved = nil }
     }
   }
 
@@ -2485,7 +2497,7 @@ final class AppModel {
     case .queued, .coalesced, .selectedImmediately:
       captureLog.notice("Program moved: \(id.rawValue, privacy: .public) → \(next.rawValue, privacy: .public), signal lost")
       if let from = descriptor(for: id)?.name, let to = descriptor(for: next)?.name {
-        programMoved = UIProgramMove(from: from, to: to, heldShot: settings.naturalTalkingHead.manualHold)
+        programMoved = UIProgramMove(fromID: id.rawValue, from: from, to: to, heldShot: settings.naturalTalkingHead.manualHold)
       }
     case .ignoredSameSource, .rejectedMissingSource:
       break
@@ -2594,7 +2606,7 @@ final class AppModel {
       guard take.status == .idle, !held.isEmpty, feedCoordinator.isFeedRunning(id), cameraUpdates[id]?.signal == .live else { continue }
       // A direct camera client has priority over Program when both qualify at once.
       let eligible = held.subtracting(attempted).sorted().filter {
-        recordingProfiles[$0]?.folderBookmark != nil || recordingModel.outputFolder(for: id) != nil
+        recordingProfiles[$0]?.hasCustomFolder == true || recordingModel.outputFolder(for: id) != nil
       }
       guard let app = eligible.first(where: { camera[$0]?.shouldStart(at: now) == true })
         ?? eligible.first(where: { program[$0]?.shouldStart(at: now) == true }), let name = recordingApps[app] else { continue }
@@ -2879,9 +2891,11 @@ final class AppModel {
   func deliverCaptureUpdateForTesting(_ id: FeedID, _ update: CaptureUpdate) { cameraDidUpdate(id, update) }
   /// What the running director sends, without the audio it decides on.
   func deliverDirectorInstructionForTesting(_ instruction: AutoSwitcherInstruction) {
-    autoSwitcherBridge?.onInstruction?(instruction)
+    autoSwitcherBridge?.enqueueEventForTesting(.instruction(instruction))
   }
-  func expireDirectorDecisionForTesting(_ decisionID: UUID) { autoSwitcherBridge?.onDecisionExpired?(decisionID) }
+  func expireDirectorDecisionForTesting(_ decisionID: UUID) {
+    autoSwitcherBridge?.enqueueEventForTesting(.decisionExpired(decisionID))
+  }
   #endif
 
   /// True when running Program sources deliver different camera formats. Cuts

@@ -17,6 +17,7 @@ final class RecordingRGBPixelConverter: @unchecked Sendable {
   private let queue: MTL4CommandQueue
   private let pipeline: MTLComputePipelineState
   private let packedPipeline: MTLComputePipelineState
+  private let packedTexturePipeline: MTLComputePipelineState
   let budget: GPUAllocationBudget
   private let slots = DispatchSemaphore(value: 3)
   private let submissionGate: MTLSharedEvent?
@@ -38,6 +39,7 @@ final class RecordingRGBPixelConverter: @unchecked Sendable {
       return try compiler.makeComputePipelineState(descriptor: descriptor)
     }
     pipeline = try build("recordingRGB16"); packedPipeline = try build("recordingPackedRGB16")
+    packedTexturePipeline = try build("recordingPackedTextureRGB16")
   }
 
   private final class WaitResult: @unchecked Sendable {
@@ -58,7 +60,7 @@ final class RecordingRGBPixelConverter: @unchecked Sendable {
       throw ConversionError.invalidInput("RGB repack requires full precision rgba32Float")
     }
     try wait { completion in
-      try self.submit(input: nil, texture: source, width: source.width, height: source.height,
+      try self.submit(pipeline: self.pipeline, input: nil, texture: source, width: source.width, height: source.height,
         parameters: [UInt32((1 << sourceBitDepth) - 1)], destination: destination, owner: nil, completion: completion)
     }
   }
@@ -89,8 +91,8 @@ final class RecordingRGBPixelConverter: @unchecked Sendable {
       throw ConversionError.invalidInput("Packed RGB recording requires bounded original IOSurface storage")
     }
     // A CV IOSurface may own fewer bytes than a VM page. Never alias its base
-    // with makeBuffer(bytesNoCopy:). Read only a bounded native texture view,
-    // then copy on the GPU into a Metal-owned private allocation.
+    // with makeBuffer(bytesNoCopy:). Decode directly from a bounded native
+    // texture view so the recorder never stages a second copy of the frame.
     // Eight-byte texels keep even a 16384-pixel R12L row under the
     // conservative Metal 4 texture limit. Tail texels may contain only owned
     // row padding; the raw decoder reads exactly the declared 36 bits/pixel.
@@ -98,23 +100,19 @@ final class RecordingRGBPixelConverter: @unchecked Sendable {
     let descriptor = MTLTextureDescriptor.texture2DDescriptor(
       pixelFormat: view.pixelFormat, width: view.width, height: height, mipmapped: false)
     descriptor.storageMode = .shared; descriptor.usage = .shaderRead
-    let (aligned, alignmentOverflow) = logicalBytes.addingReportingOverflow(255)
-    guard !alignmentOverflow else { throw ConversionError.invalidInput("RGB staging stride overflow") }
-    let stride = aligned / 256 * 256
-    let (bytes, overflow) = stride.multipliedReportingOverflow(by: height)
-    guard !overflow, let view = device.makeTexture(descriptor: descriptor, iosurface: surface, plane: 0),
-      let input = device.makeBuffer(length: bytes, options: .storageModePrivate) else {
+    guard let texture = device.makeTexture(descriptor: descriptor, iosurface: surface, plane: 0) else {
       throw ConversionError.invalidInput("Packed RGB IOSurface cannot provide a bounded native texture view")
     }
-    try submitPacked(input: input, width: width, height: height, stride: stride,
-      format: format, sourceRange: sourceRange, destination: destination,
-      owner: source, copySource: view, sourceSurface: surface, completion: completion)
+    try submit(pipeline: packedTexturePipeline, input: nil, texture: texture, width: width, height: height,
+      parameters: [UInt32(RGBFormat.allCases.firstIndex(of: format)!),
+        (sourceRange ?? (format == .r210 ? .video : .full)) == .video ? 1 : 0],
+      destination: destination, owner: source, sourceSurface: surface, completion: completion)
   }
 
   struct SourceTextureLayout {
     let pixelFormat: MTLPixelFormat
     let width: Int
-    let copiedRowBytes: Int
+    let viewRowBytes: Int
   }
 
   static func sourceTextureLayout(width: Int, height: Int, format: RGBFormat,
@@ -129,36 +127,28 @@ final class RecordingRGBPixelConverter: @unchecked Sendable {
     let (tail, overflow) = logical.addingReportingOverflow(bytesPerTexel - 1)
     guard !overflow else { throw ConversionError.invalidInput("RGB texture row overflow") }
     let texels = tail / bytesPerTexel
-    let (copied, copyOverflow) = texels.multipliedReportingOverflow(by: bytesPerTexel)
-    guard !copyOverflow, texels <= 16384, copied <= physicalStride else {
+    let (viewBytes, viewOverflow) = texels.multipliedReportingOverflow(by: bytesPerTexel)
+    guard !viewOverflow, texels <= 16384, viewBytes <= physicalStride else {
       throw ConversionError.invalidInput("RGB native texture view would exceed owned row storage")
     }
     return SourceTextureLayout(pixelFormat: format == .r12l ? .rgba16Uint : .rgba8Uint,
-      width: texels, copiedRowBytes: copied)
+      width: texels, viewRowBytes: viewBytes)
   }
 
   func convert(packedRGB input: MTLBuffer, width: Int, height: Int, bytesPerRow: Int,
     format: RGBFormat, sourceRange: Colorimetry.Range? = nil, into destination: CVPixelBuffer) throws {
-    try wait { completion in
-      try self.submitPacked(input: input, width: width, height: height, stride: bytesPerRow,
-        format: format, sourceRange: sourceRange, destination: destination, owner: nil, completion: completion)
-    }
-  }
-
-  private func submitPacked(input: MTLBuffer, width: Int, height: Int, stride: Int,
-    format: RGBFormat, sourceRange: Colorimetry.Range?, destination: CVPixelBuffer, owner: AnyObject?,
-    copySource: MTLTexture? = nil, sourceSurface: IOSurfaceRef? = nil,
-    completion: @escaping @Sendable (Result<Void, Error>) -> Void) throws {
     let minimum = try format.minimumRowBytes(width: width)
-    let (extent, overflow) = stride.multipliedReportingOverflow(by: height)
-    guard height > 0, !overflow, extent <= input.length, stride >= minimum,
-      input.device === device, width <= Int(UInt32.max), height <= Int(UInt32.max), stride <= Int(UInt32.max) else {
+    let (extent, overflow) = bytesPerRow.multipliedReportingOverflow(by: height)
+    guard height > 0, !overflow, extent <= input.length, bytesPerRow >= minimum,
+      input.device === device, width <= Int(UInt32.max), height <= Int(UInt32.max), bytesPerRow <= Int(UInt32.max) else {
       throw ConversionError.invalidInput("Invalid packed RGB input allocation")
     }
-    try submit(input: input, texture: nil, width: width, height: height,
-      parameters: [UInt32(width), UInt32(height), UInt32(stride), UInt32(RGBFormat.allCases.firstIndex(of: format)!),
-        (sourceRange ?? (format == .r210 ? .video : .full)) == .video ? 1 : 0],
-      destination: destination, owner: owner, copySource: copySource, sourceSurface: sourceSurface, completion: completion)
+    try wait { completion in
+      try self.submit(pipeline: self.packedPipeline, input: input, texture: nil, width: width, height: height,
+        parameters: [UInt32(width), UInt32(height), UInt32(bytesPerRow), UInt32(RGBFormat.allCases.firstIndex(of: format)!),
+          (sourceRange ?? (format == .r210 ? .video : .full)) == .video ? 1 : 0],
+        destination: destination, owner: nil, completion: completion)
+    }
   }
 
   private final class Submission: @unchecked Sendable {
@@ -183,21 +173,24 @@ final class RecordingRGBPixelConverter: @unchecked Sendable {
       self.command = command; self.residency = residency; self.leases = leases; self.completion = completion
     }
     func finish(_ error: Error?) {
-      converter.queue.removeResidencySet(residency)
       leases.forEach { $0.release() }; converter.slots.signal()
       if let error { completion(.failure(ConversionError.commandFailed(error.localizedDescription))) }
       else { completion(.success(())) }
     }
   }
 
-  private func submit(input: MTLBuffer?, texture: MTLTexture?, width: Int, height: Int,
+  private func submit(pipeline: MTLComputePipelineState, input: MTLBuffer?, texture: MTLTexture?, width: Int, height: Int,
     parameters values: [UInt32], destination: CVPixelBuffer, owner: AnyObject?,
-    copySource: MTLTexture? = nil, sourceSurface: IOSurfaceRef? = nil,
+    sourceSurface: IOSurfaceRef? = nil,
     completion: @escaping @Sendable (Result<Void, Error>) -> Void) throws {
-    guard CVPixelBufferGetPixelFormatType(destination) == Self.outputPixelFormat,
+    guard width > 0, height > 0, width <= 16384, height <= 16384,
+      CVPixelBufferGetPixelFormatType(destination) == Self.outputPixelFormat,
       CVPixelBufferGetWidth(destination) == width, CVPixelBufferGetHeight(destination) == height,
       !CVPixelBufferIsPlanar(destination), let surface = CVPixelBufferGetIOSurface(destination)?.takeUnretainedValue() else {
       throw ConversionError.invalidInput("Expected matching IOSurface RGBA16 destination")
+    }
+    if let inputSurface = sourceSurface ?? texture?.iosurface, IOSurfaceGetID(inputSurface) == IOSurfaceGetID(surface) {
+      throw ConversionError.invalidInput("Source and destination alias the same IOSurface")
     }
     guard slots.wait(timeout: .now()) == .success else { throw ConversionError.unavailable("RGB recording in-flight limit reached") }
     var submitted = false
@@ -219,7 +212,7 @@ final class RecordingRGBPixelConverter: @unchecked Sendable {
     if let input {
       leases.append(try budget.acquire(backingID: input.gpuAddress, bytes: input.allocatedSize, generation: 0, owner: input))
     }
-    if let texture {
+    if let texture, sourceSurface == nil {
       leases.append(try budget.acquire(backingID: UInt64(UInt(bitPattern: Unmanaged.passUnretained(texture as AnyObject).toOpaque())),
         bytes: texture.allocatedSize, generation: 0, owner: texture))
     }
@@ -233,32 +226,18 @@ final class RecordingRGBPixelConverter: @unchecked Sendable {
     table.setAddress(parameters.gpuAddress, index: input == nil ? 0 : 1)
     if let texture { table.setTexture(texture.gpuResourceID, index: 0); residency.addAllocation(texture) }
     table.setTexture(output.gpuResourceID, index: input == nil ? 1 : 0)
+    residency.commit()
     command.beginCommandBuffer(allocator: allocator)
-    if let copySource, let input {
-      residency.addAllocation(copySource)
-      guard let copy = command.makeComputeCommandEncoder() else {
-        command.endCommandBuffer(); throw ConversionError.unavailable("RGB staging GPU copy unavailable")
-      }
-      copy.copy(sourceTexture: copySource, sourceSlice: 0, sourceLevel: 0,
-        sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
-        sourceSize: MTLSize(width: copySource.width, height: copySource.height, depth: 1),
-        destinationBuffer: input, destinationOffset: 0, destinationBytesPerRow: Int(values[2]), destinationBytesPerImage: 0)
-      copy.endEncoding()
-    }
+    command.useResidencySet(residency)
     guard let encoder = command.makeComputeCommandEncoder() else {
       command.endCommandBuffer(); throw ConversionError.unavailable("RGB recording encoder unavailable")
     }
-    if copySource != nil {
-      // Metal 4 does not infer dependencies between encoders. The decode must
-      // observe completed private-buffer writes from the preceding blit pass.
-      encoder.barrier(afterQueueStages: .blit, beforeStages: .dispatch, visibilityOptions: [])
-    }
-    encoder.setComputePipelineState(input == nil ? pipeline : packedPipeline); encoder.setArgumentTable(table)
+    encoder.setComputePipelineState(pipeline); encoder.setArgumentTable(table)
     encoder.dispatchThreads(threadsPerGrid: MTLSize(width: width, height: height, depth: 1),
       threadsPerThreadgroup: MTLSize(width: 16, height: 8, depth: 1))
-    encoder.endEncoding(); command.endCommandBuffer(); residency.commit(); queue.addResidencySet(residency)
+    encoder.endEncoding(); command.endCommandBuffer()
     let submission = Submission(converter: self, destination: destination, owner: owner, input: input,
-      textures: [output] + (texture.map { [$0] } ?? []) + (copySource.map { [$0] } ?? []), parameters: parameters, table: table,
+      textures: [output] + (texture.map { [$0] } ?? []), parameters: parameters, table: table,
       allocator: allocator, command: command, residency: residency, leases: leases, completion: completion)
     let options = MTL4CommitOptions()
     options.addFeedbackHandler { feedback in
@@ -311,31 +290,9 @@ final class RecordingRGBPixelConverter: @unchecked Sendable {
     uint3 expanded = (codes * 65535u + maximumCode / 2u) / maximumCode;
     output.write(uint4(expanded, 65535u), p);
   }
-  kernel void recordingPackedRGB16(device const uchar *bytes [[buffer(0)]],
-    constant uint *p [[buffer(1)]], texture2d<uint, access::write> output [[texture(0)]],
-    uint2 xy [[thread_position_in_grid]]) {
-    if (xy.x >= p[0] || xy.y >= p[1]) return;
-    device const uchar *row = bytes + ulong(xy.y) * p[2];
-    uint3 codes; uint maximumCode;
-    if (p[3] < 2) {
-      uint i = xy.x * 4; codes = uint3(row[i], row[i+1], row[i+2]);
-      if (p[3] == 0) codes = codes.bgr;
-      maximumCode = 255;
-    } else if (p[3] == 2) {
-      uint i = xy.x * 4;
-      uint word = (uint(row[i]) << 24) | (uint(row[i+1]) << 16) | (uint(row[i+2]) << 8) | uint(row[i+3]);
-      codes = uint3((word >> 20) & 1023, (word >> 10) & 1023, word & 1023);
-      maximumCode = 1023;
-    } else {
-      ulong bit = ulong(xy.x) * 36;
-      for (uint c = 0; c < 3; ++c) {
-        ulong b = bit + c * 12; uint shift = uint(b & 7); ulong i = b >> 3;
-        codes[c] = ((uint(row[i]) | (uint(row[i+1]) << 8)) >> shift) & 4095;
-      }
-      maximumCode = 4095;
-    }
+  uint4 expandPackedRGB(uint3 codes, uint maximumCode, uint videoRange) {
     uint3 expanded;
-    if (p[4] != 0) {
+    if (videoRange) {
       // Encoder l64r is full range. Legal video RGB maps to full range;
       // superblack/superwhite clip at this unsigned representation boundary.
       int black = maximumCode == 255 ? 16 : (maximumCode == 1023 ? 64 : 256);
@@ -345,7 +302,52 @@ final class RecordingRGBPixelConverter: @unchecked Sendable {
     } else {
       expanded = (codes * 65535u + maximumCode / 2u) / maximumCode;
     }
-    output.write(uint4(expanded, 65535u), xy);
+    return uint4(expanded, 65535u);
+  }
+  uint3 decodeRGBWord(uint4 bytes, uint format) {
+    if (format < 2u) return format == 0u ? bytes.bgr : bytes.rgb;
+    uint word = (bytes.r << 24) | (bytes.g << 16) | (bytes.b << 8) | bytes.a;
+    return uint3((word >> 20) & 1023, (word >> 10) & 1023, word & 1023);
+  }
+  kernel void recordingPackedTextureRGB16(texture2d<uint, access::read> source [[texture(0)]],
+    texture2d<uint, access::write> output [[texture(1)]], constant uint2 &p [[buffer(0)]],
+    uint2 xy [[thread_position_in_grid]]) {
+    if (xy.x >= output.get_width() || xy.y >= output.get_height()) return;
+    uint3 codes;
+    if (p.x < 3u) {
+      codes = decodeRGBWord(source.read(xy), p.x);
+    } else {
+      // Each RGBA16 texel exposes 64 consecutive little-endian source bits.
+      const uint bit = xy.x * 36u;
+      const uint texel = bit / 64u;
+      const uint shift = bit % 64u;
+      ulong pixel = as_type<ulong>(ushort4(source.read(uint2(texel, xy.y)))) >> shift;
+      if (shift + 36u > 64u) {
+        pixel |= as_type<ulong>(ushort4(source.read(uint2(texel + 1u, xy.y)))) << (64u - shift);
+      }
+      codes = uint3(uint(pixel), uint(pixel >> 12), uint(pixel >> 24)) & 4095u;
+    }
+    output.write(expandPackedRGB(codes, p.x < 2u ? 255u : (p.x == 2u ? 1023u : 4095u), p.y), xy);
+  }
+  kernel void recordingPackedRGB16(device const uchar *bytes [[buffer(0)]],
+    constant uint *p [[buffer(1)]], texture2d<uint, access::write> output [[texture(0)]],
+    uint2 xy [[thread_position_in_grid]]) {
+    if (xy.x >= p[0] || xy.y >= p[1]) return;
+    device const uchar *row = bytes + ulong(xy.y) * p[2];
+    uint3 codes; uint maximumCode;
+    if (p[3] < 3u) {
+      uint i = xy.x * 4;
+      codes = decodeRGBWord(uint4(row[i], row[i+1], row[i+2], row[i+3]), p[3]);
+      maximumCode = p[3] < 2u ? 255u : 1023u;
+    } else {
+      ulong bit = ulong(xy.x) * 36;
+      for (uint c = 0; c < 3; ++c) {
+        ulong b = bit + c * 12; uint shift = uint(b & 7); ulong i = b >> 3;
+        codes[c] = ((uint(row[i]) | (uint(row[i+1]) << 8)) >> shift) & 4095;
+      }
+      maximumCode = 4095;
+    }
+    output.write(expandPackedRGB(codes, maximumCode, p[4]), xy);
   }
   """
 }

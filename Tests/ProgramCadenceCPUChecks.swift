@@ -1,3 +1,4 @@
+import CoreGraphics
 import CoreMedia
 import CoreVideo
 import Foundation
@@ -5,6 +6,75 @@ import Synchronization
 import XCTest
 
 @objcMembers final class ProgramCadenceCPUChecks: XCTestCase {
+  func testCadenceRefusesSpanBeyondFixedProgramClock() throws {
+    let id = FeedID(rawValue: "long-running")
+    let route = ProgramOutputRoute(feedIDs: [id])
+    let consumer = try route.addConsumerRoute()
+    let image = try cadenceImage()
+    let duration = CMTime(value: 1, timescale: 60)
+    let pixel = CVPixelBufferGetPixelFormatType(image)
+    route.setOutput(contract: .init(width: 2, height: 2, pixelFormat: pixel, duration: duration), active: true)
+    for ticks in [Int64(0), Int64.max - 1] {
+      route.ingest(feedID: id, frame: ProcessedFrame(payload: image, metadata: .init(
+        presentationTime: CMTime(value: ticks, timescale: 240_000), duration: duration,
+        width: 2, height: 2, pixelFormat: pixel)))
+    }
+    XCTAssertEqual(consumer.pendingCount, 1)
+    XCTAssertEqual(route.statistics.accepted, 2)
+    XCTAssertEqual(route.statistics.cadenceSkipped, 1)
+  }
+
+  func testMonitorStartsNewGenerationWhenProgramSelectionOrTimelineChanges() throws {
+    let a = FeedID(rawValue: "a"), b = FeedID(rawValue: "b"), other = FeedID(rawValue: "other")
+    let route = ProgramOutputRoute(feedIDs: [a, b, other])
+    let image = try cadenceImage()
+    let pixel = CVPixelBufferGetPixelFormatType(image)
+    var boundaries: [Bool] = []
+    route.onMonitorFrame = { _, _, _, _, boundary in boundaries.append(boundary) }
+    func send(_ id: FeedID, at ticks: Int64) {
+      route.ingest(feedID: id, frame: ProcessedFrame(payload: image, metadata: .init(
+        presentationTime: CMTime(value: ticks, timescale: 60), duration: CMTime(value: 1, timescale: 60),
+        width: 2, height: 2, pixelFormat: pixel)))
+    }
+
+    send(a, at: 100)
+    route.updateFeeds([a, b])
+    send(a, at: 101)
+    route.updateFeeds([b])
+    send(b, at: 1)
+    send(b, at: 2)
+    route.reset()
+    send(b, at: 0)
+
+    XCTAssertEqual(boundaries, [false, false, true, false, true])
+  }
+
+  func testNewProgramTimelineRearmsOutputFailureReporting() throws {
+    let id = FeedID(rawValue: "invalid-timing")
+    let route = ProgramOutputRoute(feedIDs: [id])
+    let errors = Mutex(0)
+    route.onEvent = { event in
+      if case .outputError = event { errors.withLock { $0 += 1 } }
+    }
+    let image = try cadenceImage()
+    let invalid = ProcessedFrame(payload: image, metadata: .init(
+      presentationTime: .invalid, duration: CMTime(value: 1, timescale: 60),
+      width: 2, height: 2, pixelFormat: CVPixelBufferGetPixelFormatType(image)))
+    func failTiming() {
+      for _ in 0..<ProgramOutputRoute.onAirSkipReportThreshold {
+        route.ingest(feedID: id, frame: invalid)
+      }
+    }
+
+    failTiming()
+    route.setOutput(contract: nil, active: true)
+    failTiming()
+    XCTAssertEqual(errors.withLock { $0 }, 1)
+    route.reset()
+    failTiming()
+    XCTAssertEqual(errors.withLock { $0 }, 2)
+  }
+
   func testUHD60ConversionBacklogSkipsSupersededPicturesAndPreservesCutBoundaries() throws {
     let contract = ProgramOutputFormat(width: 3840, height: 2160,
       pixelFormat: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, duration: FrameRateTarget.fps60.duration)
@@ -203,6 +273,26 @@ import XCTest
     stream.tickForTesting()
     XCTAssertEqual(clock.deliveredSlots, [0, 1, 2, 3, 31, 32])
     XCTAssertEqual(stream.droppedFrames, 27)
+  }
+
+  func testPassthroughRejectsAnAlternateColourProfileEvenWhenStandardTagsMatch() throws {
+    let image = try cadenceImage()
+    let contract = ProgramOutputFormat(width: 2, height: 2, pixelFormat: CVPixelBufferGetPixelFormatType(image),
+      duration: CMTime(value: 1, timescale: 30))
+    let profile = try XCTUnwrap(CGColorSpace(name: CGColorSpace.displayP3)?.copyICCData())
+    let alternateTags: [(CFString, CFTypeRef)] = [
+      (kCVImageBufferICCProfileKey, profile),
+      (kCVImageBufferGammaLevelKey, 2.4 as CFNumber),
+    ]
+    for (key, value) in alternateTags {
+      XCTAssertTrue(contract.matchesColourAndAspect(image))
+      CVBufferSetAttachment(image, key, value, .shouldPropagate)
+      let sample = try VideoContract.sample(image, at: .zero, duration: contract.duration)
+      let description = try XCTUnwrap(sample.formatDescription)
+      XCTAssertNotNil(CMFormatDescriptionGetExtension(description, extensionKey: key))
+      XCTAssertFalse(contract.matchesColourAndAspect(image))
+      CVBufferRemoveAttachment(image, key)
+    }
   }
 
   func testRealStreamTimerKeepsMediaCadenceWithoutIncomingFrames() throws {
@@ -440,6 +530,30 @@ import XCTest
     rig.bridge.disconnect()
   }
 
+  func testMissedWakeExactlyOnGridStillSendsThatSlot() throws {
+    let rig = try CadenceRig(rate: 60)
+    defer { rig.bridge.disconnect() }
+    rig.send(index: 0, duration: CMTime(value: 2, timescale: 1))
+    rig.bridge.waitUntilIdle()
+    rig.jump(to: 24.0 / 60)
+    XCTAssertEqual(rig.sent.count, 2)
+    XCTAssertEqual(rig.sent.last ?? -1, 24.0 / 60, accuracy: 1e-8)
+    XCTAssertEqual(rig.bridge.currentStatistics.clockSkipped, 23)
+  }
+
+  func testMissedWakeDrivenByPumpStillSchedulesTheNextDeadline() throws {
+    let rig = try CadenceRig(rate: 60)
+    defer { rig.bridge.disconnect() }
+    rig.send(index: 0, duration: CMTime(value: 2, timescale: 1))
+    rig.bridge.waitUntilIdle()
+    rig.jump(to: 1.0 / 60, deliversWake: false)
+    rig.bridge.pump()
+    XCTAssertEqual(rig.sent.count, 2)
+    rig.jump(to: 2.0 / 60)
+    XCTAssertEqual(rig.sent.count, 3)
+    XCTAssertEqual(rig.sent.last ?? -1, 2.0 / 60, accuracy: 1e-8)
+  }
+
   func testPendingMediaTimeIsBoundedEquallyAt25And120Hz() throws {
     for rate in [25, 120] {
       let image = try cadenceImage()
@@ -553,7 +667,7 @@ private final class CadenceRig: @unchecked Sendable {
         duration: duration ?? CMTime(value: 1, timescale: Int32(rate)), width: 2, height: 2,
         pixelFormat: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)))
   }
-  func jump(to target: Double) {
+  func jump(to target: Double, deliversWake: Bool = true) {
     let wake = lock.withLock { () -> (@Sendable () -> Void)? in
       time = target
       wakes.sort { $0.0 < $1.0 }
@@ -561,7 +675,7 @@ private final class CadenceRig: @unchecked Sendable {
       wakes.removeFirst()
       return first.1
     }
-    wake?()
+    if deliversWake { wake?() }
     bridge.waitUntilIdle()
   }
   func advance(to target: Double) {

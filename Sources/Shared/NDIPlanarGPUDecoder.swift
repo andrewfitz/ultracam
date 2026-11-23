@@ -19,15 +19,18 @@ final class NDIPlanarGPUDecoder {
   func encode(planes: [MTLTexture], destination: MTLTexture, layout: NDIPlanarLayout,
     location: PlanarGPUChromaLocation, range: Colorimetry.Range,
     command: MTL4CommandBuffer, residency: MTLResidencySet) throws -> Resources {
-    guard planes.count == 3, destination.pixelFormat == .rgba32Float else { throw PlanarGPUError.textureMismatch }
+    guard planes.count == 3, command.device === device, residency.device === device,
+      destination.device === device, destination.textureType == .type2D,
+      destination.usage.isEmpty || destination.usage.contains(.shaderWrite),
+      destination.pixelFormat == .rgba32Float else { throw PlanarGPUError.textureMismatch }
     let descriptors = try layout.planes(width: destination.width, height: destination.height)
     for index in descriptors.indices {
       let d = descriptors[index]
       let expected: MTLPixelFormat = d.componentBytes == 1 ? .r8Unorm : (d.components == 2 ? .rg16Unorm : .r16Unorm)
       guard planes[index].width == d.width, planes[index].height == d.height, planes[index].pixelFormat == expected,
-        planes[index].device === device else { throw PlanarGPUError.textureMismatch }
+        planes[index].device === device, planes[index].textureType == .type2D,
+        planes[index].usage.isEmpty || planes[index].usage.contains(.shaderRead) else { throw PlanarGPUError.textureMismatch }
     }
-    guard destination.device === device else { throw PlanarGPUError.textureMismatch }
     let sixteen = layout == .pa16, full = range == .full
     let scale: Float = sixteen ? 256 : 1, maximum: Float = sixteen ? 65535 : 255
     let values = [SIMD4<Float>(sixteen ? 1 : 2, location.x, sixteen ? 0 : location.y, sixteen ? 1 : 0),
@@ -36,11 +39,11 @@ final class NDIPlanarGPUDecoder {
     guard let parameters = device.makeBuffer(bytes: values, length: values.count * 16) else { throw PlanarGPUError.invalidLayout }
     let td = MTL4ArgumentTableDescriptor(); td.maxBufferBindCount = 1; td.maxTextureBindCount = 4
     let arguments = try device.makeArgumentTable(descriptor: td)
+    guard let encoder = command.makeComputeCommandEncoder() else { throw PlanarGPUError.invalidLayout }
     arguments.setAddress(parameters.gpuAddress, index: 0); residency.addAllocation(parameters)
     for (index, texture) in (planes + [destination]).enumerated() {
       arguments.setTexture(texture.gpuResourceID, index: index); residency.addAllocation(texture)
     }
-    guard let encoder = command.makeComputeCommandEncoder() else { throw PlanarGPUError.invalidLayout }
     encoder.setComputePipelineState(pipeline); encoder.setArgumentTable(arguments)
     encoder.dispatchThreads(threadsPerGrid: MTLSize(width: destination.width, height: destination.height, depth: 1),
       threadsPerThreadgroup: MTLSize(width: 16, height: 8, depth: 1))

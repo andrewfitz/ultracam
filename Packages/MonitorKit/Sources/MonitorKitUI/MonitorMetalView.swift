@@ -33,8 +33,8 @@ import QuartzCore
 ///   which another view may show on another screen) as a uniform, so the tick
 ///   never waits for the main thread.
 /// - Memory: replaced frames are released as soon as the GPU finished with them:
-///   a convenience view watches the `status` of its last committed command
-///   buffer, a host-driven one takes what the host reports through
+///   a convenience view checks its outstanding command buffers. A host-driven
+///   view takes what the host reports through
 ///   `MonitorDrawableContext.completion` (or `completionReporter`). While the
 ///   view is paused or hidden it keeps no frame and no focus mask at all once
 ///   that work completed (a convenience view commits one empty marker buffer
@@ -184,9 +184,10 @@ public final class MonitorMetalView: MonitorPlatformView {
 
   /// Draws exactly what a display tick draws, into `texture` instead of a
   /// drawable: the drawable-free path for tests, snapshots and thumbnails. The
-  /// layer is re-tagged as a tick would. In convenience mode it encodes into
-  /// `commandBuffer` (the caller commits), or into one of its own that it
-  /// commits; in host mode it calls the host's closure with no drawable.
+  /// layer is re-tagged as a tick would. In convenience mode the caller commits
+  /// a supplied command buffer and the view observes its completion. Without a
+  /// supplied buffer the view commits its own. In host mode it calls the host's
+  /// closure with no drawable.
   public func drawOffscreen(into texture: MTLTexture, commandBuffer: MTLCommandBuffer? = nil) {
     updateDrawableSize()
     refreshHeadroom()
@@ -432,9 +433,11 @@ public final class MonitorMetalView: MonitorPlatformView {
     if changed { onSurfaceStateChange?(surface) }
   }
 
-  private func zoom(by factor: Double, at point: CGPoint) {
-    guard configuration.gesturesEnabled, let (surface, _, p) = surface(at: point) else { return }
+  @discardableResult
+  private func zoom(by factor: Double, at point: CGPoint) -> Bool {
+    guard configuration.gesturesEnabled, let (surface, _, p) = surface(at: point) else { return false }
     edit(surface) { m, layout in MonitorMagnifier.zoom(m, by: factor, about: p, layout: layout) }
+    return true
   }
 
   private func beginDrag(at point: CGPoint) {
@@ -462,6 +465,7 @@ public final class MonitorMetalView: MonitorPlatformView {
   /// True when the point was in a navigator inset (the view recentred there).
   private func navigatorClick(at point: CGPoint) -> Bool {
     guard configuration.gesturesEnabled, let (surface, layout, p) = surface(at: point),
+      !scene.clean, !surface.state.clean,
       MonitorMagnifier.recenter(Magnification(), navigatorPoint: p, layout: layout) != nil
     else { return false }
     edit(surface) { m, layout in MonitorMagnifier.recenter(m, navigatorPoint: p, layout: layout) }
@@ -531,7 +535,7 @@ public final class MonitorMetalView: MonitorPlatformView {
     private func location(_ event: NSEvent) -> CGPoint { convert(event.locationInWindow, from: nil) }
 
     public override func magnify(with event: NSEvent) {
-      zoom(by: 1 + Double(event.magnification), at: location(event))
+      if !zoom(by: 1 + Double(event.magnification), at: location(event)) { super.magnify(with: event) }
     }
 
     public override func scrollWheel(with event: NSEvent) {
@@ -539,7 +543,7 @@ public final class MonitorMetalView: MonitorPlatformView {
       guard dy != 0 else { return super.scrollWheel(with: event) }
       // A wheel notch is 10%; a trackpad's continuous deltas are in points.
       let factor = event.hasPreciseScrollingDeltas ? exp(dy * 0.01) : pow(1.1, dy)
-      zoom(by: factor, at: location(event))
+      if !zoom(by: factor, at: location(event)) { super.scrollWheel(with: event) }
     }
 
     public override func mouseDown(with event: NSEvent) {

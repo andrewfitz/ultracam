@@ -120,6 +120,9 @@ import XCTest
     session.cameras[1].signal = .noSignal
     session.cameras[1].recording.status = .paused
     XCTAssertEqual(problems(session).map(\.id), ["signal.camera-2"])
+    XCTAssertNil(problems(session).first?.alert, "A paused take is not recording through the outage")
+    session.cameras[1].signalLostFor = 6
+    XCTAssertEqual(problems(session).first?.detail, "Take ends in 4 s", "A new capture epoch also closes a paused take")
   }
 
   func testStripRowShowsWhatToDoAndCountsWhenThereIsMore() throws {
@@ -128,6 +131,10 @@ import XCTest
     XCTAssertEqual(strip.text, "Check Camera 2's HDMI", "The picture says what happened, the strip what to do")
     XCTAssertEqual(strip.level, .damage)
     XCTAssertEqual(strip.count, 1)
+    one.inputConnector = "SDI"
+    strip = try XCTUnwrap(UIPresentationBuilder.stripProblem(one, in: separate([one])))
+    XCTAssertEqual(strip.text, "Check Camera 2's SDI")
+    XCTAssertEqual(strip.short, "Check SDI")
     one.lutError = "gone"
     strip = try XCTUnwrap(UIPresentationBuilder.stripProblem(one, in: separate([one])))
     XCTAssertEqual(strip.count, 2)

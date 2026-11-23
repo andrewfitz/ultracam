@@ -4,6 +4,13 @@ import Foundation
 import XCTest
 
 @objcMembers final class EmbeddedAudioRecordingChecks: XCTestCase {
+  func testSilencePacketRejectsByteCountOverflow() {
+    XCTAssertThrowsError(try EmbeddedAudioRecording.makeSilenceSampleBuffer(
+      sampleFrameCount: Int.max, presentationTime: CMTime(value: 0, timescale: 48_000))) {
+      XCTAssertEqual($0 as? EmbeddedAudioError, .sizeOverflow)
+    }
+  }
+
   func testExactSigned32ToPacked24Conversion() throws {
     let values: [Int32] = [
       0,

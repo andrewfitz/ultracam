@@ -255,6 +255,8 @@ NS_SWIFT_NAME(DeckLinkBackend)
 // after every arrival or removal, and once soon after registering.
 + (id)addDeviceListObserver:(void (NS_SWIFT_UI_ACTOR ^)(NSArray<UltracamDevice *> *devices))handler
   NS_SWIFT_NAME(addDeviceListObserver(_:));
+// Whether an empty device snapshot came from an installed notification source.
++ (BOOL)deviceListDiscoveryActive;
 + (void)removeDeviceListObserver:(id)token;
 + (nullable UltracamDeviceDiagnostics *)diagnosticsForDeviceID:(NSString *)deviceID
   NS_SWIFT_NAME(diagnostics(deviceID:));

@@ -14,7 +14,7 @@ import SwiftUI
   }
 
   private static func verify(_ verifier: Verifier, render: Render) throws {
-    let suite = "org.ultracam.ui-verify.mac-camera.\(UUID().uuidString)"
+    let suite = verifier.makeDefaultsDomain()
     guard let defaults = UserDefaults(suiteName: suite) else { throw PluginError.failed("Cannot create fixture defaults") }
     defer { defaults.removePersistentDomain(forName: suite) }
     let webID = "maccamera:web", spareID = "maccamera:spare", deckID = "decklink:recorder"

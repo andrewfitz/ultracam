@@ -225,9 +225,9 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
 #endif
 
   var currentStatistics: Statistics {
-    statsLock.lock()
-    defer { statsLock.unlock() }
-    return statistics
+    var result = statsLock.withLock { statistics }
+    result.cachedSurfaces = allocationBudget.snapshot().allocations
+    return result
   }
 
   static func supportsSource(_ format: OSType) -> Bool {
@@ -591,10 +591,6 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
       textures.removeValue(forKey: key)
       removed = true
     }
-    let count = textures.count
-    statsLock.lock()
-    statistics.cachedSurfaces = count
-    statsLock.unlock()
     return removed
   }
 
@@ -663,7 +659,8 @@ final class ProgramNormalizer: ProgramFrameNormalizing, @unchecked Sendable {
 
   private static func sourceCode(_ format: OSType) -> Code? {
     switch format {
-    case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange: return .yuv42010
+    case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+         kCVPixelFormatType_420YpCbCr10BiPlanarFullRange: return .yuv42010
     case kCVPixelFormatType_422YpCbCr8BiPlanarVideoRange: return .yuv4228
     case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
          kCVPixelFormatType_420YpCbCr8BiPlanarFullRange: return .yuv420

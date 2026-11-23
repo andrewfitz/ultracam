@@ -73,13 +73,13 @@ final class Audit3EngineTests: XCTestCase {
     focus.enabled = true
     focus.stage = .source
     try gpu.run { try feed.analyze(still, focus: focus, into: $0) }
-    XCTAssertTrue(feed.hasFocusMask(for: still, stage: .source, monitorLUTEnabled: true))
+    XCTAssertTrue(feed.hasFocusMask(for: still, focus: focus, monitorLUTEnabled: true))
     // A host counter's values, however far it has run in a session, are not the
     // frozen frame's: the next live frame is analysed, not taken as held.
     var next = live
     for counter: UInt64 in [0, 1, 2, 1_000, 1 << 40, (1 << 63) - 1] {
       next.id = counter
-      XCTAssertFalse(feed.hasFocusMask(for: next, stage: .source, monitorLUTEnabled: true), "id \(counter)")
+      XCTAssertFalse(feed.hasFocusMask(for: next, focus: focus, monitorLUTEnabled: true), "id \(counter)")
     }
   }
 
@@ -94,10 +94,11 @@ final class Audit3EngineTests: XCTestCase {
     focus.enabled = true
     focus.stage = .monitor
     try gpu.run { try feed.analyze(frame, focus: focus, into: $0) }
-    XCTAssertFalse(feed.hasFocusMask(for: frame, stage: .monitor, monitorLUTEnabled: false))
+    XCTAssertFalse(feed.hasFocusMask(for: frame, focus: focus, monitorLUTEnabled: false))
     focus.stage = .output
     try gpu.run { try feed.analyze(frame, focus: focus, into: $0) }
-    XCTAssertTrue(feed.hasFocusMask(for: frame, stage: .monitor, monitorLUTEnabled: false))
+    focus.stage = .monitor
+    XCTAssertTrue(feed.hasFocusMask(for: frame, focus: focus, monitorLUTEnabled: false))
   }
 
   /// A synchronous caller used to wait without limit for a background build of

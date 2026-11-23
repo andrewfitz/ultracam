@@ -5,6 +5,7 @@ if [[ $# -ne 0 ]]; then
   exit 2
 fi
 task_root="$(cd "$(dirname "$0")/.." && pwd)"
+app_source_list="$(rg --files "$task_root/Sources/App" -g '*.swift' | sort)"
 external_root="$(python3 "$task_root/scripts/work_paths.py" --path work_root)"
 run_id="$(date -u +%Y%m%dT%H%M%S)-$$"
 test_root="$external_root/monitor-app-integration/$run_id"
@@ -33,7 +34,7 @@ vendor_compile_native "$test_root/compile.log"
 app_sources=()
 while IFS= read -r source_file; do
   if [[ "$source_file" != */UltracamApp.swift ]]; then app_sources+=("$source_file"); fi
-done < <(rg --files "$task_root/Sources/App" -g '*.swift' | sort)
+done <<< "$app_source_list"
 frameworks="$(xcode-select -p)/Platforms/MacOSX.platform/Developer/Library/Frameworks"
 libraries="$(xcode-select -p)/Platforms/MacOSX.platform/Developer/usr/lib"
 xcrun swiftc -O -whole-module-optimization -num-threads 4 \

@@ -600,7 +600,6 @@ public final class MonitorEngine: @unchecked Sendable {
     case .asynchronous:
       if let cached = renderPipelines.withLock({ $0[key] }) { return cached }
       let buildKey = BuildKey.render(key)
-      if failedPipelines.withLock({ $0.contains(buildKey) }) { return nil }
       guard claimAsynchronous(buildKey) else { return nil }
       if let cached = renderPipelines.withLock({ $0[key] }) {
         finishBuild(buildKey)
@@ -681,7 +680,10 @@ public final class MonitorEngine: @unchecked Sendable {
   private func claimAsynchronous(_ key: BuildKey) -> Bool {
     buildFinished.lock()
     defer { buildFinished.unlock() }
-    guard pendingPipelines.withLock({ $0.insert(key).inserted }) else { return false }
+    // A completion records its failure before clearing its claim under this
+    // condition. Check both here so a stale lookup cannot restart a failed build.
+    guard !failedPipelines.withLock({ $0.contains(key) }),
+      pendingPipelines.withLock({ $0.insert(key).inserted }) else { return false }
     asynchronousOwners.withLock { _ = $0.insert(key) }
     return true
   }
@@ -744,7 +746,6 @@ public final class MonitorEngine: @unchecked Sendable {
     case .asynchronous:
       if let cached = computePipelines.withLock({ $0[key] }) { return cached }
       let pendingKey = BuildKey.compute(key)
-      if failedPipelines.withLock({ $0.contains(pendingKey) }) { return nil }
       guard claimAsynchronous(pendingKey) else { return nil }
       if let cached = computePipelines.withLock({ $0[key] }) {
         finishBuild(pendingKey)
@@ -910,6 +911,22 @@ extension PixelLayout {
 }
 
 extension MTLPixelFormat {
+  /// Color formats requiring an integer shader texture declaration.
+  var isIntegerColor: Bool {
+    switch self {
+    case .r8Uint, .r8Sint, .r16Uint, .r16Sint, .r32Uint, .r32Sint,
+      .rg8Uint, .rg8Sint, .rg16Uint, .rg16Sint, .rg32Uint, .rg32Sint,
+      .rgba8Uint, .rgba8Sint, .rgba16Uint, .rgba16Sint, .rgba32Uint, .rgba32Sint, .rgb10a2Uint:
+      return true
+    default:
+      // RGB8, RGB16 and RGB32 Uint/Sint, introduced in the Metal 27 SDK.
+      switch rawValue {
+      case 47, 48, 97, 98, 120, 121: return true
+      default: return false
+      }
+    }
+  }
+
   /// Formats whose stores encode with the sRGB curve.
   var isSRGB: Bool {
     switch self {

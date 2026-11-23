@@ -7,7 +7,7 @@ import XCTest
     var released = false
     var completion: (() -> Void)?
     var lease: NoCopyIngestLease? = try NoCopyIngestLease(pointer: raw, length: 32,
-      allocation: NoCopyIngestAllocation(baseAddress: raw, length: 8192, generation: 1),
+      allocation: NoCopyIngestAllocation(baseAddress: raw, length: 8192, generation: 1), vmPageSize: 4096,
       inspectVM: { base, length in NoCopyVMRange(baseAddress: base, length: length, generation: 1) },
       frameRelease: { released = true })
     lease!.submitGPU { completion = $0 }
@@ -35,9 +35,9 @@ import XCTest
     var allocation: NoCopyIngestAllocation? = NoCopyIngestAllocation(baseAddress: raw, length: 4096,
       generation: 1, release: { releases += 1 })
     var first: NoCopyIngestLease? = try NoCopyIngestLease(pointer: raw, length: 4,
-      allocation: allocation, inspectVM: { base, length in NoCopyVMRange(baseAddress: base, length: length, generation: 1) })
+      allocation: allocation, vmPageSize: 4096, inspectVM: { base, length in NoCopyVMRange(baseAddress: base, length: length, generation: 1) })
     var second: NoCopyIngestLease? = try NoCopyIngestLease(pointer: raw, length: 4,
-      allocation: allocation, inspectVM: { base, length in NoCopyVMRange(baseAddress: base, length: length, generation: 1) })
+      allocation: allocation, vmPageSize: 4096, inspectVM: { base, length in NoCopyVMRange(baseAddress: base, length: length, generation: 1) })
     allocation = nil
     first?.completeGPU(); first = nil
     XCTAssertEqual(releases, 0)

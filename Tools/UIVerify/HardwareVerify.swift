@@ -10,15 +10,15 @@ import SwiftUI
   static let hint = "If it is plugged in, check its cable and hub."
 
   static func run(verifier: Verifier, render: (String, AnyView, CGSize) -> Void) {
-    let suite = "org.ultracam.ui-verify.hardware.\(UUID().uuidString)"
+    let suite = verifier.makeDefaultsDomain()
     guard let defaults = UserDefaults(suiteName: suite) else { verifier.check("hardware: defaults suite", false); return }
     defer { defaults.removePersistentDomain(forName: suite) }
     guard let rig = try? Rig(defaults: defaults) else { verifier.check("hardware: fixture builds", false); return }
     let model = rig.model
-    func settle(_ label: String, until condition: () -> Bool) {
+    func settle(_ label: String, viewDependent: Bool = false, until condition: () -> Bool) {
       let deadline = Date().addingTimeInterval(3)
       while !condition() && Date() < deadline { MainLoop.run(seconds: 0.01) }
-      verifier.check(label, condition())
+      verifier.check(label, condition(), viewDependent: viewDependent)
     }
     settle("hardware: both bodies connect and read") {
       model.feedDescriptors.allSatisfy { model.cameraControls.state(for: $0.id.rawValue).connected &&
@@ -75,6 +75,29 @@ import SwiftUI
       "missing \(absentMissing.joined(separator: ", "))", viewDependent: true)
     render("settings-hardware-absent", AnyView(pane()), CGSize(width: width, height: UISettingsLayout.defaultSize.height))
     model.updateCamera(camera2) { $0.selectedDevice = "fake:right" }
+
+    // Recheck the paired body's address, then connect it without removing its assignment.
+    let store = model.cameraControls
+    Task { await store.disconnect(camera2.rawValue) }
+    settle("hardware: body disconnects", until: { !store.state(for: camera2.rawValue).connected })
+    let pairing = HostedView(pane([Rig.bodyB.id]), size: CGSize(width: width, height: 1800), dark: false)
+    func press(_ title: String) -> Bool {
+      let nodes = Accessibility.nodes(in: pairing.host)
+      guard let node = nodes.first(where: { $0.name == title && $0.enabled && ($0.role == "AXButton" || $0.role == "AXDisclosureTriangle") })
+      else { return false }
+      let pressed = Accessibility.press(node)
+      pairing.settle()
+      return pressed
+    }
+    let checked = press("Change Camera Address…") && press("Check Camera")
+    settle("hardware: a checked address offers Connect for the paired body", viewDependent: true) {
+      checked && Accessibility.nodes(in: pairing.host).contains { $0.name == "Connect to \(Rig.bodyB.name)" }
+    }
+    let reconnected = press("Connect to \(Rig.bodyB.name)")
+    settle("hardware: Connect after Check Camera reconnects the same assignment", viewDependent: true) {
+      reconnected && store.state(for: camera2.rawValue).connected && store.assignment(for: camera2.rawValue)?.camera.id == Rig.bodyB.id
+    }
+    pairing.close()
 
     // The idle reader runs only while the pane is on screen. Offscreen windows are never
     // unoccluded, so this one counts as seen while it's presented.

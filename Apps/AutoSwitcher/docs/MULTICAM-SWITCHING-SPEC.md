@@ -1,8 +1,10 @@
-# Multicam switching across UltraCam, Auto Switcher, Transcriberrr, and MPCut
+# Multicam production suite specification
 
-**Design draft 0.1 · November 21, 2026 · For product and engineering review**
+**Design draft 0.2 · November 23, 2026 · For product and engineering review**
 
 This document specifies the intended product. The existing Auto Switcher prototype is a source of reusable code and test fixtures. Its transports, process boundaries, and file formats have not been adopted as the final design. In this draft, **must** identifies a requirement and **proposed** identifies a design choice awaiting review. Example messages, filenames, and commands describe the proposed interfaces.
+
+**Naming is deferred.** Cam (UltraCam), Switch (Auto Switcher), Transcribe (Transcriberrr) and Cut (MPCut) are working role labels. The current project names below identify the integration points. Choose the suite name, shared visual identity and final app icons after the core workflows are built. Protocol roles, schema identifiers, session files and capability negotiation must work across a display-name change.
 
 ## 1. Product outcome
 
@@ -25,7 +27,7 @@ The first integration covers the four first-party apps on one Mac plus portable 
 | Transcriberrr | GUI, CLI, batch transcription, native realtime tracks, frame timing, drafts, finals, retractions and reconnect support | Allow an authorized second process to subscribe to the producer’s recognition session. Connect live and batch outputs to the production time map. |
 | MPCut | Native multicam projects, rational offsets, picture switches, fixed/follow/muted audio, aligned JPEG export and CLI | Add switch-session import/export, media identity matching, offline orchestration, alternate revisions and explicit round-trip conflict handling. |
 
-MPCut already supports comparing camera JPEGs at the same group time. Transcriberrr already accepts mono PCM16 at 24 kHz and gives native tracks a common frame clock. Reuse these paths and preserve each app’s native project format. See the [MPCut multicam documentation](../../misc/mpcut/README.md), [MPCut project model](../../misc/mpcut/Sources/MPCutCore/MulticamProject.swift), and [Transcriberrr realtime documentation](../../misc/transcriberrr/README.md) in the development checkout.
+MPCut already supports comparing camera JPEGs at the same group time. Transcriberrr already accepts mono PCM16 at 24 kHz and gives native tracks a common frame clock. Reuse these paths and preserve each app’s native project format. Development checkout references, relative to the directory containing the UltraCam and Auto Switcher repositories, are `misc/mpcut/README.md`, `misc/mpcut/Sources/MPCutCore/MulticamProject.swift` and `misc/transcriberrr/README.md`.
 
 ## 3. App responsibilities and service lifetime
 
@@ -36,11 +38,15 @@ MPCut already supports comparing camera JPEGs at the same group time. Transcribe
 | Transcriberrr | Timed speech, track and speaker attribution when available, revisions, model readiness | Live audio tracks or file jobs | Realtime ASR server and file transcription |
 | MPCut | Aligned source coverage, requested stills, audio selection, editorial revisions and exports | Source recordings, transcripts, switching sessions | Multicam editing, analysis, still extraction and export |
 
-**Proposed service model.** One per-user Auto Switcher service accepts multiple named sessions. Its menu app and CLI control the same service. A live session has one authoritative Program host. An offline job has an independent session or revision and cannot claim a live host’s output. Transcriberrr likewise exposes its service to its GUI, CLI, audio publishers, and transcript subscribers.
+**Proposed service model.** One per-user Auto Switcher service accepts multiple named sessions. Its GUI, the shared menu and its CLI control the same service. A live session has one authoritative Program host. An offline job has an independent session or revision and cannot claim a live host’s output. Transcriberrr likewise exposes its service to its GUI, CLI, audio publishers, and transcript subscribers.
 
 Starting Auto must discover or launch the switcher exactly once, including simultaneous GUI and CLI starts. Discovery returns a service instance ID, endpoint, supported versions and readiness. A local rendezvous record and singleton lock are proposed; the sandboxed UltraCam build must prove discovery, launch and per-user authorization on a clean Mac before choosing the final macOS registration mechanism. A stale record is identified by a failed instance handshake. Opening or closing a control window must not interrupt active sessions. Releasing one client must not terminate another client’s ASR job. Headless session ownership and explicit stop commands must work with no window open.
 
 UltraCam selects Auto, Hold, a profile, role bindings, audio source, processing mode, and profile-declared operator settings. Auto Switcher validates settings, returns the effective configuration and revision, and owns their behavior. The advanced profile editor and provider configuration belong in Auto Switcher. An operator can open the matching switcher or transcription session directly from UltraCam.
+
+### Repository and release layout
+
+**Proposed layout for review.** Keep four product repositories with independent releases. Put the versioned switching contracts, example profiles, exchange fixtures and conformance runner in Switch. Each app pins a published contract release and advertises its supported protocol versions at runtime. This lets a separately installed Cut import a session written by an older Cam/Switch combination. Ship the small shared menu helper as a separately versioned component from the Switch repository. Each GUI installer must be able to supply or reuse it, including on a Mac with only Cut installed. Integration builds test the four released apps together. Repository consolidation and product renaming are separate decisions from the service extraction.
 
 ## 4. Processing modes and evidence deadlines
 
@@ -124,6 +130,12 @@ The matching host outcome:
 
 **Queues and deadlines.** Keep one replaceable unsent analysis frame per route in live mode. Bound decoded dimensions, payload bytes, concurrent inference, transcript replay and observer queues. Carry JPEG metadata and payload under the same sample ID; discard incomplete samples. Prioritize route and clock messages over media delivery. Missing JPEGs affect visual evidence age independently of camera health. Offline jobs use bounded batches and backpressure so requested frames can be completed instead of silently dropped.
 
+### Observers and generic outputs
+
+A session owner can enable event broadcasting to authorized subscribers. A subscriber receives the initial snapshot, then sequenced updates for the session and topics it selected. Observing a session grants no routing authority. Route IDs are opaque to Switch. The host binds an ID to a camera, scene or other action. Native Cam uses the acknowledged host path.
+
+For a host controlled through global shortcuts, the operator can bind each route ID to a macOS keycode and modifiers and explicitly arm that output. The adapter posts a shortcut once per committed command ID, reports permission or dispatch failure, and never posts shortcuts during history replay or an offline edit. Journal a successful post as `shortcut.dispatched`. Without a host acknowledgement the actual route and frame remain unconfirmed. Timestamp export in GUI and CLI must distinguish intended time, dispatch time and confirmed Program time, including manual cuts. Proposed CSV columns are session ID, decision ID, route, outcome, intended ticks, dispatch time with clock domain, and applied ticks. Missing times are empty. The first release focuses on the four native apps. OBS and device-specific adapters are later integrations.
+
 ## 7. Clocks, media sampling and transcript semantics
 
 Use a production timeline at **240,000 ticks/second**, with integer ticks in interchange. Preserve native source PTS and timescale alongside production time. Each recording segment has an explicit source-to-production mapping, bounded validity range and generation. Use rational arithmetic until a frame must be selected. For ordinary unit-rate material, group time equals source time plus the declared offset. Variable frame rate, discontinuities, restarted cameras and drift require actual indexed frame PTS and, where needed, additional mapping segments. Never derive all frame boundaries from nominal fps.
@@ -149,7 +161,7 @@ Profiles are versioned JSON documents. Publish JSON Schemas and valid/invalid ex
 
 Ship model-free Timer and Motion profiles, a talking-head profile, a camera-facing profile, and a multi-angle workbench example. Treat face direction as an estimate with confidence; hold through uncertainty, multiple plausible faces and brief head turns. Providers may publish additional typed signals such as pitch, energy, speaker activity or model-estimated tone. A signal definition must identify units, time range and provenance. A profile must declare how to behave when that signal is absent.
 
-A local image model should work without sending footage off the Mac. An optional cloud provider receives only the explicitly authorized inputs. Provider deadlines differ by mode. Immediate switching drops stale results; delayed switching may use them until the relevant playout deadline; offline processing can retry or checkpoint them. Store outputs used for a decision so replay can reproduce the recorded choice even if a model changes.
+Switch must ship a usable local image-capable model with its release and expose its readiness from the GUI and CLI. Model-free profiles must start with inference disabled. The built-in provider and optional local or cloud providers use the same versioned observation or decision interface, reporting supported inputs, deadlines, model identity and structured outputs. Switch validates candidate decisions against route bindings, hold, timing and health policy before requesting a cut. An optional cloud provider receives only the explicitly authorized inputs. Provider deadlines differ by mode. Immediate switching drops stale results; delayed switching may use them until the relevant playout deadline; offline processing can retry or checkpoint them. Store outputs used for a decision so replay can reproduce the recorded choice even if a model changes.
 
 ## 9. Portable switching session and MPCut round trip
 
@@ -189,9 +201,24 @@ The GUI and CLI of each app must invoke the same domain operations and validatio
 | App | GUI workflow | Proposed CLI operation |
 |---|---|---|
 | UltraCam | Select feeds, profile, timing mode, audio and recording destination; start/hold/stop live session | Start capture with a saved production config; enumerate devices, inspect status, hold/resume, stop and finalize |
-| Auto Switcher | Menu-bar status, sessions, profile editor, bindings, evidence freshness, decision history and export | Serve, validate a profile, inspect/watch a session, run/resume offline analysis and export a revision |
+| Auto Switcher | Sessions, profile editor, bindings, evidence freshness, decision history and export | Serve, validate a profile, inspect/watch a session, run/resume offline analysis and export a revision |
 | Transcriberrr | Select model, run service, show publishing tracks and subscribing consumers; transcribe files | Existing serve/batch operations plus scoped subscription management and session status |
 | MPCut | Open an as-aired session, relink, generate alternate edit, compare and export changes | Inspect/import session, export aligned samples/audio, orchestrate analysis, import or export a revision and render through the normal export engine |
+
+### One macOS menu-bar item
+
+In a graphical login session, the first suite GUI that requests menu integration starts or attaches to a per-user menu helper. Concurrent launches must converge on one status item. The helper presents one monochrome macOS template icon for the whole suite, with four stable submenus. A headless command starts only the services its workflow needs. The helper can quit, restart or be upgraded while capture, recognition and offline jobs continue. On reconnect it rebuilds its view from service snapshots.
+
+| Submenu | At a glance | Actions |
+|---|---|---|
+| Cam | Capture state, actual Program route, recording and delay | Open Cam, open the active production, take or release Hold |
+| Switch | Service readiness, active profile and routing host | Open Switch, start or connect to the service, inspect decisions, edit the profile |
+| Transcribe | Audio publisher, incoming level, model readiness and transcript lag | Open Transcribe, inspect the active track, start a standalone transcription |
+| Cut | Open project or headless job, current stage, progress and revision | Open Cut, import the live session, inspect or resume an offline job |
+
+Show installation, GUI and service state separately. A closed window can coexist with a running service. Show missing apps as “Not installed” and idle installed apps as “Ready to open.” Each submenu exposes actions supported by that installation and authorized for that session. Quitting the menu helper and stopping a production are distinct actions.
+
+The active production view lists **Cam → Switch** (registration and JPEGs), **Cam → Transcribe** (audio), **Transcribe → Switch** (transcript), and **Switch → Cam** (cut requests and host acknowledgements). For an offline job show Cut as the evidence producer, the selected transcription job and the returned revision. Each link reports its endpoints, session ID, negotiated capability, last input or acknowledgement, and reason when waiting, degraded or disconnected. Mark optional links unused when the profile did not request them. Each app exposes its own snapshot to its headless CLI. The menu joins snapshots by session ID so an unrelated healthy ASR job cannot make a broken production appear connected.
 
 **Cross-app status.** Expose the same snapshot to GUI and CLI. Show service identity, connection state, negotiated capability, last valid media time, input age, backlog and consequence for directing. UltraCam should distinguish “audio arriving, waiting for speech” from “no audio received.” Auto Switcher should distinguish “model warming” from “source unavailable.” Transcriberrr should identify the producing audio track and subscribers. MPCut should show completed stages, stale inputs, relink requirements and the revision being reviewed.
 
@@ -221,7 +248,8 @@ Default to local processing and loopback service access. Authenticate local peer
 | 3. Native live evidence | Two cameras deliver JPEGs without reopening devices. One audio stream is recognized once while the switcher receives revisions directly. Verify clock resets, a late final, health loss and manual override. Demonstrate each app’s independent headless workflow. |
 | 4. Offline generation | Run an aligned multicam project via GUI and CLI. Interrupt after still extraction, resume, import the same result and relink moved files. A changed offset invalidates the appropriate cached evidence. Human revisions survive a second analysis. |
 | 5. Delayed Program | At representative camera counts, formats and rates, demonstrate ten seconds of aligned picture and audio, a context-informed retroactive choice before commitment, and graceful underrun. Test both audience-delayed Program and the immediate-plus-alternate workflow if approved. |
-| 6. Release qualification | Repeat on a clean Mac with signed apps, sandbox boundaries, denied permissions, model warm-up, process crashes and offline operation. Validate compatibility, migration, package recovery and bounded resource use. |
+| 6. Suite menu and standalone operation | Launch all four GUIs concurrently and verify one template icon with four submenus. Close and restart the helper during a live recording and an offline job. Disable transcription and verify that only dependent links degrade. On a clean login run the four CLI workflows without starting a GUI or creating a menu icon. Test each product installed alone. |
+| 7. Release qualification | Repeat on a clean Mac with signed apps, sandbox boundaries, denied permissions, model warm-up, process crashes and offline operation. Validate compatibility, migration, package recovery and bounded resource use. |
 
 Publish conformance fixtures for protocol negotiation, idempotent retries, wrong generation, expired cut, manual/application race, transcript retraction, mixed frame rates, delayed-camera gaps and edit-package round trips. Measure **capture → sample**, **sample → evidence**, **speech → draft/final**, **evidence → decision**, and **decision → actual Program frame** independently. Report p50/p95/p99, drops, CPU/GPU load, peak memory, buffer storage and A/V drift under sustained load. Set numeric live release budgets using those measurements; a fast inference benchmark alone does not qualify the complete system.
 
@@ -233,5 +261,7 @@ Publish conformance fixtures for protocol negotiation, idempotent retries, wrong
 4. **Interchange boundary.** Approve a portable versioned session package, immutable as-aired history, and child editorial revisions alongside MPCut’s native project. Decide which assembly edits beyond cuts and soundtrack choices need first-release round-trip fidelity.
 5. **Evidence defaults.** Decide whether raw JPEG samples, transcript text or only decisions and evidence references are saved by default, and whether cloud processing is ever allowed without per-production selection.
 6. **Qualification targets.** Select the first supported hardware/camera matrix, acceptable immediate latency, acceptable delayed A/V drift, and default fallback when a profile loses required evidence.
+
+7. **Packaging.** Review the four-repository layout, shared helper distribution and upgrade ownership against standalone installs. Validate mixed-version operation before fixing the installer strategy.
 
 Approval of this draft establishes the architecture. The next design deliverable would be machine-readable schemas, worked wire traces and a golden four-app round-trip fixture for review before production integration.

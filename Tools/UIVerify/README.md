@@ -1,12 +1,13 @@
 # UI verification
 
-Three layers check the new interface:
+The interface checks run at four levels.
 
 | Layer | Run | Covers |
 |---|---|---|
 | Unit | `bash scripts/test.sh` | `Tests/UIPresentationChecks.swift`: the audit rules in the pure presentation layer: tally, tile and strip states, record and cut controls, stop confirmations, status bar, menu bar icon, formatting, chips, wording (never consumer app names). |
 | Offscreen | `bash scripts/ui-verify.sh` | This tool, described below. |
-| In-app | `bash scripts/app-self-test.sh` | `Sources/App/UISelfTest.swift`, run inside the real app with `--ui-self-test <dir>`: the main menu (required menus, required shortcuts, no duplicates, dumped to `menus.tsv`); the main, Settings and Diagnostics windows; the inspector opened in the real window; the menu bar item; window renders in light and dark. Writes `report.json`. It never starts cameras. Windows appear briefly. `SKIP_BUILD=1` reuses the last Debug build. |
+| In-app | `bash scripts/app-self-test.sh` | `Sources/App/UISelfTest.swift`, run inside the real app with `--ui-self-test <dir>`: the main menu (required menus, required shortcuts, no duplicates, dumped to `menus.tsv`); the main, Settings and Diagnostics windows; the inspector opened in the real window; the menu bar item; window renders in light and dark. Writes `report.json`. The default run uses offline hardware. `LIVE=1` also checks starting and stopping the selected real camera. Windows appear briefly. `SKIP_BUILD=1` reuses the last Debug build. |
+| UI tour | `bash scripts/ui-tour.sh` | Drives the unsigned Debug app with Accessibility and captures its windows and menus, including all nine Settings panes. Each run uses its own preferences and offline hardware. `APPEARANCE=Dark` selects dark appearance. `LIVE=1` selects real capture hardware. |
 
 ## What `ui-verify` does
 
@@ -43,13 +44,14 @@ Artifacts go to `agent-work/build/ultracam/ui-verify/<run>/` under `ULTRACAM_WOR
 
 `STRICT=0` reports view-dependent failures as pending instead of failing.
 
+`RENDER_INSPECTOR=1` adds an untitled 1600×900 inspector render. The default run renders the inspector in titled windows at 1320×860 and 980×680.
+
 `UI_PERF_ONLY=1` runs only the live performance checks. The default cases cover two and four cameras with both live and fixed meters. `UI_PERF_CAMERAS` and `UI_PERF_METERS` select cases for a focused run. `UI_PERF_IDLE` sets the idle interval in seconds and `UI_PERF_PROFILE_INSPECTOR` adds inspector toggles before the measured interactions.
 
 `UI_MAC_CAMERA_ONLY=1` runs the scripted Mac Camera and DeckLink scenario. It checks the Hardware permission action and mixed inventory, the inspector's input and Hardware link, per-device settings, the live effects route and the finalized source take. The fixture sends frames to an in-process sink. Screenshots and the fixture take are saved in the run directory.
 
 ## Known limits
 
-- **Inspector:** `.inspector` inside a bare `NSHostingView` throws during AppKit layout, so the whole-window inspector render runs in the app self-test. `RENDER_INSPECTOR=1` attempts it here anyway.
 - **Vibrancy:** offscreen capture draws vibrant materials (the inspector, bars) as a flat color.
 
 ## Speed

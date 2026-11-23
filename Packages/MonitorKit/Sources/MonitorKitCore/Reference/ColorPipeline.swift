@@ -252,6 +252,8 @@ public struct MonitorColorPipeline: Equatable, Sendable {
   /// PQ mastering peak for `pqToSDR` and the PQ roll-off.
   public let pqSourcePeak: Double
   public let log: LogEncoding?
+  private let pictureRange: CodeRange
+  private let pictureBitDepth: Int
   /// The signal's primaries, which the HDR transforms convert from.
   public let sourcePrimaries: ColorPrimaries
   /// Linear picture primaries to target primaries.
@@ -264,10 +266,14 @@ public struct MonitorColorPipeline: Equatable, Sendable {
   /// into extended linear, or PQ into HLG).
   public let rollsOff: Bool
 
+  /// The CPU reference uses the signal's declared range and a 10-bit container by
+  /// default. A pass supplies the range and code depth of its active picture stage.
   public init(
     output o: MonitorOutputColor, signal: SignalDescription, transform settings: DisplayTransformSettings = .init(),
-    monitorStageHasLUT: Bool = false
+    monitorStageHasLUT: Bool = false, range: CodeRange? = nil, bitDepth: Int = 10
   ) {
+    pictureRange = range ?? signal.range
+    pictureBitDepth = bitDepth
     let output = o.normalized()
     referenceWhite = output.referenceWhite
     hlgOutputPeak = HDRToSDR.hlgReferencePeak
@@ -448,13 +454,14 @@ public struct MonitorColorPipeline: Equatable, Sendable {
   }
 
   /// The display transform alone: a monitor-stage value (range-expanded, in the
-  /// source's encoding) to the picture encoding.
-  public func transformed(_ v: ColorRGB, range: CodeRange = .legal, bitDepth: Int = 10) -> ColorRGB {
+  /// source's encoding) to the picture encoding. By default it uses the picture's
+  /// range and bit depth. Either can be overridden for a different container.
+  public func transformed(_ v: ColorRGB, range: CodeRange? = nil, bitDepth: Int? = nil) -> ColorRGB {
     switch transform {
     case .none: return v
     case .logToRec709:
       guard let log else { return v }
-      return DisplayAssist.rec709(v, log: log, range: range, bitDepth: bitDepth)
+      return DisplayAssist.rec709(v, log: log, range: range ?? pictureRange, bitDepth: bitDepth ?? pictureBitDepth)
     case .pqToSDR:
       return HDRToSDR.pq(v, primaries: sourcePrimaries, sourcePeak: pqSourcePeak, referenceWhite: referenceWhite)
     case .hlgToSDR: return HDRToSDR.hlg(v, primaries: sourcePrimaries)
@@ -480,7 +487,7 @@ public struct MonitorColorPipeline: Equatable, Sendable {
 
   /// Transform, then conversion: what the pass shows for a monitor-stage value
   /// with display adjustments and overlays off.
-  public func present(_ v: ColorRGB, range: CodeRange = .legal, bitDepth: Int = 10, headroom: Double = 1) -> ColorRGB {
+  public func present(_ v: ColorRGB, range: CodeRange? = nil, bitDepth: Int? = nil, headroom: Double = 1) -> ColorRGB {
     converted(transformed(v, range: range, bitDepth: bitDepth), headroom: headroom)
   }
 
@@ -502,13 +509,14 @@ public struct MonitorColorPipeline: Equatable, Sendable {
     }
   }
 
-  /// An overlay colour authored as Rec.709 SDR display R'G'B' at graphics white,
-  /// in target values: unchanged on an SDR native layer, else through BT.1886 to
-  /// linear light, Rec.709 to the target primaries, and the target's encoding (white
-  /// is 58% PQ, 75% HLG, 1.0 extended linear at 203 cd/m²).
+  /// An overlay colour authored as Rec.709 SDR display R'G'B' at graphics white.
+  /// Channels are clamped to 0…1 before encoding for the target. A native SDR
+  /// layer uses those values directly (white is 58% PQ, 75% HLG, or 1.0 extended
+  /// linear at 203 cd/m² on converted targets).
   public func overlayColor(_ c: ColorRGB) -> ColorRGB {
-    guard let overlay else { return c }
-    let unit = ColorRGB(r: min(max(c.r, 0), 1), g: min(max(c.g, 0), 1), b: min(max(c.b, 0), 1))
+    func channel(_ value: Double) -> Double { min(1, max(0, value)) }
+    let unit = ColorRGB(r: channel(c.r), g: channel(c.g), b: channel(c.b))
+    guard let overlay else { return unit }
     let l = overlayMatrix.apply(linear(unit, transfer: .bt1886, primaries: .rec709))
     return encode(l, transfer: overlay.transfer, primaries: overlay.primaries)
   }

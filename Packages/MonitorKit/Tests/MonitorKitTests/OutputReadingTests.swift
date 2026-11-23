@@ -385,8 +385,9 @@ final class OutputReadingTests: XCTestCase {
       focus.enabled = true
       focus.stage = .source
       try gpu.run { try f.analyze(frame, focus: focus, into: $0) }
-      XCTAssertTrue(f.hasFocusMask(for: frame, stage: .source, monitorLUTEnabled: true), c.name)
-      XCTAssertFalse(f.hasFocusMask(for: frame, stage: .output, monitorLUTEnabled: true), c.name)
+      XCTAssertTrue(f.hasFocusMask(for: frame, focus: focus, monitorLUTEnabled: true), c.name)
+      focus.stage = .output
+      XCTAssertFalse(f.hasFocusMask(for: frame, focus: focus, monitorLUTEnabled: true), c.name)
       var state = MonitorState()
       state.focus.enabled = true
       state.focus.stage = .output

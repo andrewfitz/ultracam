@@ -292,7 +292,7 @@ private func monitorOnRender<T>(_ gpu: MonitorGPUContext, _ body: @escaping () t
       if mode == 1 { state.clean = true }
       if mode == 2 { settings.toolsEnabled = false }
       let work = MonitorSurfacePresenter.RenderWork(
-        content: mode == 0 ? .none : .live(delivery), stamp: mode == 0 ? nil : delivery.stamp,
+        content: mode == 0 ? .none : .live(delivery), host: host, stamp: mode == 0 ? nil : delivery.stamp,
         state: state, preferences: settings, latestVersion: 1, stateVersion: 1)
       let done = Completion()
       try monitorOnRender(gpu) {
@@ -666,8 +666,8 @@ private func monitorOnRender<T>(_ gpu: MonitorGPUContext, _ body: @escaping () t
     let presenter = MonitorSurfacePresenter(target: MonitorTargetID("freeze-residency"), host: host, gpu: gpu)
     let loop = MonitorSurfaceRenderLoop(presenter: presenter, layer: CAMetalLayer())
     var state = MonitorState(); state.focus.enabled = true; state.monitorLUT = true
-    let work = MonitorSurfacePresenter.RenderWork(content: .frozenOwned(frame, owner, token: 1), stamp: delivery.stamp,
-      state: state, preferences: MonitorFeedPreferences(), latestVersion: 1, stateVersion: 1)
+    let work = MonitorSurfacePresenter.RenderWork(content: .frozenOwned(frame, owner, token: 1), host: host,
+      stamp: delivery.stamp, state: state, preferences: MonitorFeedPreferences(), latestVersion: 1, stateVersion: 1)
     let output = try target(replacement, width: 16, height: 8)
     let done = Completion()
     try monitorOnRender(gpu) {

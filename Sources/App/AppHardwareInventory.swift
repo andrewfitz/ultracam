@@ -14,6 +14,8 @@ import Observation
   static let pollInterval: Duration = .seconds(2)
 
   private(set) var statuses: [String: CaptureDeviceStatus] = [:]
+  private var listedDeviceIDs: Set<String>?
+  @ObservationIgnored private var invalidatedStatusCaches: Set<String> = []
   /// Names given on this Mac, by device ID. Never written to the hardware: other apps
   /// share the device's own label, and this is a local preference.
   private(set) var nicknames: [String: String]
@@ -37,13 +39,20 @@ import Observation
     nicknames = defaults.dictionary(forKey: Self.nicknamesKey) as? [String: String] ?? [:]
     lastKnownNames = defaults.dictionary(forKey: Self.lastKnownNamesKey) as? [String: String] ?? [:]
     observation = hardware.observeDeviceStatus { [weak self] id, status in
-      guard let self, self.statuses[id] != status else { return }
-      self.statuses[id] = status
+      guard let self, self.listedDeviceIDs?.contains(id) != false else { return }
+      self.invalidatedStatusCaches.remove(id)
+      if self.statuses[id] != status { self.statuses[id] = status }
     }
   }
 
   /// The cached status, from the observer or, before its first delivery, the plugin's cache.
-  func status(for deviceID: String) -> CaptureDeviceStatus? { statuses[deviceID] ?? status(deviceID) }
+  func status(for deviceID: String) -> CaptureDeviceStatus? {
+    guard listedDeviceIDs?.contains(deviceID) != false else { return nil }
+    // Once a device leaves, a late read can still populate its plugin cache.
+    // After reconnection, wait for a new status delivery for that device.
+    guard !invalidatedStatusCaches.contains(deviceID) else { return nil }
+    return statuses[deviceID] ?? status(deviceID)
+  }
 
   func nickname(for deviceID: String) -> String? { nicknames[deviceID] }
 
@@ -60,6 +69,8 @@ import Observation
   /// unplugged input shows no old connector, and one plugged back in starts unknown.
   func devicesListed(_ ids: [String]) {
     let listed = Set(ids)
+    if let listedDeviceIDs { invalidatedStatusCaches.formUnion(listedDeviceIDs.subtracting(listed)) }
+    if listedDeviceIDs != listed { listedDeviceIDs = listed }
     guard statuses.keys.contains(where: { !listed.contains($0) }) else { return }
     statuses = statuses.filter { listed.contains($0.key) }
   }

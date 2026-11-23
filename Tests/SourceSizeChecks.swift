@@ -24,6 +24,10 @@ import XCTest
     let pixelAspect = try Rational(Int64.max, 1)
     XCTAssertThrowsError(try SourceSize(width: huge, height: 1, pixelAspect: pixelAspect))
   }
+  func testDisplayAspectReducesBeforeRequiringInt64() throws {
+    let source = try SourceSize(width: 1920, height: 1080, pixelAspect: Rational(Int64.max, 16))
+    XCTAssertEqual(source.displayAspect, try Rational(Int64.max, 9))
+  }
   func testAdmissionSnapshotReusesValidatedAspect() throws {
     let format = try SourceFormat(width: 1920, height: 1080, pixel: .v210, rate: .constant(CMTime(value: 1, timescale: 30)))
     let snapshot = try SourceSizeAdmission.snapshot(format, destination: (1920, 1080))

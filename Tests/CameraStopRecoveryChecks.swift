@@ -1,4 +1,5 @@
 import CoreMedia
+import CoreMediaIO
 import CoreVideo
 import XCTest
 
@@ -37,6 +38,16 @@ import XCTest
     XCTAssertNil(pending)
     recovery.stop(token)
     XCTAssertEqual(attempts, 2, "Successful quiescence is drained once")
+  }
+
+  func testAlreadyStoppedStreamCanReconnectWithoutRetry() throws {
+    let recovery = CameraStreamStopRecovery(capacity: 1, schedule: { _ in XCTFail("Stream is already idle") },
+      deviceExists: { _ in true })
+    let token = try recovery.reserve(deviceID: 1, streamID: 2) { OSStatus(kCMIOHardwareNotRunningError) }
+    recovery.stop(token)
+    XCTAssertEqual(recovery.retainedStreams, 0)
+    let replacement = try recovery.reserve(deviceID: 1, streamID: 2) { noErr }
+    recovery.stop(replacement)
   }
 
   func testFailedStopOnADeviceThatIsGoneReleasesItsQueueAndSlot() throws {

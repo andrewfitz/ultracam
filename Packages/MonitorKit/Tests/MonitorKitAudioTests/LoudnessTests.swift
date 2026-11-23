@@ -335,6 +335,24 @@ final class LoudnessTests: XCTestCase {
     XCTAssertEqual(m.snapshot().duration, 100 / fs, accuracy: 1e-12)
   }
 
+  func testFlushedMidTickResetCountsFirstCompleteWindowForMaxima() throws {
+    let fs = 48_000.0
+    let meter = try meter(fs)
+    let partial = PlanarBlock(channelCount: 2, capacity: 1)
+    meter.process(planar: partial.pointers, frameCount: 1)
+    meter.resetMeasurement()
+    meter.flush()
+
+    meter.feed(.tone(dBFS: -20, seconds: 0.4, sampleRate: fs))
+    let first = meter.snapshot()
+    XCTAssertTrue(first.momentary.isFinite)
+    XCTAssertEqual(first.momentaryMax, first.momentary)
+    meter.feed(.tone(dBFS: -20, seconds: 2.6, sampleRate: fs))
+    let full = meter.snapshot()
+    XCTAssertTrue(full.shortTerm.isFinite)
+    XCTAssertEqual(full.shortTermMax, full.shortTerm)
+  }
+
   func testFlushPreservesCompleteTicksAndIsIdempotent() throws {
     let fs = 48_000.0
     let m = try LoudnessMeter(sampleRate: fs, channelCount: 1)
@@ -354,6 +372,11 @@ final class LoudnessTests: XCTestCase {
     XCTAssertThrowsError(try LoudnessMeter(sampleRate: 1000, channelCount: 2))
     XCTAssertThrowsError(try LoudnessMeter(sampleRate: 48000, channelCount: 0))
     XCTAssertThrowsError(try LoudnessMeter(sampleRate: 48000, channelCount: 17))
+    for count in [Int.min, Int.max] {
+      XCTAssertThrowsError(try LoudnessMeter(sampleRate: 48000, channelCount: count)) {
+        XCTAssertEqual($0 as? AudioMeterError, .unsupportedChannelCount(count))
+      }
+    }
     XCTAssertThrowsError(try LoudnessMeter(sampleRate: 48000, channels: [.weighted(-1)]))
     XCTAssertThrowsError(
       try AudioMeter(configuration: .init(sampleRate: 48000, channelCount: 2, loudnessChannels: [.left])))

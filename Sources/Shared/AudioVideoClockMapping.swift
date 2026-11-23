@@ -40,10 +40,12 @@ struct AudioVideoClockMapping: Sendable, Hashable {
 
   /// Returns the exact (fractional) source sample count for a duration.
   func audioSamples(forVideoDuration duration: CMTime, sampleRate: Double) throws -> Double {
-    guard duration.isNumeric, duration.epoch == 0, duration.seconds >= 0,
+    guard duration.isNumeric, duration.timescale > 0, duration.epoch == 0, duration.value >= 0,
       sampleRate.isFinite, sampleRate > 0 else {
       throw SourceFormatError.invalid("Invalid duration or sample rate")
     }
-    return duration.seconds * sampleRate / audioToVideoRate
+    let samples = (duration.seconds / audioToVideoRate) * sampleRate
+    guard samples.isFinite else { throw SourceFormatError.invalid("Audio sample count overflow") }
+    return samples
   }
 }

@@ -1,6 +1,6 @@
 # Ultracam
 
-The standalone [Auto Switcher application and Rust server](Apps/AutoSwitcher/README.md) live in the sibling checkout at `../auto-switcher`. Keep it beside UltraCam, like MonitorKit, when building from source. UltraCam can use a private worker or join a shared session.
+Builds use the [Auto Switcher application and Rust server](Apps/AutoSwitcher/README.md) from `../auto-switcher` when that checkout is complete. A clean checkout builds the pinned copy in `Apps/AutoSwitcher`. UltraCam can use a private worker or join a shared session.
 
 
 Ultracam uses fresh app and camera identities: `org.ultracam.app`,

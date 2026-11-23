@@ -151,7 +151,13 @@ final class CaptureServicesBridge: @unchecked Sendable {
         })
         state.withLock { orderedIngest = stage }
         try next.start(deviceID: deviceID, timing: timing, handlers: CaptureHandlers(isRecording: callbacks.isRecording) { delivery in
-          guard self.state.withLock({ self.ingestGeneration == generation && !self.ingestTerminated }) else { return }
+          let ordered = self.state.withLock { () -> Bool? in
+            guard self.ingestGeneration == generation, !self.ingestTerminated else { return nil }
+            if case .cpuMemory = delivery.payload { self.cpuIngestActivated = true }
+            if case .event(.fatal) = delivery.payload { self.ingestTerminated = true }
+            return self.cpuIngestActivated
+          }
+          guard let ordered else { return }
           if case .cpuMemory(_, let info) = delivery.payload {
             do { try info.validate() }
             catch {
@@ -161,10 +167,6 @@ final class CaptureServicesBridge: @unchecked Sendable {
                 mappingRevision: delivery.mappingRevision, payload: .event(.fatal("Invalid CPU-memory frame timing: " + String(describing: error)))))
               return
             }
-          }
-          let ordered = self.state.withLock { () -> Bool in
-            if case .cpuMemory = delivery.payload { self.cpuIngestActivated = true }
-            return self.cpuIngestActivated
           }
           if !ordered { publish(delivery); return }
           if !stage.enqueue(delivery) {
@@ -190,7 +192,7 @@ final class CaptureServicesBridge: @unchecked Sendable {
 
   private static func attachHostTime(_ buffer: CapturedPixelBuffer, info: CaptureFrameInfo) {
     guard let host = info.captureHostTime, host.isNumeric, host.epoch == 0,
-      host.seconds.isFinite, host.seconds > 0 else { return }
+      host.timescale > 0, host.value > 0 else { return }
     CVBufferSetAttachment(buffer.value, DeviceAPI.captureHostTimeAttachmentKey as CFString,
       NSNumber(value: host.seconds), .shouldPropagate)
   }
@@ -216,13 +218,7 @@ final class CaptureServicesBridge: @unchecked Sendable {
         pixelBufferDataSize: CVPixelBufferGetDataSize(image), ioSurfaceAllocationSize: surface)) ?? Int.max
       return .init(bytes: bytes, duration: info.duration.seconds)
     case .rawAudio(let packet):
-      var bytes = 0
-      for plane in packet.planes {
-        let sum = bytes.addingReportingOverflow(plane.count)
-        if sum.overflow { return .init(bytes: Int.max, duration: .infinity) }
-        bytes = sum.partialValue
-      }
-      return .init(bytes: bytes, duration: Double(packet.sampleFrameCount) / packet.format.sampleRate)
+      return .init(bytes: packet.byteCount, duration: Double(packet.sampleFrameCount) / packet.format.sampleRate)
     case .event, .media: return .init(bytes: 0, duration: 0)
     }
   }

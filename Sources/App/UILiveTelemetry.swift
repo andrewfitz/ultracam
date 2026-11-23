@@ -34,7 +34,7 @@ extension UISessionBridge {
   /// A take's running values: clock, size, rate, drops, its audio so far and the time left on its drive.
   func applyTake(_ id: FeedID, statistics stats: RecordingStatistics?, drives: [UIDrive], to rec: inout UICameraRecording) {
     rec.elapsed = stats?.elapsed ?? 0
-    rec.fileBytes = Int64(stats?.fileBytes ?? 0)
+    rec.fileBytes = Int64(clamping: stats?.fileBytes ?? 0)
     rec.megabitsPerSecond = stats?.videoMegabitsPerSecond ?? 0
     rec.droppedFrames = Int(clamping: stats?.droppedVideoFrames ?? 0)
     rec.sourceGaps = Int(clamping: stats?.sourceGaps ?? 0)
@@ -145,8 +145,8 @@ extension UISessionBridge {
   /// only growth after it means copying is happening now.
   nonisolated static func ingestActivity(previous: (count: UInt64, lastChange: TimeInterval)?, count: UInt64,
     now: TimeInterval) -> (count: UInt64, lastChange: TimeInterval) {
-    guard let previous else { return (count, -.infinity) }
-    return (count, count > 0 && previous.count != count ? now : previous.lastChange)
+    guard let previous, count >= previous.count else { return (count, -.infinity) }
+    return (count, count > previous.count ? now : previous.lastChange)
   }
 
   var streamSnapshot: ProgramStreamSnapshot { bridge.model.streamSnapshot }
@@ -185,7 +185,7 @@ extension UIContext {
   func liveSession(_ live: UILiveSource?, only cameraID: String? = nil, follows: UILiveSource.Follows) -> UISessionSnapshot {
     guard let live else { return session }
     var session = session
-    session.drives = live.drives()
+    if follows.contains(.take) { session.drives = live.drives() }
     for index in session.cameras.indices where cameraID == nil || session.cameras[index].id == cameraID {
       session.cameras[index] = live.camera(session.cameras[index], follows: follows, drives: session.drives)
     }

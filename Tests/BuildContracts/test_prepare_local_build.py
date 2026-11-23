@@ -13,7 +13,7 @@ class PreparationTests(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
-        self.root = Path(directory.name)
+        self.root = Path(directory.name).resolve()
         self.source = self.root / 'input.app'
         self.destination = self.root / 'staged.app'
         self.make_app(self.source, False)
@@ -57,3 +57,15 @@ class PreparationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'test failure'):
                 self.run_stage()
         self.assertTrue(sentinel.exists())
+
+    def test_symlinked_metadata_cannot_modify_the_original(self):
+        info = self.source / 'Contents/Info.plist'
+        original = self.root / 'original.plist'
+        info.rename(original)
+        info.symlink_to(original)
+        contents = original.read_bytes()
+        with (patch.object(stage.subprocess, 'run') as run,
+              self.assertRaisesRegex(ValueError, 'symlinked local build metadata')):
+            stage.sign_and_validate(self.source)
+        run.assert_not_called()
+        self.assertEqual(original.read_bytes(), contents)

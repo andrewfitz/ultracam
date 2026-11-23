@@ -8,7 +8,13 @@ from statistics import median
 
 
 def output(*args):
-    return subprocess.check_output(args, stderr=subprocess.PIPE, timeout=60)
+    try:
+        return subprocess.check_output(args, stderr=subprocess.PIPE, timeout=60)
+    except subprocess.CalledProcessError as error:
+        detail = (error.stderr or b"").decode(errors="replace").strip()
+        if detail:
+            raise RuntimeError(f"{args[0]} failed: {detail}") from error
+        raise
 
 
 def probe(path, *args):
@@ -18,6 +24,17 @@ def probe(path, *args):
 def require(condition, message):
     if not condition:
         raise RuntimeError(message)
+
+
+def presentation_times(packets, track, path):
+    message = f"Missing or invalid {track} presentation time in {path}"
+    try:
+        times = [float(packet["pts_time"]) for packet in packets]
+    except (KeyError, TypeError, ValueError) as error:
+        raise RuntimeError(message) from error
+    require(all(map(math.isfinite, times)), message)
+    require(all(a < b for a, b in zip(times, times[1:])), f"Regressing {track} time in {path}")
+    return times
 
 
 def verify_recording(path, *, with_audio, require_black=True, check_tone_channels=False, flash_threshold=195,
@@ -41,12 +58,11 @@ def verify_recording(path, *, with_audio, require_black=True, check_tone_channel
     require(actual_color == expected_color, f"Incorrect {expected_codec} color signaling {actual_color} in {path}")
     period = 1 / expected_fps
     frames = probe(path, "-select_streams", "v:0", "-show_packets",
-                   "-show_entries", "packet=pts_time,dts_time,flags,size")["packets"]
-    times = [float(f["pts_time"]) for f in frames]
+                   "-show_entries", "packet=pts_time,dts_time,flags,size").get("packets", [])
     minimum_frames = 12 if measure_throughput else 60
-    require(len(times) > minimum_frames, f"Insufficient video ({len(times)} frames) in {path}")
+    require(len(frames) > minimum_frames, f"Insufficient video ({len(frames)} frames) in {path}")
+    times = presentation_times(frames, "video", path)
     require("K" in frames[0]["flags"], f"First decodable picture is not a keyframe in {path}")
-    require(all(a < b for a, b in zip(times, times[1:])), f"Regressing video time in {path}")
     keys = [index for index, frame in enumerate(frames) if "K" in frame["flags"]]
     gaps = [(a, b) for a, b in zip(times, times[1:]) if b - a > .35]
     if worker_gaps:
@@ -140,13 +156,12 @@ def verify_recording(path, *, with_audio, require_black=True, check_tone_channel
         return {"frames": len(times), "flashes": len(flashes), **metrics}
     require(len(audio) == 1, f"Expected exactly one audio track in {path}")
     track = audio[0]
-    require((track["codec_name"], track["profile"], track["channels"], track["sample_rate"]) == ("aac", "LC", 2, "48000"),
+    require((track.get("codec_name"), track.get("profile"), track.get("channels"), track.get("sample_rate")) == ("aac", "LC", 2, "48000"),
             f"Unexpected audio format in {path}")
     packets = probe(path, "-select_streams", "a:0", "-show_packets",
-                    "-show_entries", "packet=pts_time,dts_time")["packets"]
-    pts = [float(p["pts_time"]) for p in packets]
-    require(pts, f"No decoded audio packets in {path}")
-    require(all(a < b for a, b in zip(pts, pts[1:])), f"Regressing audio time in {path}")
+                    "-show_entries", "packet=pts_time,dts_time").get("packets", [])
+    require(packets, f"No decoded audio packets in {path}")
+    presentation_times(packets, "audio", path)
     if startup_epoch:
         # The fixture withholds the first six video frames on every connection while
         # audio advances against the common epoch. Independent track zeroes erase this gap.
@@ -230,6 +245,7 @@ def verify_recording(path, *, with_audio, require_black=True, check_tone_channel
             # Exclude AAC transition windows and allow one cycle of estimator quantization.
             begin = (start + slot * 1600 + 450) * 2
             band = samples[begin + 1:begin + 1 + 2 * 750:2]
+            require(begin >= 0 and len(band) == 750, f"Incomplete PCM slot {slot} in {path}")
             peak = max(abs(x) for x in band)
             frequency = sum(a <= 0 < b for a, b in zip(band, band[1:])) * 48_000 / len(band)
             expected = carriers[slot % len(carriers)]
@@ -247,6 +263,7 @@ def verify_recording(path, *, with_audio, require_black=True, check_tone_channel
         start = round((complete[0] + .08) * 48_000)
         for channel, expected in enumerate((900, 1200)):
             wave = samples[start * 2 + channel:(start + 4800) * 2 + channel:2]
+            require(len(wave) == 4800, f"Incomplete stereo tone on channel {channel + 1} in {path}")
             crossings = sum(a <= 0 < b for a, b in zip(wave, wave[1:]))
             require(abs(crossings * 10 - expected) <= 15,
                     f"Wrong frequency on channel {channel + 1} in {path}")

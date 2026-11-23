@@ -25,7 +25,9 @@ struct ClockMappedPCMConverter {
   let maximumWorkspaceBytes: Int
   private let selectedChannels: Range<Int>
   private var pending: [Float] = []
-  private var phase = 0.0
+  // Source position multiplied by the effective output rate. Advancing by
+  // the source rate keeps integral sample-rate conversions exact across packets.
+  private var scaledPhase = 0.0
   private var outputOrigin: CMTime?
   private var emitted: Int64 = 0
   private var expectedAudioTime: CMTime?
@@ -71,7 +73,7 @@ struct ClockMappedPCMConverter {
       throw ClockMappedPCMError.discontinuity
     }
     pending.removeAll(keepingCapacity: true)
-    phase = 0
+    scaledPhase = 0
     outputOrigin = videoTime
     emitted = 0
     expectedAudioTime = audioTime
@@ -84,20 +86,21 @@ struct ClockMappedPCMConverter {
     guard !finished else { return nil }
     finished = true
     guard let origin = outputOrigin, let ratio = previousRatio, !pending.isEmpty else { return nil }
-    let step = format.sampleRate / (outputSampleRate * ratio)
+    let phaseScale = outputSampleRate * ratio
     let channels = selectedChannels.count
     let frameCount = pending.count / channels
     var output = [Float]()
-    while phase < Double(frameCount) {
-      let index = min(Int(phase), frameCount - 1)
+    while scaledPhase < Double(frameCount) * phaseScale {
+      let position = scaledPhase / phaseScale
+      let index = min(Int(position), frameCount - 1)
       let next = min(index + 1, frameCount - 1)
-      let fraction = Float(phase - Double(index))
+      let fraction = Float(position - Double(index))
       for channel in 0..<channels {
         let first = Double(pending[index * channels + channel])
         let second = Double(pending[next * channels + channel])
         output.append(Float(first + (second - first) * Double(fraction)))
       }
-      phase += step
+      scaledPhase += format.sampleRate
     }
     let start = CMTimeAdd(origin, CMTime(value: emitted, timescale: Int32(outputSampleRate)))
     let count = output.count / channels
@@ -148,31 +151,43 @@ struct ClockMappedPCMConverter {
       }
     }
     let outputCapacity = try preflight(sampleFrameCount: sampleFrameCount, mapping: mapping)
-    let nextAudioTime = CMTimeAdd(audioTime, CMTime(seconds: Double(sampleFrameCount) / format.sampleRate,
-      preferredTimescale: 1_000_000_000))
+    let packetDuration: CMTime
+    if let inputTimescale = CMTimeScale(exactly: format.sampleRate) {
+      packetDuration = CMTime(value: Int64(sampleFrameCount), timescale: inputTimescale)
+    } else {
+      packetDuration = CMTime(seconds: Double(sampleFrameCount) / format.sampleRate,
+        preferredTimescale: 1_000_000_000)
+    }
+    let nextAudioTime = CMTimeAdd(audioTime, packetDuration)
     let nextVideoTime = try mapping.videoTime(forAudioTime: nextAudioTime)
     let frames = try decode(planes, frames: sampleFrameCount)
     let channels = selectedChannels.count
     let frameCount = frames.count / channels
-    var cursor = phase
-    let step = format.sampleRate / (outputSampleRate * ratio)
+    let phaseScale = outputSampleRate * ratio
+    var cursor = scaledPhase
+    if let previousRatio, previousRatio != ratio {
+      cursor *= ratio / previousRatio
+    }
     var output = [Float]()
     output.reserveCapacity(outputCapacity * channels)
-    while cursor + 1 < Double(frameCount) {
-      let index = Int(cursor), fraction = Float(cursor - Double(index))
+    while cursor < Double(frameCount - 1) * phaseScale {
+      let position = cursor / phaseScale
+      let index = min(Int(position), frameCount - 2)
+      let fraction = Float(position - Double(index))
       for channel in 0..<channels {
         let first = Double(frames[index * channels + channel])
         let second = Double(frames[(index + 1) * channels + channel])
         output.append(Float(first + (second - first) * Double(fraction)))
       }
-      cursor += step
+      cursor += format.sampleRate
     }
-    let consumed = cursor >= Double(frameCount) ? frameCount : Int(cursor)
+    let consumed = cursor >= Double(frameCount) * phaseScale ? frameCount : Int(cursor / phaseScale)
     let start = CMTimeAdd(outputOrigin ?? videoTime,
       CMTime(value: emitted, timescale: Int32(outputSampleRate)))
     // Copy only the remaining interpolation frame; retaining the combined
     // array capacity would keep an entire large packet alive between calls.
-    pending = Array(frames[(consumed * channels)...]); phase = cursor - Double(consumed)
+    pending = Array(frames[(consumed * channels)...])
+    scaledPhase = max(0, cursor - Double(consumed) * phaseScale)
     outputOrigin = outputOrigin ?? videoTime
     previousRatio = ratio
     let count = output.count / channels
@@ -264,7 +279,9 @@ struct ClockMappedPCMConverter {
     case .int16:
       return Float(Int16(littleEndian: raw.loadUnaligned(fromByteOffset: offset, as: Int16.self))) / 32_768
     case .int24in32:
-      return Float(Int32(littleEndian: raw.loadUnaligned(fromByteOffset: offset, as: Int32.self))) / 8_388_608
+      let word = Int32(littleEndian: raw.loadUnaligned(fromByteOffset: offset, as: Int32.self))
+      // Discard the high padding byte and sign-extend bit 23.
+      return Float((word << 8) >> 8) / 8_388_608
     case .int32:
       return Float(Int32(littleEndian: raw.loadUnaligned(fromByteOffset: offset, as: Int32.self))) / 2_147_483_648
     case .float32:

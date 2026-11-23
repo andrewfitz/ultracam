@@ -17,6 +17,7 @@ private actor SettingsFake: VendorSettingsProviding {
     var failed = false
     var ignoreWrites = false
     var writes = 0
+    private var reads = 0
     private var holdRead = false
     private var pendingRead: CheckedContinuation<[VendorSetting], Never>?
     private var pendingSnapshot: [VendorSetting] = []
@@ -24,6 +25,7 @@ private actor SettingsFake: VendorSettingsProviding {
     func readIsPending() -> Bool { pendingRead != nil }
     func releaseRead() { pendingRead?.resume(returning: pendingSnapshot); pendingRead = nil }
     func settings(deviceID device: String) async -> [VendorSetting] {
+        reads += 1
         let snapshot: [VendorSetting] = [.init(id: "decklink:advertiseHDRToCameras", labelKey: "Advertise HDR to cameras", value: .boolean(values[device] ?? false), allowedValues: .unrestricted, mutable: !readOnly, availabilityReason: nil, interruptsCapture: true, applicationError: unapplied ? .failed("Synthetic EDID application failed") : nil)]
         if holdRead {
             holdRead = false; pendingSnapshot = snapshot
@@ -41,6 +43,7 @@ private actor SettingsFake: VendorSettingsProviding {
     func fail(_ enabled: Bool) { failed = enabled }
     func ignore(_ enabled: Bool) { ignoreWrites = enabled }
     func count() -> Int { writes }
+    func readCount() -> Int { reads }
 
 }
 
@@ -51,29 +54,73 @@ private actor CaptureSettingsFake: VendorSettingsProviding {
     private var mode = VendorCaptureMode.automatic
     private var control = VendorSettingValue.choice("auto")
     private var writes: [String] = []
+    private let focusResetsMode: Bool
+    private let failReadAfterFocus: Bool
     static let format = VendorCaptureFormat(id: "medium", label: "720p",
       rates: [.init(duration: CMTime(value: 1, timescale: 30), label: "30 fps")],
       ranges: [.init(shortest: CMTime(value: 1, timescale: 60), longest: CMTime(value: 1, timescale: 24))])
 
-    func settings(deviceID: String) -> [VendorSetting] {
-        let choices: [VendorSetting.Choice] = mode == VendorCaptureMode.automatic
-            ? [.init(id: "auto", label: "Auto")] : [.init(id: "locked", label: "Locked")]
+    init(focusResetsMode: Bool = false, failReadAfterFocus: Bool = false) {
+        self.focusResetsMode = focusResetsMode
+        self.failReadAfterFocus = failReadAfterFocus
+    }
+
+    func settings(deviceID: String) throws -> [VendorSetting] {
+        if failReadAfterFocus, writes.contains("focus") { throw PluginError.failed("Synthetic settings read failed") }
+        let automatic = VendorSetting.Choice(id: "auto", label: "Auto")
+        let locked = VendorSetting.Choice(id: "locked", label: "Locked")
+        let choices = focusResetsMode ? [automatic, locked] : (mode == VendorCaptureMode.automatic ? [automatic] : [locked])
         return [
-            .init(id: "mode", labelKey: "Capture Format", value: mode, allowedValues: .unrestricted,
-              mutable: true, availabilityReason: nil, interruptsCapture: true, captureFormats: [Self.format]),
             .init(id: "focus", labelKey: "Focus", value: control, allowedValues: .choices(choices),
-              mutable: true, availabilityReason: nil, interruptsCapture: false)
+              mutable: true, availabilityReason: nil, interruptsCapture: false),
+            .init(id: "mode", labelKey: "Capture Format", value: mode, allowedValues: .unrestricted,
+              mutable: true, availabilityReason: nil, interruptsCapture: true, captureFormats: [Self.format])
         ]
     }
     func apply(_ value: VendorSettingValue, to setting: String, deviceID: String) {
         writes.append(setting)
         if setting == "mode" { mode = value }
-        if setting == "focus" { control = value }
+        if setting == "focus" {
+            control = value
+            if focusResetsMode { mode = VendorCaptureMode.automatic }
+        }
     }
     func appliedIDs() -> [String] { writes }
 }
 
 @MainActor @objcMembers final class VendorSettingsStoreChecks: XCTestCase {
+    func testSettingsOperationsRejectMismatchedOrMalformedDeviceRoutes() async {
+        let fake = SettingsFake(), persistence = MemoryVendorSettings()
+        let store = VendorSettingsStore(plugins: ["decklink": fake, "alias": fake], persistence: persistence)
+        let device = "decklink:device", setting = "decklink:advertiseHDRToCameras"
+        await store.refresh(deviceID: device, pluginID: "decklink")
+        await store.apply(.boolean(true), to: setting, deviceID: device, pluginID: "alias")
+        await store.restore(deviceID: "alias:device", pluginID: "alias")
+        await store.refresh(deviceID: "decklink:", pluginID: "decklink")
+        let reads = await fake.readCount(), writes = await fake.count()
+        XCTAssertEqual(reads, 1)
+        XCTAssertEqual(writes, 0)
+        XCTAssertEqual(persistence.writes, 0)
+        XCTAssertEqual(store.state(for: device).settings.first?.value, .boolean(false))
+    }
+
+    func testAlreadyCancelledSettingsOperationsNeverEnterAdapter() async {
+        let fake = SettingsFake(), persistence = MemoryVendorSettings()
+        let store = VendorSettingsStore(plugins: ["decklink": fake], persistence: persistence)
+        let device = "decklink:device", setting = "decklink:advertiseHDRToCameras"
+        await store.refresh(deviceID: device, pluginID: "decklink")
+        await Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            await store.refresh(deviceID: device, pluginID: "decklink")
+            await store.restore(deviceID: device, pluginID: "decklink")
+            await store.apply(.boolean(true), to: setting, deviceID: device, pluginID: "decklink")
+        }.value
+        let reads = await fake.readCount(), writes = await fake.count()
+        XCTAssertEqual(reads, 1)
+        XCTAssertEqual(writes, 0)
+        XCTAssertEqual(persistence.writes, 0)
+    }
+
     func testInheritancePreservesOverridesAndFutureDevices() async throws {
         let fake = SettingsFake(), persistence = MemoryVendorSettings()
         let setting = "decklink:advertiseHDRToCameras"
@@ -206,7 +253,30 @@ private actor CaptureSettingsFake: VendorSettingsProviding {
         let applied = await fake.appliedIDs()
         XCTAssertEqual(applied, ["mode", "focus"])
         XCTAssertNil(store.state(for: device).message)
-        XCTAssertEqual(store.state(for: device).settings.last?.value, .choice("locked"))
+        XCTAssertEqual(store.state(for: device).settings.first(where: { $0.id == "focus" })?.value, .choice("locked"))
+    }
+
+    func testRestorePersistsOnlyInheritedValuesConfirmedByFinalSnapshot() async {
+        let fake = CaptureSettingsFake(focusResetsMode: true), persistence = MemoryVendorSettings()
+        let device = "capture:test"
+        let mode = VendorCaptureMode.value(formatID: "medium", duration: CMTime(value: 1, timescale: 30))
+        persistence.snapshot.inheritedByPlugin["capture"] = ["mode": mode, "focus": .choice("locked")]
+        let store = VendorSettingsStore(plugins: ["capture": fake], persistence: persistence)
+        await store.restore(deviceID: device, pluginID: "capture")
+        XCTAssertEqual(persistence.snapshot.desiredByDevice[device], ["focus": .choice("locked")])
+        XCTAssertEqual(persistence.snapshot.inheritedByPlugin["capture"]?["mode"], mode)
+        XCTAssertNotNil(store.state(for: device).message)
+    }
+
+    func testRestoreDoesNotPersistEarlierAcknowledgementWhenFinalReadFails() async {
+        let fake = CaptureSettingsFake(focusResetsMode: true, failReadAfterFocus: true), persistence = MemoryVendorSettings()
+        let device = "capture:test"
+        let mode = VendorCaptureMode.value(formatID: "medium", duration: CMTime(value: 1, timescale: 30))
+        persistence.snapshot.inheritedByPlugin["capture"] = ["mode": mode, "focus": .choice("locked")]
+        let store = VendorSettingsStore(plugins: ["capture": fake], persistence: persistence)
+        await store.restore(deviceID: device, pluginID: "capture")
+        XCTAssertEqual(persistence.writes, 0)
+        XCTAssertNotNil(store.state(for: device).message)
     }
 
     func testMissingSavedModeAndInvalidRatePreserveSavedPair() async throws {

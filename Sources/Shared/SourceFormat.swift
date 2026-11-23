@@ -262,8 +262,12 @@ struct Timecode: Hashable, Codable, Sendable {
   }
   func validate(rate: FrameRate) throws {
     try rate.validate()
-    let fps = 1 / CMTimeGetSeconds(rate.nominal)
-    guard fps.isFinite, fps > 0, Double(frames) < ceil(fps) else { throw SourceFormatError.invalid("Timecode frame exceeds declared rate") }
+    let duration = rate.nominal
+    // An integer label is below ceil(fps) exactly when it is below fps.
+    // Comparing the rational avoids rounding a whole-number rate upward.
+    guard Int128(frames) * Int128(duration.value) < Int128(duration.timescale) else {
+      throw SourceFormatError.invalid("Timecode frame exceeds declared rate")
+    }
     if dropFrame {
       let thirty = CMTimeCompare(rate.nominal, CMTime(value: 1001, timescale: 30000)) == 0
       let sixty = CMTimeCompare(rate.nominal, CMTime(value: 1001, timescale: 60000)) == 0

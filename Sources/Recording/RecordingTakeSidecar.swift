@@ -260,10 +260,36 @@ final class RecordingTakeSidecar: @unchecked Sendable {
     guard descriptor >= 0 else { throw Failure.occupied }
     journal = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
     do {
-      guard !FileManager.default.fileExists(atPath: url.path) else { throw Failure.occupied }
-      try save()
-    } catch { try? journal.close(); try? FileManager.default.removeItem(at: journalURL); throw error }
+      try createSnapshot()
+    } catch {
+      try? journal.close()
+      _ = unlink(journalURL.path)
+      throw error
+    }
   }
+
+  private func createSnapshot() throws {
+    let data = try JSONEncoder().encode(snapshotValue)
+    // Reserve this path as well as the journal. An existing dangling link
+    // still occupies the name, and an atomic replacement would erase it.
+    let descriptor = open(url.path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o666)
+    guard descriptor >= 0 else {
+      let failure = errno
+      if failure == EEXIST { throw Failure.occupied }
+      throw POSIXError(.init(rawValue: failure) ?? .EIO)
+    }
+    let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+    do {
+      try handle.write(contentsOf: data)
+      try handle.synchronize()
+      try handle.close()
+    } catch {
+      _ = unlink(url.path)
+      try? handle.close()
+      throw error
+    }
+  }
+
   private func save() throws { try save(snapshot) }
   private func save(_ candidate: Snapshot) throws {
     try JSONEncoder().encode(candidate).write(to: url, options: .atomic)
@@ -395,23 +421,33 @@ final class RecordingTakeSidecar: @unchecked Sendable {
   }
   static func readSnapshot(for movie: URL) throws -> Snapshot {
     let file = url(for: movie)
-    let attributes = try FileManager.default.attributesOfItem(atPath: file.path)
-    guard attributes[.type] as? FileAttributeType == .typeRegular,
-      let size = attributes[.size] as? NSNumber, size.int64Value > 0, size.int64Value <= 1_048_576 else { throw Failure.occupied }
-    return try JSONDecoder().decode(Snapshot.self, from: Data(contentsOf: file))
+    let descriptor = open(file.path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+    guard descriptor >= 0 else { throw Failure.occupied }
+    let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+    defer { try? handle.close() }
+    var info = stat()
+    guard fstat(descriptor, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG,
+      info.st_size > 0, info.st_size <= 1_048_576,
+      let data = try handle.read(upToCount: Int(info.st_size)), data.count == info.st_size else { throw Failure.occupied }
+    return try JSONDecoder().decode(Snapshot.self, from: data)
   }
 
   static func removePairedMetadata(for movie: URL) throws {
     let sidecar = url(for: movie)
     let journal = sidecar.appendingPathExtension("journal")
-    for file in [sidecar, journal] {
-      if FileManager.default.fileExists(atPath: file.path) {
-        let values = try file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
-        guard values.isRegularFile == true, values.isSymbolicLink != true else { throw Failure.occupied }
+    let files = try [sidecar, journal].filter { file in
+      var info = stat()
+      if lstat(file.path, &info) != 0 {
+        if errno == ENOENT { return false }
+        throw POSIXError(.init(rawValue: errno) ?? .EIO)
       }
+      guard (info.st_mode & S_IFMT) == S_IFREG else { throw Failure.occupied }
+      return true
     }
-    for file in [sidecar, journal] where FileManager.default.fileExists(atPath: file.path) {
-      try FileManager.default.removeItem(at: file)
+    for file in files {
+      if unlink(file.path) != 0, errno != ENOENT {
+        throw POSIXError(.init(rawValue: errno) ?? .EIO)
+      }
     }
   }
 

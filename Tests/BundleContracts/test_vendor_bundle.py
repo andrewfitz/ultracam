@@ -46,6 +46,15 @@ class VendorBundleTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'Unresolved non-system dependency'):
             self.validate(reload_executable=validator.reload_helper_executable(self.app))
 
+    def test_worker_requires_its_own_runtime_search_paths(self):
+        worker = self.binary(self.app / validator.SWITCHER_WORKER)
+        self.meta[worker]['dependencies'] = ['@rpath/libCore.dylib']
+        self.meta[self.host]['dependencies'].append('@loader_path/auto-switcher')
+        with self.assertRaisesRegex(ValueError, 'Unresolved non-system dependency'):
+            self.validate()
+        self.meta[worker]['rpaths'] = ['@executable_path/../Frameworks']
+        self.validate()
+
     def test_rpath_first_existing_external_match_is_rejected(self):
         self.meta[self.host]['rpaths'] = [str(self.root / 'SDK'), '@executable_path/../Frameworks']
         with self.assertRaisesRegex(ValueError, 'dependency'):
@@ -103,6 +112,7 @@ class VendorBundleTests(unittest.TestCase):
 
     def test_top_level_signed_extension_requires_extracted_entitlements(self):
         self.reload_helper()
+        self.binary(self.app / validator.SWITCHER_WORKER).chmod(0o755)
         host_entitlements = {'com.apple.security.files.user-selected.read-write': True,
                              'com.apple.security.cs.disable-library-validation': True,
                              'com.apple.security.app-sandbox': True,
@@ -153,11 +163,16 @@ class VendorBundleTests(unittest.TestCase):
                 'com.apple.security.application-groups': ['group.org.ultracam.shared']}
         camera = {'com.apple.security.app-sandbox': True,
                   'com.apple.security.application-groups': ['group.org.ultracam.shared']}
+        worker = {'com.apple.security.app-sandbox': True, 'com.apple.security.inherit': True}
         def extraction(args, **kwargs):
-            return SimpleNamespace(returncode=0, stdout=plistlib.dumps(host if Path(args[-1]) == self.app else camera))
+            values = {self.app: host, self.extension: camera, (self.app / validator.SWITCHER_WORKER).resolve(): worker}
+            return SimpleNamespace(returncode=0, stdout=plistlib.dumps(values[Path(args[-1])]))
+        alias = self.root / 'current.app'
+        alias.symlink_to(self.app, target_is_directory=True)
         with patch.object(validator.subprocess, 'run', side_effect=extraction), \
-                patch.object(validator, 'validate_symbols'), patch.object(validator, 'validate_vendors'):
-            validator.validate(self.app, root=self.root, signed=True)
+                patch.object(validator, 'validate_symbols') as symbols, patch.object(validator, 'validate_vendors'):
+            validator.validate(alias, root=self.root, signed=True)
+            symbols.assert_called_once_with(self.app)
             for values, key, replacement in [(host, 'com.apple.security.application-groups', []),
                     (host, 'com.apple.security.application-groups', ['group.other']),
                     (host, 'com.apple.developer.system-extension.install', False),
@@ -165,6 +180,7 @@ class VendorBundleTests(unittest.TestCase):
                     (host, 'com.apple.application-identifier', 'TEST.other.app'),
                     (host, 'keychain-access-groups', ['group.other', host['com.apple.application-identifier']]),
                     (host, 'com.apple.security.app-sandbox', False),
+                    (worker, 'com.apple.security.inherit', False),
                     (camera, 'com.apple.security.app-sandbox', False),
                     (camera, 'com.apple.security.application-groups', ['group.other'])]:
                 original = values[key]; values[key] = replacement
@@ -216,7 +232,7 @@ class VendorBundleTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
+        self.root = Path(self.temp.name).resolve()
         self.app = self.root / 'Ultracam.app'
         self.extension = self.app / 'Contents/Library/SystemExtensions/org.ultracam.app.camera.systemextension'
         self.meta = {}
@@ -308,6 +324,9 @@ class VendorBundleTests(unittest.TestCase):
         self.runtime.unlink(); self.core.unlink()
         self.meta[self.host]['dependencies'] = []
         self.validate()
+        self.binary(self.app / 'Contents/Helpers/old/libCore.dylib', install='@rpath/libCore.dylib')
+        with self.assertRaisesRegex(ValueError, 'Unexpected vendor runtime'):
+            self.validate()
 
     def test_non_system_absolute_dependency_requires_explicit_driver_declaration(self):
         self.meta[self.core]['dependencies'] = ['/Library/Frameworks/Driver.framework/Driver']

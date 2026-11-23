@@ -9,6 +9,14 @@ case "$profile" in
   legacy|maccamera-1080|uhd60-hevc|720p2997-av1|all) ;;
   *) echo "Unknown stream profile: $profile" >&2; exit 2 ;;
 esac
+if ! duration="$(python3 -c 'import sys
+seconds = int(sys.argv[1])
+if seconds < 18:
+    sys.exit(2)
+print(seconds)' "${2:-24}" 2>/dev/null)"; then
+  echo 'DURATION_SECONDS must be a whole number of at least 18 seconds.' >&2
+  exit 2
+fi
 pkg="$1"
 task_root="$(cd "$(dirname "$0")/.." && pwd)"
 auto_switcher_source="$(python3 "$task_root/scripts/auto_switcher_source.py")"
@@ -65,8 +73,8 @@ if [[ "$profile" == all ]]; then
   for candidate in legacy uhd60-hevc 720p2997-av1; do
     mkdir "$test_root/$candidate"
     python3 -B "$test_root/Tools/ProgramStreamAppSmoke/verify.py" "$test_root/app-smoke" \
-      "$test_root/$candidate" "${2:-24}" "$candidate" || status=1
+      "$test_root/$candidate" "$duration" "$candidate" || status=1
   done
   exit "$status"
 fi
-python3 -B "$test_root/Tools/ProgramStreamAppSmoke/verify.py" "$test_root/app-smoke" "$test_root" "${2:-24}" "$profile"
+python3 -B "$test_root/Tools/ProgramStreamAppSmoke/verify.py" "$test_root/app-smoke" "$test_root" "$duration" "$profile"

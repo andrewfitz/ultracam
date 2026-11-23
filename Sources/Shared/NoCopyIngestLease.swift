@@ -5,29 +5,18 @@ public final class NoCopyIngestAllocation: @unchecked Sendable {
   public let baseAddress: UInt
   public let length: Int
   public let generation: UInt64
-  private let retainBody: () -> Void
   private let releaseBody: () -> Void
-  private var released = false
-  private let lock = NSLock()
 
   public init(baseAddress: UnsafeRawPointer, length: Int, generation: UInt64,
-              retain: @escaping () -> Void = {}, release: @escaping () -> Void = {}) {
+              retain: () -> Void = {}, release: @escaping () -> Void = {}) {
     self.baseAddress = UInt(bitPattern: baseAddress)
     self.length = length
     self.generation = generation
-    self.retainBody = retain
     self.releaseBody = release
-    retainBody()
+    retain()
   }
 
-  fileprivate func releaseOnce() {
-    lock.lock(); defer { lock.unlock() }
-    guard !released else { return }
-    released = true
-    releaseBody()
-  }
-
-  deinit { releaseOnce() }
+  deinit { releaseBody() }
 }
 
 public enum NoCopyIngestError: Error, Equatable {
@@ -70,19 +59,20 @@ public final class NoCopyIngestLease: @unchecked Sendable {
   private var submitted = false
 
   public init(pointer: UnsafeRawPointer, length: Int,
-              allocation: NoCopyIngestAllocation?, vmPageSize: Int = 4096,
+              allocation: NoCopyIngestAllocation?, vmPageSize: Int = Int(getpagesize()),
               inspectVM: NoCopyVMInspector? = nil,
               frameRelease: @escaping () -> Void = {},
               onGPUResourcesReleased: @escaping () -> Void = {}) throws {
     guard let allocation else { throw NoCopyIngestError.missingAllocationOwnership }
     guard length > 0, allocation.length > 0 else { throw NoCopyIngestError.invalidLength }
-    guard vmPageSize > 0 else { throw NoCopyIngestError.invalidVMPageSize }
+    guard vmPageSize > 0, vmPageSize.nonzeroBitCount == 1 else { throw NoCopyIngestError.invalidVMPageSize }
     let start = UInt(bitPattern: pointer)
     let endResult = start.addingReportingOverflow(UInt(length))
-    guard start >= allocation.baseAddress, !endResult.overflow else { throw NoCopyIngestError.arithmeticOverflow }
+    guard !endResult.overflow else { throw NoCopyIngestError.arithmeticOverflow }
     let end = endResult.partialValue
     let allocEndResult = allocation.baseAddress.addingReportingOverflow(UInt(allocation.length))
-    guard !allocEndResult.overflow, end <= allocEndResult.partialValue else { throw NoCopyIngestError.outsideAllocation }
+    guard !allocEndResult.overflow else { throw NoCopyIngestError.arithmeticOverflow }
+    guard start >= allocation.baseAddress, end <= allocEndResult.partialValue else { throw NoCopyIngestError.outsideAllocation }
     let roundedBase = start - (start % UInt(vmPageSize))
     let roundedEndResult = end.addingReportingOverflow(UInt(vmPageSize - 1))
     guard !roundedEndResult.overflow else { throw NoCopyIngestError.arithmeticOverflow }
@@ -93,7 +83,10 @@ public final class NoCopyIngestLease: @unchecked Sendable {
     guard let inspectVM else { throw NoCopyIngestError.splitVMRegion }
     do {
       guard let region = inspectVM(roundedBase, roundedLength) else { throw NoCopyIngestError.splitVMRegion }
-      guard region.baseAddress == roundedBase, region.length >= roundedLength else { throw NoCopyIngestError.splitVMRegion }
+      // An inspector may return the whole VM region containing a frame slice.
+      guard region.baseAddress <= roundedBase, region.length > 0 else { throw NoCopyIngestError.splitVMRegion }
+      let regionEnd = region.baseAddress.addingReportingOverflow(UInt(region.length))
+      guard !regionEnd.overflow, roundedEnd <= regionEnd.partialValue else { throw NoCopyIngestError.splitVMRegion }
       guard region.generation == allocation.generation else { throw NoCopyIngestError.generationMismatch }
     }
     self.roundedBaseAddress = roundedBase

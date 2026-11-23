@@ -74,9 +74,17 @@ public struct CubeLUT: Sendable, Equatable {
     var values: [Float] = []
     var headers: Set<String> = []
     var dataStarted = false
-    for (index, raw) in source.components(separatedBy: .newlines).enumerated() {
+    // Read one line at a time. CRLF is a single newline Character, and
+    // blank lines need no storage even in files near the size limit.
+    var remaining = source[...]
+    var lineNumber = 0
+    while !remaining.isEmpty {
+      let end = remaining.firstIndex(where: \.isNewline) ?? remaining.endIndex
+      let raw = remaining[..<end]
+      remaining = end == remaining.endIndex ? remaining[end...] : remaining[remaining.index(after: end)...]
+      lineNumber += 1
       guard raw.utf8.count <= 250 else {
-        throw ParseError.invalid("line \(index + 1): line exceeds 250 bytes")
+        throw ParseError.invalid("line \(lineNumber): line exceeds 250 bytes")
       }
       // The specification defines comments as lines beginning with `#`, but
       // inline comments are common in exported files. Strip an inline marker
@@ -92,13 +100,13 @@ public struct CubeLUT: Sendable, Equatable {
           break
         }
       }
-      let uncommented = commentStart.map { String(raw[..<$0]) } ?? raw
+      let uncommented = commentStart.map { raw[..<$0] } ?? raw
       let line = uncommented.trimmingCharacters(in: .whitespacesAndNewlines)
       if line.isEmpty { continue }
       let parts = line.split(whereSeparator: \.isWhitespace).map(String.init)
       guard let key = parts.first else { continue }
       func invalid(_ reason: String) -> ParseError {
-        .invalid("line \(index + 1): \(reason)")
+        .invalid("line \(lineNumber): \(reason)")
       }
       func numbers(_ count: Int) throws -> [Float] {
         guard parts.count == count + 1 else { throw invalid("\(key) requires \(count) numbers") }

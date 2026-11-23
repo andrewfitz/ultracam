@@ -136,12 +136,13 @@ enum ExtensionFormatCatalog {
   /// only happens to contain the requested identity in a malformed catalog.
   static func installedPrefixMatchesPublished(_ installed: [ExtensionFormatContract]) -> Bool {
     let count = min(installed.count, published.count)
-    return Array(installed.prefix(count)) == Array(published.prefix(count))
+    guard installed.prefix(count).elementsEqual(published.prefix(count)) else { return false }
+    return installed.count <= published.count || Set(installed).count == installed.count
   }
 
   static func validateAppendOnly(previous: [ExtensionFormatContract], proposed: [ExtensionFormatContract]) throws {
-    guard proposed.count >= previous.count, Array(proposed.prefix(previous.count)) == previous,
-      Set(proposed.map(\.id)).count == proposed.count else { throw ExtensionFormatCatalogError.changedPublishedIndex }
+    guard proposed.prefix(previous.count).elementsEqual(previous),
+      Set(proposed).count == proposed.count else { throw ExtensionFormatCatalogError.changedPublishedIndex }
   }
 
   /// `installed` must be read from the actual extension. A local catalog is

@@ -206,7 +206,7 @@ extension MonitorPass {
       s, signal: k.signal, full: FalseColorTable.usesFullRangeARRI(signal: k.signal, layout: k.layout),
       stageHasLUT: stageHasLUT, processed: k.processed)
     let color = MonitorColorPipeline(
-      output: k.output, signal: k.signal, transform: s.displayTransform,
+      output: k.output, signal: k.signal.signal(for: s.pictureStage), transform: s.displayTransform,
       monitorStageHasLUT: s.pictureHasLUT(burnInLUT: k.burnInLUT != nil, monitorLUT: k.monitorLUT != nil))
     let frameParameters = FrameParameters(
       shape: SIMD4(k.layout.shaderKind, UInt32(k.width), UInt32(k.height), 0), options: SIMD4(0, 0, 0, 0),

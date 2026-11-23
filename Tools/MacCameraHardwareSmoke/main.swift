@@ -146,15 +146,26 @@ private func exactFPS(for duration: CMTime) -> String {
     throw SmokeFailure("Select an independent camera input UID")
   }
   let microphoneUID = explicit ? args.dropFirst(4).first : (listing ? nil : args.dropFirst(2).first)
+  guard microphoneUID?.isEmpty != true else { throw SmokeFailure("Supply a microphone input UID or omit it") }
   let microphone = microphoneUID.map { "input:" + $0 } ?? "off"
+  let requestedDuration: CMTime?
+  if explicit {
+    guard !args[2].isEmpty, let rate = VendorCaptureMode.customDuration(args[3]) else {
+      throw SmokeFailure("Supply a format ID and a positive FPS. Use --formats to list the camera's available modes.")
+    }
+    requestedDuration = rate
+  } else { requestedDuration = nil }
+  let requestedIndex = !listing && !explicit && args.count >= 2 ? Int(args[1]) : 0
+  guard let requestedIndex, requestedIndex >= 0 else {
+    throw SmokeFailure("Supply a nonnegative format index. Use --formats to list the camera's available modes.")
+  }
   let configuredSeconds = ProcessInfo.processInfo.environment["ULTRACAM_MAC_CAMERA_SMOKE_SECONDS"] ?? "0"
   guard let seconds = Int(configuredSeconds), (0...60).contains(seconds) else {
     throw SmokeFailure("ULTRACAM_MAC_CAMERA_SMOKE_SECONDS must be an integer from 0 through 60")
   }
   let plugin = MacCameraCapturePlugin()
   let id = MacCameraCapturePlugin.id(for: uid)
-  try plugin.configureSettings(.init(desiredByDevice: [id: [MacCameraAudio.settingsKey: .choice(microphone)]]))
-  try await plugin.authorizeCapture(deviceID: id)
+  try await plugin.authorizeCapture(deviceID: nil)
   guard let device = try plugin.devices().first(where: { $0.id == id }),
     let mode = try await plugin.settings(deviceID: id).first(where: { $0.id == MacCameraCapturePlugin.modeKey }),
     let formats = mode.captureFormats else {
@@ -173,27 +184,27 @@ private func exactFPS(for duration: CMTime) -> String {
   }
   let format: VendorCaptureFormat
   let duration: CMTime
-  if explicit {
+  if let requestedDuration {
     guard let choice = formats.first(where: { $0.id == args[2] }) else {
       throw SmokeFailure("The selected format ID is unavailable. Use --formats with the selected camera UID.")
     }
-    guard let rate = VendorCaptureMode.customDuration(args[3]), choice.supports(rate) else {
+    guard choice.supports(requestedDuration) else {
       throw SmokeFailure("The requested FPS is unsupported by this format. Use an exact value in a --formats interval.")
     }
     format = choice
-    duration = rate
+    duration = requestedDuration
   } else {
-    let index = args.count >= 2 ? Int(args[1]) ?? -1 : 0
-    guard formats.indices.contains(index), let rate = formats[index].rates.first else {
+    guard formats.indices.contains(requestedIndex), let rate = formats[requestedIndex].rates.first else {
       throw SmokeFailure("The selected plugin format index is unavailable. Use --formats with the selected camera UID.")
     }
-    format = formats[index]
+    format = formats[requestedIndex]
     duration = rate.duration
   }
   let selection = VendorCaptureMode.value(formatID: format.id, duration: duration)
   try plugin.configureSettings(.init(desiredByDevice: [id: [
     MacCameraCapturePlugin.modeKey: selection, MacCameraAudio.settingsKey: .choice(microphone)
   ]]))
+  try await plugin.authorizeCapture(deviceID: id)
   print("Selected \(device.name) / \(format.label) / \(exactFPS(for: duration)) fps, formatID=\(format.id), microphone=\(microphone)")
 
   for attempt in 1...2 {
@@ -219,7 +230,11 @@ private func exactFPS(for duration: CMTime) -> String {
       try await Task.sleep(for: .milliseconds(20))
     }
     let active = plugin.status(deviceID: id)
-    let captured = audit.snapshot
+    let counters = session.counters
+    let captured = await Task.detached {
+      session.stop()
+      return audit.snapshot
+    }.value
     guard captured.errors.isEmpty, captured.frames >= 8, let delivered = captured.format else {
       throw SmokeFailure("Expected eight admitted video frames; received \(captured.frames). \((captured.errors + [captured.startupMessage].compactMap { $0 }).joined(separator: " "))")
     }
@@ -231,11 +246,9 @@ private func exactFPS(for duration: CMTime) -> String {
       print("Source PTS span in seconds: video \(captured.firstVideoPTS?.seconds ?? .nan)...\(captured.lastVideoPTS?.seconds ?? .nan), PCM \(captured.firstAudioPTS?.seconds ?? .nan)...\(captured.lastAudioPTS?.seconds ?? .nan)")
     }
     print("Attempt \(attempt) delivered \(delivered.width)x\(delivered.height), \(delivered.rate), \(captured.frames) frames, \(captured.declarations) epochs, \(captured.clockUpdates) clock mapping updates")
-    print("Signal \(active?.signalDetail ?? "no detail"), device drops \(session.counters.deviceDroppedFrames)")
-    await Task.detached { session.stop() }.value
-    let stopped = audit.snapshot.callbacks
+    print("Signal \(active?.signalDetail ?? "no detail"), device drops \(counters.deviceDroppedFrames)")
     try await Task.sleep(for: .milliseconds(350))
-    guard audit.snapshot.callbacks == stopped, plugin.status(deviceID: id)?.availability != .inUseHere else {
+    guard audit.snapshot.callbacks == captured.callbacks, plugin.status(deviceID: id)?.availability != .inUseHere else {
       throw SmokeFailure("Stopped session still delivered callbacks or held its device")
     }
   }

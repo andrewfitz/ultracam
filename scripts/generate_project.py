@@ -8,16 +8,16 @@ import os
 import sys
 from pathlib import Path
 from xml.sax.saxutils import escape
-from work_paths import work_paths
+from work_paths import LAYOUT, work_paths
 from vendors import read_inventory, build_settings, source_paths, generate_bridge, input_digest, check_capabilities
-from auto_switcher_source import auto_switcher_source
+from auto_switcher_source import AUTO_SWITCHER_LOCATIONS, auto_switcher_source
 
 ROOT = Path(__file__).resolve().parents[1]
 if not (ROOT.parent / "MonitorKit" / "Package.swift").is_file():
     sys.exit("generate_project.py: clone the MonitorKit repository beside Ultracam at ../MonitorKit")
 objects = {}
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument('--sdk-inventory', type=Path)
+parser.add_argument('--sdk-inventory', type=Path, default=os.environ.get('ULTRACAM_SDK_INVENTORY') or None)
 output = parser.add_mutually_exclusive_group()
 output.add_argument('--output-dir', type=Path, help='Redirect the canonical project for comparison')
 output.add_argument('--build-project', type=Path, help='Generate a runnable out-of-tree Xcode project')
@@ -33,10 +33,14 @@ vendor_digest = input_digest(manifests, sdk_inventory)
 directory = (args.build_project or args.output_dir or ROOT / "Ultracam.xcodeproj").resolve()
 private_bridge = directory / "GeneratedBridgingHeader.h" if args.build_project else None
 check_capabilities(ROOT, manifests, sdk_inventory)
-try:
-    switcher_include = "$(SRCROOT)/" + (auto_switcher_source(ROOT) / "include").relative_to(ROOT).as_posix()
-except ValueError as error:
-    parser.exit(1, f'{error}\n')
+if args.build_project:
+    try:
+        switcher_includes = ["$(SRCROOT)/" + (auto_switcher_source(ROOT) / "include").relative_to(ROOT).as_posix()]
+    except ValueError as error:
+        parser.exit(1, f'{error}\n')
+else:
+    # The checked-in project must work with either layout and regenerate identically on CI.
+    switcher_includes = [f"$(SRCROOT)/{location}/include" for location in AUTO_SWITCHER_LOCATIONS]
 if args.output_dir is None or args.bridge_output is not None:
     generate_bridge(ROOT, manifests, private_bridge or args.bridge_output)
 
@@ -119,10 +123,13 @@ def project_path(path):
     return path if Path(path).is_absolute() else "$(SRCROOT)/" + path
 
 
-auto_switcher_lib_dir = os.environ.get(
-    "AUTO_SWITCHER_LIB_DIR",
-    str(work_paths(ROOT)["build_root"] / "auto-switcher-target/release"),
-)
+auto_switcher_lib_dir = os.environ.get("AUTO_SWITCHER_LIB_DIR")
+if auto_switcher_lib_dir is None:
+    if args.build_project or "ULTRACAM_WORK_ROOT" in os.environ:
+        auto_switcher_lib_dir = str(work_paths(ROOT)["build_root"] / "auto-switcher-target/release")
+    else:
+        # Keep canonical generation independent of the resolved .build symlink.
+        auto_switcher_lib_dir = f"$(SRCROOT)/.build/{LAYOUT['build_root']}/auto-switcher-target/release"
 if "$(" not in auto_switcher_lib_dir:
     library_path = Path(auto_switcher_lib_dir).expanduser().resolve(strict=False)
     permitted_root = ROOT if library_path.is_relative_to(ROOT) else work_paths(ROOT)["work_root"]
@@ -202,7 +209,7 @@ def target(key, name, sources, product, product_type, bundle_id, plist, entitlem
                        DEBUG_INFORMATION_FORMAT="dwarf-with-dsym")
         settings.update(ASSETCATALOG_COMPILER_APPICON_NAME="AppIcon",
                         SWIFT_OBJC_BRIDGING_HEADER=str(private_bridge) if private_bridge else "Sources/DeviceAPI/GeneratedBridgingHeader.h",
-                        HEADER_SEARCH_PATHS=["$(inherited)", switcher_include]
+                        HEADER_SEARCH_PATHS=["$(inherited)", *switcher_includes]
                         + [project_path(path) for path in vendor_settings['headerSearchPaths']],
                         LIBRARY_SEARCH_PATHS=["$(inherited)", auto_switcher_lib_dir] + [project_path(path) for path in vendor_settings['librarySearchPaths']],
                         OTHER_LDFLAGS=["$(inherited)", "-lauto_switcher", "-lc++", "-lz", "-liconv",

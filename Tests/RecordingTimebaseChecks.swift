@@ -48,6 +48,28 @@ import XCTest
     XCTAssertEqual(mapper.diagnostics.rejectedSamples, 1)
   }
 
+  func testSampleEndMustFitAtTheFixedTrackTimescale() throws {
+    let scale: CMTimeScale = 240_000
+    let duration = CMTime(value: 2, timescale: scale)
+    let exact = try RecordingTimebase.Configuration(frameRate: .constant(duration),
+      declaredTimebases: [scale])
+    let quantized = try RecordingTimebase.Configuration(
+      frameRate: .variable(nominal: duration, shortest: duration, longest: duration),
+      declaredTimebases: nil, quantizationPolicy: .nearest240000)
+    for config in [exact, quantized] {
+      var mapper = try RecordingTimebase(configuration: config, origin: .zero)
+      _ = try mapper.append(pts: .zero, duration: duration)
+      XCTAssertThrowsError(try mapper.append(pts: CMTime(value: Int64.max - 1, timescale: scale),
+        duration: duration)) { error in
+        XCTAssertEqual(error as? RecordingTimebase.Failure, .unrepresentableTime)
+      }
+      let last = try mapper.append(pts: CMTime(value: Int64.max - 2, timescale: scale), duration: duration)
+      XCTAssertEqual(CMTimeAdd(last.presentationTime, last.duration), CMTime(value: Int64.max, timescale: scale))
+      XCTAssertEqual(mapper.diagnostics.acceptedSamples, 2)
+      XCTAssertEqual(mapper.diagnostics.rejectedSamples, 1)
+    }
+  }
+
   func testLongVFRRoundsAbsoluteOffsetsWithoutAccumulatedDrift() throws {
     let vfr = FrameRate.variable(nominal: CMTime(value: 1001, timescale: 30000), shortest: CMTime(value: 1, timescale: 1000000), longest: CMTime(value: 1, timescale: 10))
     let config = try RecordingTimebase.Configuration(frameRate: vfr, declaredTimebases: nil, quantizationPolicy: .nearest240000)

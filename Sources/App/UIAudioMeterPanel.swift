@@ -42,8 +42,9 @@ struct UIAudioMeterPanel: View {
         // A new capture (camera removed and added again) is a new tap: a new view pairs attach and detach.
         UIAudioMeterTapView(tap: tap, present: levels.present, name: name).id(tap.identity)
       } else {
-        LevelMeterView(snapshot: levels.meterSnapshot, style: .full, present: levels.present, name: name,
-          channelLabels: UIChannelLabels.labels(levels.meterSnapshot.channelCount))
+        let snapshot = levels.meterSnapshot
+        LevelMeterView(snapshot: snapshot, style: .full, present: levels.present, name: name,
+          channelLabels: UIChannelLabels.labels(snapshot.channelCount))
       }
     }
     .frame(height: 210)
@@ -115,7 +116,8 @@ struct UILiveAudioMeter: View {
         .id(tap.identity)
     } else {
       let snapshot = audio.meterSnapshot
-      let count = channels?.count(detected: AudioMeterTap.channelsWithSignal(snapshot), available: snapshot.channelCount)
+      let detected = channels == .asDetected ? AudioMeterTap.channelsWithSignal(snapshot) : 0
+      let count = channels?.count(detected: detected, available: snapshot.channelCount)
       let shown = count.map { UIAudioMeterSubset.snapshot(snapshot, channels: $0) } ?? snapshot
       LevelMeterView(snapshot: shown, style: style, present: audio.present, name: name,
         channelLabels: UIChannelLabels.labels(shown.channelCount, of: snapshot.channelCount))
@@ -189,7 +191,7 @@ private struct UILiveAudioMeterTapView: View {
       let count = channels.count(detected: tap.detectedChannels, available: full.configuration.channelCount)
       if let subset = tap.displayMeter(channels: count) {
         shown = subset
-        hidden = AudioMeterTap.hiddenOver(full.snapshot(), from: count)
+        if style == .strip { hidden = AudioMeterTap.hiddenOver(full.snapshot(), from: count) }
       }
     }
     if displayedMeter !== shown { displayedMeter = shown }

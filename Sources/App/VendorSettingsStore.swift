@@ -64,8 +64,9 @@ typealias VendorSettingsSnapshot = VendorSettingsPolicy
     }
     /// Refresh capabilities as the editor opens or capture releases the device.
     func refresh(deviceID: String, pluginID: String) async {
+        guard let plugin = plugin(for: deviceID, pluginID: pluginID) else { return }
         let state = state(for: deviceID)
-        guard !closed, !state.busy, let plugin = plugins[pluginID] else { return }
+        guard !state.busy else { return }
         let generation = self.generation
         state.busy = true
         defer { if valid(generation) { state.busy = false } }
@@ -79,8 +80,9 @@ typealias VendorSettingsSnapshot = VendorSettingsPolicy
     }
 
     func restore(deviceID: String, pluginID: String) async {
+        guard let plugin = plugin(for: deviceID, pluginID: pluginID) else { return }
         let state = state(for: deviceID)
-        guard !closed, !state.busy, let plugin = plugins[pluginID] else { return }
+        guard !state.busy else { return }
         let generation = self.generation
         state.busy = true; state.message = nil
         defer { if valid(generation) { state.busy = false } }
@@ -90,42 +92,62 @@ typealias VendorSettingsSnapshot = VendorSettingsPolicy
             state.settings = settings
             let inherited = policy.inheritedByPlugin[pluginID] ?? [:]
             let desired = policy.desiredByDevice[deviceID] ?? [:]
-            var verified: [String: VendorSettingValue] = [:]
+            var verified: [(id: String, value: VendorSettingValue)] = []
             var visited: Set<String> = []
             var errors: [String] = []
-            while let setting = state.settings.first(where: {
-                !visited.contains($0.id) && (desired[$0.id] != nil || inherited[$0.id] != nil)
-            }) {
+            var snapshotCurrent = true
+            func pending(_ setting: VendorSetting) -> Bool {
+                !visited.contains(setting.id) && (desired[setting.id] != nil || inherited[setting.id] != nil)
+            }
+            // A capture format can change the choices offered by other controls.
+            // Plugins may present those controls ahead of the format in their editor.
+            while let setting = state.settings.first(where: { $0.captureFormats != nil && pending($0) })
+                ?? state.settings.first(where: pending) {
                 visited.insert(setting.id)
                 guard let value = desired[setting.id] ?? inherited[setting.id] else { continue }
                 do {
                     try value.validate()
                     if value != setting.value || setting.applicationError != nil {
-                        try validate(value, setting: setting)
-                        try await plugin.apply(value, to: setting.id, deviceID: deviceID)
+                        try setting.validate(value)
+                        snapshotCurrent = false
+                        var writeError: (any Error)?
+                        do { try await plugin.apply(value, to: setting.id, deviceID: deviceID) }
+                        catch { writeError = error }
                         guard valid(generation), !Task.isCancelled else { return }
                         let fresh = try await plugin.settings(deviceID: deviceID)
                         guard valid(generation), !Task.isCancelled else { return }
                         state.settings = fresh
+                        snapshotCurrent = true
+                        if let writeError { throw writeError }
                     }
                     try verify(value, settingID: setting.id, settings: state.settings)
-                    verified[setting.id] = value
+                    verified.append((setting.id, value))
                 } catch {
                     guard valid(generation), !Task.isCancelled else { return }
                     errors.append(error.localizedDescription)
+                    if !snapshotCurrent { break }
                 }
             }
-            if !errors.isEmpty { state.message = errors.joined(separator: "\n") }
-            if !verified.isEmpty {
-                var next = policy
-                for (id, value) in verified { next.desiredByDevice[deviceID, default: [:]][id] = value }
-                try persist(next)
+            guard snapshotCurrent else {
+                state.message = errors.joined(separator: "\n")
+                return
             }
+            var next = policy
+            for (id, value) in verified {
+                do {
+                    // Later setting changes can override an earlier acknowledgement.
+                    try verify(value, settingID: id, settings: state.settings)
+                    next.desiredByDevice[deviceID, default: [:]][id] = value
+                } catch { errors.append(error.localizedDescription) }
+            }
+            if !errors.isEmpty { state.message = errors.joined(separator: "\n") }
+            if next != policy { try persist(next) }
         } catch { if valid(generation), !Task.isCancelled { state.message = error.localizedDescription } }
     }
     func apply(_ value: VendorSettingValue, to settingID: String, deviceID: String, pluginID: String) async {
+        guard let plugin = plugin(for: deviceID, pluginID: pluginID) else { return }
         let state = state(for: deviceID)
-        guard !closed, !state.busy, let plugin = plugins[pluginID] else { return }
+        guard !state.busy else { return }
         let generation = self.generation
         state.busy = true; state.message = nil
         defer { if valid(generation) { state.busy = false } }
@@ -133,7 +155,7 @@ typealias VendorSettingsSnapshot = VendorSettingsPolicy
             guard let setting = state.settings.first(where: { $0.id == settingID }) else {
                 throw PluginError.unsupported("This device does not expose that setting")
             }
-            try validate(value, setting: setting)
+            try setting.validate(value)
             if value != setting.value || setting.applicationError != nil {
                 try await plugin.apply(value, to: settingID, deviceID: deviceID)
                 guard valid(generation), !Task.isCancelled else { return }
@@ -152,6 +174,11 @@ typealias VendorSettingsSnapshot = VendorSettingsPolicy
         closed = true; generation &+= 1; policy = .init()
         for state in states.values { state.settings = []; state.busy = false; state.message = nil }
     }
+    private func plugin(for deviceID: String, pluginID: String) -> (any VendorSettingsProviding)? {
+        guard !closed, !Task.isCancelled, (try? VendorRegistry.pluginID(for: deviceID)) == pluginID,
+            let plugin = plugins[pluginID], plugin.descriptor.id == pluginID else { return nil }
+        return plugin
+    }
     private func valid(_ generation: UInt64) -> Bool { !closed && generation == self.generation }
     private func persist(_ next: VendorSettingsPolicy) throws {
         guard !closed else { throw PluginError.invalidState("Vendor settings store is closed") }
@@ -166,33 +193,5 @@ typealias VendorSettingsSnapshot = VendorSettingsPolicy
         guard setting?.value == value else {
             throw PluginError.failed("The device did not confirm the requested setting")
         }
-    }
-    private func validate(_ value: VendorSettingValue, setting: VendorSetting) throws {
-        try value.validate()
-        guard setting.mutable else { throw PluginError.unsupported(setting.availabilityReason ?? "Setting is read-only") }
-        if let formats = setting.captureFormats {
-            if value == VendorCaptureMode.automatic { return }
-            guard let mode = VendorCaptureMode(selection: value), let format = formats.first(where: { $0.id == mode.formatID }) else {
-                throw PluginError.unsupported("The requested capture format is unavailable")
-            }
-            guard format.supports(mode.duration) else {
-                throw PluginError.unsupported("The requested frame rate is outside this format’s supported ranges")
-            }
-            return
-        }
-        let allowed: Bool
-        switch (setting.allowedValues, value) {
-        case (.unrestricted, _):
-            switch (setting.value, value) {
-            case (.boolean, .boolean), (.signed, .signed), (.unsigned, .unsigned), (.decimal, .decimal), (.text, .text), (.choice, .choice): allowed = true
-            default: allowed = false
-            }
-        case (.choices(let choices), .choice(let id)): allowed = choices.contains { $0.id == id }
-        case (.signed(let range), .signed(let number)): allowed = range.contains(number)
-        case (.unsigned(let range), .unsigned(let number)): allowed = range.contains(number)
-        case (.decimal(let range), .decimal(let number)): allowed = range.contains(number)
-        default: allowed = false
-        }
-        guard allowed else { throw PluginError.unsupported("Setting value is outside the supported values") }
     }
 }

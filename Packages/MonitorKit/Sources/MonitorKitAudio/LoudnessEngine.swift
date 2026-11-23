@@ -435,6 +435,9 @@ final class LoudnessEngine {
     energies.update(repeating: 0, count: max(activeCount, 1))
     if state.pointee.measuring { state.pointee.frames -= partial }
     state.pointee.tickPosition = 0
+    // A mid-tick reset excluded the unfinished tick from the new maxima.
+    // Flushing discards it, so the next complete tick counts immediately.
+    if state.pointee.resetTicks < 0 { state.pointee.resetTicks = 0 }
     state.pointee.readings.duration = Double(state.pointee.frames) / sampleRate
   }
 

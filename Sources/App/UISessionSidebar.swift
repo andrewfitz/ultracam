@@ -76,23 +76,18 @@ struct UIInterruptedTakesSheet: View {
 
   var body: some View {
     VStack(alignment: .leading, spacing: 12) {
-      Text("Interrupted Takes").font(.uiTitle)
+      Text("Interrupted Takes").font(.uiTitle).accessibilityAddTraits(.isHeader)
       if session.interruptedTakes.isEmpty {
         Text("No interrupted takes were found in the saved folders.").font(.uiRow).foregroundStyle(.secondary)
-      }
-      ForEach(session.interruptedTakes) { take in
-        HStack(spacing: 8) {
-          Image(systemName: UISymbol.take).foregroundStyle(.secondary).accessibilityHidden(true)
-          Text(take.title).font(.uiRow).lineLimit(1).truncationMode(.middle).help(take.title)
-          Spacer(minLength: 4)
-          if session.recoveringID == take.id {
-            ProgressView().controlSize(.small).accessibilityLabel("Recovering")
-          } else {
-            Button("Recover") { context.send(.recover(id: take.id)) }
-              .controlSize(.small)
-              .disabled(session.recoveringID != nil)
+      } else {
+        ViewThatFits(in: .vertical) {
+          takeRows
+          ScrollView {
+            takeRows
+              .padding(.trailing, 8)
           }
         }
+        .frame(maxHeight: 240)
       }
       Text(session.recoveryMessage ?? "Recovery copies complete fragments into a separate _Recovered.mov without re-encoding and keeps the original.")
         .font(.uiMeta).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
@@ -106,6 +101,26 @@ struct UIInterruptedTakesSheet: View {
     }
     .padding(20)
     .frame(width: 460, alignment: .leading)
+  }
+
+  private var takeRows: some View {
+    VStack(alignment: .leading, spacing: 8) {
+      ForEach(session.interruptedTakes) { take in
+        HStack(spacing: 8) {
+          Image(systemName: UISymbol.take).foregroundStyle(.secondary).accessibilityHidden(true)
+          Text(take.title).font(.uiRow).lineLimit(1).truncationMode(.middle).help(take.title)
+          Spacer(minLength: 4)
+          if session.recoveringID == take.id {
+            ProgressView().controlSize(.small).accessibilityLabel("Recovering \(take.title)")
+          } else {
+            Button("Recover") { context.send(.recover(id: take.id)) }
+              .controlSize(.small)
+              .disabled(session.recoveringID != nil)
+              .accessibilityLabel("Recover \(take.title)")
+          }
+        }
+      }
+    }
   }
 }
 

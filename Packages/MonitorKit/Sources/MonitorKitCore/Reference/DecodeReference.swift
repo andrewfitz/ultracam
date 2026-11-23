@@ -26,16 +26,18 @@ public enum DecodeReference {
     vertical: ChromaVerticalSiting = .center
   ) -> (x0: Int, x1: Int, fx: Double, y0: Int, y1: Int, fy: Double) {
     guard subsampling != .s444 else { return (x, x, 0, y, y, 0) }
-    let cw = (width + 1) / 2
-    let cx = (Double(x) - (siting == .center ? 0.5 : 0)) / 2
-    let fx0 = cx.rounded(.down)
-    let x0 = min(max(Int(fx0), 0), cw - 1), x1 = min(max(Int(fx0) + 1, 0), cw - 1)
-    guard subsampling == .s420 else { return (x0, x1, cx - fx0, y, y, 0) }
-    let ch = (height + 1) / 2
-    let cy = (Double(y) - 0.5 - vertical.offset) / 2
-    let fy0 = cy.rounded(.down)
-    let y0 = min(max(Int(fy0), 0), ch - 1), y1 = min(max(Int(fy0) + 1, 0), ch - 1)
-    return (x0, x1, cx - fx0, y0, y1, cy - fy0)
+    func taps(_ pixel: Int, count: Int, site: Double) -> (Int, Int, Double) {
+      // Halve the integer coordinate first so the phase survives past Double's
+      // exact integer range. An arithmetic shift rounds negative pixels down.
+      let phase = (Double(pixel & 1) - site) / 2
+      let lower = (pixel >> 1) - (phase < 0 ? 1 : 0)
+      let last = (max(1, count) - 1) / 2
+      return (min(max(lower, 0), last), min(max(lower + 1, 0), last), phase < 0 ? phase + 1 : phase)
+    }
+    let (x0, x1, fx) = taps(x, count: width, site: siting == .center ? 0.5 : 0)
+    guard subsampling == .s420 else { return (x0, x1, fx, y, y, 0) }
+    let (y0, y1, fy) = taps(y, count: height, site: 0.5 + vertical.offset)
+    return (x0, x1, fx, y0, y1, fy)
   }
 
   /// Native normalized log code (code / 1023) of a code-valued curve (S-Log3)

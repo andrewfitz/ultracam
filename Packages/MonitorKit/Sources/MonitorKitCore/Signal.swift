@@ -45,6 +45,10 @@ public enum PixelLayout: Hashable, Codable, Sendable {
     }
   }
 
+  /// Normalized float RGB uses a full-range 10-bit container for log math and code labels.
+  package var codeBitDepth: Int { isFloat ? 10 : bitDepth }
+  package func effectiveRange(_ declared: CodeRange) -> CodeRange { isFloat ? .full : declared }
+
   public var subsampling: ChromaSubsampling {
     switch self {
     case .v210, .uyvy8, .yuyv8: return .s422
@@ -118,22 +122,23 @@ public enum LogCurve: String, Codable, Sendable, CaseIterable {
 
   /// Normalized native code (code / 1023) to scene-linear reflectance.
   public func decode(_ native: Double) -> Double? {
+    guard native.isFinite else { return nil }
+    let value: Double
     switch self {
     case .sLog3: return ColorMath.sLog3Decode(native)
     case .arriLogC3:
       // ARRI LogC3 EI800 (ALEXA, 2017 white paper).
-      guard native.isFinite else { return nil }
       let cut = 0.010591, a = 5.555556, b = 0.052272, c = 0.247190, d = 0.385537
       let e = 5.367655, f = 0.092809
-      return native > e * cut + f ? (pow(10, (native - d) / c) - b) / a : (native - f) / e
+      value = native > e * cut + f ? (pow(10, (native - d) / c) - b) / a : (native - f) / e
     case .arriLogC4:
       // ARRI LogC4 (ALEXA 35 specification, 2022).
-      guard native.isFinite else { return nil }
       let a = (pow(2.0, 18) - 16) / 117.45, b = (1023 - 95) / 1023.0, c = 95 / 1023.0
       let s = (7 * log(2.0) * pow(2.0, 7 - 14 * c / b)) / (a * b)
       let t = (pow(2.0, 14 * (-c / b) + 6) - 64) / a
-      return native >= 0 ? (pow(2, 14 * (native - c) / b + 6) - 64) / a : native * s + t
+      value = native >= 0 ? (pow(2, 14 * (native - c) / b + 6) - 64) / a : native * s + t
     }
+    return value.isFinite ? value : nil
   }
 }
 

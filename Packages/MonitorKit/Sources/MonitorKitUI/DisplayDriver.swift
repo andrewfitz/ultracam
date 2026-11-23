@@ -26,8 +26,8 @@ public struct MonitorDrawableContext {
   /// What the layer is tagged with: the view's `layerColorOverride`, else what the
   /// renderer resolved from the scene.
   public let layerColor: MonitorLayerColor
-  /// Whether the scene changed since the renderer last encoded. A host that
-  /// draws only the scene can return false when it is not.
+  /// Whether this target needs a draw. An offscreen encode leaves the next
+  /// drawable due for presentation even when its dimensions match.
   public let needsDisplay: Bool
   /// Where the host reports its finished GPU work, from any thread.
   public let completion: MonitorCompletionReporter
@@ -135,29 +135,31 @@ final class MonitorDisplayDriver: NSObject, CAMetalDisplayLinkDelegate, @uncheck
   /// The link's run loop (thread-safe to perform on and wake).
   nonisolated(unsafe) let linkRunLoop: CFRunLoop
   private let linkIsMain: Bool
-  /// Convenience mode: one committed command buffer watched through `status`,
-  /// with the renderer's encode it carried (the last buffer of that encode).
-  /// Buffers of a queue complete in commit order, so once it completed every
-  /// earlier encode has too: replaced frames go a frame or two after their GPU
-  /// work, with no handler, event or allocation per frame, and no more than one
-  /// buffer held back from Metal's reuse.
-  private(set) var probe: MTLCommandBuffer?
-  private var probeEncode: UInt64 = 0
-  /// The probe is an idle marker, whose completion handler releases again.
-  private var probeIsMarker = false
-  /// The last encode a completed probe vouched for.
-  private var vouched: UInt64 = 0
+  private var lastOwnEncode: UInt64 = 0
+  private var idleMarkerEncode: UInt64 = 0
+  /// Both halves of a split draw carry the same index. Caller-owned buffers
+  /// can commit in any order, including after newer own-queue buffers.
+  private var pendingCommands: [(buffer: MTLCommandBuffer, encode: UInt64, onOwnQueue: Bool)] = []
+  /// The last tracked buffer, for diagnostics of split draws.
+  var lastTrackedBuffer: MTLCommandBuffer? { pendingCommands.last?.buffer }
+  // Only caller-supplied snapshot buffers need an independent completion
+  // wakeup. The live display path watches its own queue without a handler.
+  private let callerFrames = CallerFrames()
+  private lazy var callerCompletion: MTLCommandBufferHandler = { [weak self, callerFrames] _ in
+    withExtendedLifetime(callerFrames) {
+      guard let self, self.isIdle else { return }
+      self.performOnLink { self.releaseIdle() }
+    }
+  }
+  private final class CallerFrames: Sendable {
+    let frames = Mutex<[MonitorFrame]>([])
+  }
+  /// An offscreen encode updated the renderer's key without presenting it.
+  private var needsPresentation = false
   /// The scope buffer the last own-queue draw committed after its pictures' (for tests).
   private(set) var lastScopeBuffer: ObjectIdentifier?
   /// Host-driven completions, reported from any thread.
   let completion = MonitorCompletionReporter()
-  /// An encode into a caller's command buffer (`drawOffscreen`) the probe cannot
-  /// vouch for: completions are reported below it until the renderer's own
-  /// window has passed it.
-  private var unvouched: UInt64 = 0
-  /// Keep the first incomplete caller encode as the completion barrier, but
-  /// measure the renderer's fallback window from the most recent one.
-  private var lastUnvouched: UInt64 = 0
   private let lock = NSLock()
   private var appliedLayerColor: MonitorLayerColor?
   /// A host-driven view's own tag, instead of the scene's.
@@ -201,7 +203,29 @@ final class MonitorDisplayDriver: NSObject, CAMetalDisplayLinkDelegate, @uncheck
       hostEncode = encode
     }
     super.init()
+    pendingCommands.reserveCapacity(max(8, renderer.engine.framesInFlight * 2))
+    if hostEncode == nil { renderer.usesExplicitClassicCompletion = true }
     completion.driver = self
+  }
+
+  deinit {
+    guard !pendingCommands.isEmpty else { return }
+    let frames = renderer.uncompletedClassicFrames()
+    guard !frames.isEmpty else { return }
+    // Metal retains the textures but does not know about a frame's Core Video
+    // backing. The caller's handlers and the queue tail can outlive the view.
+    callerFrames.frames.withLock { $0 = frames }
+    if let tail = pendingCommands.last(where: {
+      guard $0.onOwnQueue else { return false }
+      let status = $0.buffer.status
+      return status != .completed && status != .error
+    })?.buffer {
+      // The buffer has already been committed. The background thread only waits.
+      nonisolated(unsafe) let committed = tail
+      DispatchQueue.global().async {
+        withExtendedLifetime(frames) { committed.waitUntilCompleted() }
+      }
+    }
   }
 
   /// Runs `body` on the link's run loop: now when called there on the main
@@ -270,9 +294,11 @@ final class MonitorDisplayDriver: NSObject, CAMetalDisplayLinkDelegate, @uncheck
     // An explicit offscreen draw is allowed while paused. It creates new GPU
     // work after the transition to idle, so arrange its completion release too.
     if drawable == nil, isIdle { releaseIdle() }
-    guard changes.status || changes.graticule || changes.error != nil, let notify else { return }
-    let status = changes.status, graticule = changes.graticule
-    let error = changes.error
+    report(status: changes.status, graticule: changes.graticule, error: changes.error)
+  }
+
+  private func report(status: Bool, graticule: Bool, error: (any Error)?) {
+    guard status || graticule || error != nil, let notify else { return }
     if Thread.isMainThread {
       MainActor.assumeIsolated { notify(status, graticule, error) }
     } else {
@@ -290,21 +316,21 @@ final class MonitorDisplayDriver: NSObject, CAMetalDisplayLinkDelegate, @uncheck
   func releaseIdle() {
     lock.lock()
     noteHostCompletion()
-    _ = noteCompletion()
-    if isIdle, let queue, !probeIsMarker, renderer.encodeCount > vouched, let marker = queue.makeCommandBuffer() {
-      // An empty buffer after the last frame: once it completes, every encode has.
+    let error = checkCommandBuffers()
+    if isIdle, let queue, !pendingCommands.isEmpty, lastOwnEncode > idleMarkerEncode,
+      let marker = queue.makeCommandBuffer() {
+      // Wake after outstanding own-queue work. Caller buffers have their own wakeup.
       marker.label = "MonitorKitUI idle marker"
       marker.addCompletedHandler { [weak self] _ in
         guard let driver = self else { return }
         driver.performOnLink { driver.releaseIdle() }
       }
       marker.commit()
-      probe = marker
-      probeEncode = renderer.encodeCount
-      probeIsMarker = true
+      idleMarkerEncode = lastOwnEncode
     }
     if isIdle { renderer.releaseIdleResources() }
     lock.unlock()
+    if let error { report(status: false, graticule: false, error: error) }
   }
 
   /// What the host reported finished, to the renderer.
@@ -313,33 +339,39 @@ final class MonitorDisplayDriver: NSObject, CAMetalDisplayLinkDelegate, @uncheck
     if done > 0 { renderer.noteCompleted(through: done) }
   }
 
-  /// The encodes the view's completed command buffers vouch for, to the renderer.
-  /// Advances renderer completion state when the probe has finished.
-  ///
-  /// Most callers only need the state transition; the tick path consumes the
-  /// optional command-buffer error to report it to the host. Marking the
-  /// result discardable keeps the idle-release path explicit without turning
-  /// an intentionally ignored error into a warnings-as-errors failure.
+  func trackCommandBuffer(_ commandBuffer: MTLCommandBuffer, onOwnQueue: Bool = false) {
+    pendingCommands.append((commandBuffer, renderer.encodeCount, onOwnQueue))
+  }
+
+  /// The status reader also lets tests exercise independent buffer failures
+  /// without deliberately faulting the GPU. Called under the driver's lock.
   @discardableResult
-  private func noteCompletion() -> (any Error)? {
-    guard let cb = probe else { return nil }
-    let status = cb.status
-    guard status == .completed || status == .error else { return nil }
-    let commandError = status == .error ? cb.error : nil
-    probe = nil
-    probeIsMarker = false
-    vouched = probeEncode
-    var done = probeEncode
-    if unvouched > 0 {
-      let window = UInt64(max(3, renderer.engine.framesInFlight))
-      if renderer.encodeCount >= lastUnvouched &+ window {
-        unvouched = 0
-      } else {
-        done = min(done, unvouched - 1)
+  func checkCommandBuffers(
+    status: (MTLCommandBuffer) -> MTLCommandBufferStatus = { $0.status }
+  ) -> (any Error)? {
+    guard !pendingCommands.isEmpty else { return nil }
+    var failure: (any Error)?
+    var invalidated = false
+    var completedThrough = renderer.encodeCount
+    var held = 0
+    var i = 0
+    while i < pendingCommands.count {
+      let (commandBuffer, index, _) = pendingCommands[i]
+      let state = status(commandBuffer)
+      if state == .error {
+        invalidated = true
+        if failure == nil { failure = commandBuffer.error }
+      } else if state != .completed {
+        completedThrough = min(completedThrough, index > 0 ? index - 1 : 0)
+        if held != i { pendingCommands[held] = pendingCommands[i] }
+        held += 1
       }
+      i += 1
     }
-    renderer.noteCompleted(through: done)
-    return commandError
+    pendingCommands.removeLast(pendingCommands.count - held)
+    if invalidated { renderer.invalidateGPUResults() }
+    renderer.noteCompleted(through: completedThrough)
+    return failure
   }
 
   /// The tick's work under `lock`; returns whether a status or a graticule changed.
@@ -350,9 +382,10 @@ final class MonitorDisplayDriver: NSObject, CAMetalDisplayLinkDelegate, @uncheck
     renderer.pixelsPerPoint = pixelsPerPoint
     renderer.displayHeadroom = headroom
     noteHostCompletion()
-    let commandError = noteCompletion()
-    do { try renderer.update() } catch { return (false, false, error) }
-    if let commandError { return (false, false, commandError) }
+    let commandError = checkCommandBuffers()
+    do { try renderer.update(width: texture.width, height: texture.height) } catch { return (false, false, error) }
+    let needs = (drawable != nil && needsPresentation)
+      || renderer.needsDisplay(width: texture.width, height: texture.height, pixelFormat: texture.pixelFormat)
     let wanted = override.withLock { $0 } ?? renderer.layerColor
     if appliedLayerColor != wanted {
       applyLayerColor(wanted)
@@ -361,22 +394,26 @@ final class MonitorDisplayDriver: NSObject, CAMetalDisplayLinkDelegate, @uncheck
       if drawable != nil {
         skips.add(1, ordering: .relaxed)
         renderer.setNeedsDisplay()
-        return (false, false, nil)
+        return (false, false, commandError)
       }
     }
-    let needs = renderer.needsDisplay(width: texture.width, height: texture.height, pixelFormat: texture.pixelFormat)
+    let drew: Bool
     if let hostEncode {
       let context = MonitorDrawableContext(
         drawable: drawable, texture: texture, renderer: renderer, targetPresentationTimestamp: timestamp,
         pixelsPerPoint: pixelsPerPoint, headroom: renderer.headroom, layerColor: wanted, needsDisplay: needs,
         completion: completion)
-      if hostEncode(context) { draws.add(1, ordering: .relaxed) } else { skips.add(1, ordering: .relaxed) }
-    } else if (needs || drawable == nil) && draw(texture: texture, drawable: drawable, commandBuffer: commandBuffer) {
+      drew = hostEncode(context)
+    } else {
+      drew = (needs || drawable == nil) && draw(texture: texture, drawable: drawable, commandBuffer: commandBuffer)
+    }
+    if drew {
+      needsPresentation = drawable == nil
       draws.add(1, ordering: .relaxed)
     } else {
       skips.add(1, ordering: .relaxed)
     }
-    return (renderer.takeStatusChanges(), renderer.takeGraticuleChanges(), nil)
+    return (renderer.takeStatusChanges(), renderer.takeGraticuleChanges(), commandError)
   }
 
   /// A drawable on the view's own queue: the pictures in one command buffer,
@@ -387,14 +424,17 @@ final class MonitorDisplayDriver: NSObject, CAMetalDisplayLinkDelegate, @uncheck
   /// into a caller's buffer, all of it there.
   private func draw(texture: MTLTexture, drawable: (any CAMetalDrawable)?, commandBuffer: MTLCommandBuffer?) -> Bool {
     if let commandBuffer {
+      // A throw may follow partial encoding. Track that work as well.
+      defer {
+        trackCommandBuffer(commandBuffer)
+        commandBuffer.addCompletedHandler(callerCompletion)
+      }
       do {
         try renderer.encode(target: texture, into: commandBuffer)
       } catch {
         return false
       }
       if let drawable { commandBuffer.present(drawable) }
-      if unvouched == 0 { unvouched = renderer.encodeCount }
-      lastUnvouched = renderer.encodeCount
       return true
     }
     guard let queue, let cb = queue.makeCommandBuffer() else { return false }
@@ -411,18 +451,14 @@ final class MonitorDisplayDriver: NSObject, CAMetalDisplayLinkDelegate, @uncheck
       drew = false
     }
     cb.commit()
-    var last = cb
+    trackCommandBuffer(cb, onOwnQueue: true)
+    lastOwnEncode = renderer.encodeCount
     lastScopeBuffer = nil
     if drawable != nil, renderer.scopesDue, let scopes = queue.makeCommandBuffer() {
       renderer.encodeScopes(into: scopes)
       scopes.commit()
-      last = scopes
+      trackCommandBuffer(scopes, onOwnQueue: true)
       lastScopeBuffer = ObjectIdentifier(scopes)
-    }
-    // The last buffer of the encode: the scope buffer reads its frames too.
-    if probe == nil {
-      probe = last
-      probeEncode = renderer.encodeCount
     }
     return drew
   }

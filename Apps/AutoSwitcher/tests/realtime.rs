@@ -132,6 +132,42 @@ fn pcm_stdout_only_still_applies_each_simulated_cut() {
 }
 
 #[test]
+fn talking_head_safety_floor_preserves_profile_validation() {
+    let dir = tempfile::tempdir().unwrap();
+    let profile = dir.path().join("profile.json");
+    let events = dir.path().join("events.jsonl");
+    std::fs::write(&events, "").unwrap();
+    for (minimum, valid) in [(-1, false), (0, true)] {
+        std::fs::write(
+            &profile,
+            serde_json::json!({
+                "anchor_camera_id": "A",
+                "emphasis_camera_id": "B",
+                "minimum_shot_duration": minimum,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_auto-switcher"))
+            .args(["offline", "--output", "-", "--config"])
+            .arg(&profile)
+            .arg("--events")
+            .arg(&events)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.success(), valid);
+        if valid {
+            let timeline: SessionTimeline = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(timeline.config.minimum_shot_duration, 10.0);
+        } else {
+            assert!(String::from_utf8(output.stderr)
+                .unwrap()
+                .contains("minimum_shot_duration"));
+        }
+    }
+}
+
+#[test]
 fn jsonl_cue_that_overflows_float_does_not_corrupt_the_ledger() {
     let (timeline, _) = realtime(
         "jsonl",

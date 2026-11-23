@@ -193,6 +193,29 @@ struct SonyPluginChecks {
     failedBridge.failConnect = false
     try await failedPlugin.connect(feedID: "replacement", generation: 2, camera: camera, credentials: nil)
     try await failedPlugin.disconnect(feedID: "replacement", generation: 2)
+    let closingBridge = Bridge()
+    let closingPlugin = SonyControlPlugin(backend: closingBridge)
+    try await closingPlugin.connect(feedID: "closing", generation: 1, camera: camera, credentials: nil)
+    closingBridge.holdCleanup = true
+    let disconnecting = Task { try await closingPlugin.disconnect(feedID: "closing", generation: 1) }
+    for _ in 0..<1000 { if closingBridge.cleanupReply != nil { break }; await Task.yield() }
+    precondition(closingBridge.cleanupReply != nil)
+    let shuttingDown = Task { try await closingPlugin.shutdown() }
+    var admissionClosed = false
+    for _ in 0..<1000 {
+      do { _ = try await closingPlugin.discover() }
+      catch let error as ControlError {
+        if error.code == .invalidState { admissionClosed = true; break }
+        precondition(error.code == .unavailable)
+      }
+      await Task.yield()
+    }
+    precondition(admissionClosed)
+    closingBridge.cleanupReply?("[]", nil)
+    closingBridge.cleanupReply = nil
+    try await disconnecting.value
+    try await shuttingDown.value
+    precondition(closingBridge.calls == ["connect", "disconnect"], "Shutdown must preserve an acknowledged in-flight disconnect")
     let mutable = Bridge()
     mutable.cacheAddress = "192.0.2.1"
     let pinnedPlugin = SonyControlPlugin(backend: mutable)
@@ -266,11 +289,19 @@ struct SonyPluginChecks {
     [{"id":"monitoringDisplayHDMI","title":"HDMI","code":2,"value":2,"writable":true,"choices":[{"value":1,"label":"Off"}]},
     {"id":"faceEyeFrameDisplay","title":"Frames","code":3,"value":2,"writable":true,"choices":[{"value":2,"label":"On"}]}]
     """
+    let constrained = try await readingsPlugin.properties(feedID: "readings", generation: 1)
+    precondition(constrained.first { $0.id == "cameraDisplay" }?.writable == false,
+      "Only offer the HDMI toggle when the whole group accepts the opposite value")
     do {
       try await readingsPlugin.set("cameraDisplay", value: .boolean(false), feedID: "readings", generation: 1)
       preconditionFailure("Unavailable grouped display value was accepted")
     } catch let error as ControlError { precondition(error.code == .invalidRequest) }
     precondition(readings.setCalls == 0, "Validate the entire grouped display change before writing any setting")
+    readings.json = """
+    [{"id":"monitoringDisplayHDMI","title":"HDMI","code":2,"value":0,"writable":false,"choices":[]}]
+    """
+    let unknown = try await readingsPlugin.properties(feedID: "readings", generation: 1)
+    precondition(!unknown.contains { $0.id == "cameraDisplay" }, "An unknown HDMI state must not appear as Off")
     try await readingsPlugin.disconnect(feedID: "readings", generation: 1)
     print("Sony plugin checks passed")
   }

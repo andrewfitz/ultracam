@@ -56,6 +56,30 @@ import XCTest
     queue.sync { XCTAssertEqual(ready, 1) }
   }
 
+  func testChangedFormatReplacesPendingAndCachedImages() throws {
+    let queue = DispatchQueue(label: "standby.lifecycle.format-change")
+    let pending = Pending()
+    let lifecycle = GPUStandbyLifecycle(queue: queue, submit: pending.submit) {}
+    let a = try VideoContract.formatDescription(width: 64, height: 32, pixelFormat: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+    let b = try VideoContract.formatDescription(width: 128, height: 64, pixelFormat: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+    queue.sync {
+      XCTAssertNil(lifecycle.image(for: a))
+      XCTAssertNil(lifecycle.image(for: b))
+      XCTAssertEqual(pending.callbacks.count, 1)
+    }
+    pending.callbacks[0](.success(try image(a)))
+    try queue.sync {
+      XCTAssertNil(lifecycle.image(for: b))
+      let callback = try XCTUnwrap(pending.callbacks.dropFirst().first)
+      callback(.success(try image(b)))
+    }
+    queue.sync {
+      XCTAssertNotNil(lifecycle.image(for: b))
+      XCTAssertNil(lifecycle.image(for: a))
+      XCTAssertEqual(pending.callbacks.count, 3)
+    }
+  }
+
   func testRapidFormatGenerationsKeepOnlyOneSubmittedFillAndCoalesceLatest() throws {
     let queue = DispatchQueue(label: "standby.lifecycle.bounded-generations")
     let pending = Pending()

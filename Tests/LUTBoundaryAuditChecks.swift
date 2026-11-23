@@ -126,12 +126,16 @@ import XCTest
       range: .video, horizontalChromaSiting: .left, verticalChromaSiting: .center)
     CVBufferSetAttachment(source, kCVImageBufferMasteringDisplayColorVolumeKey, Data([1,2,3]) as CFData, .shouldPropagate)
     CVBufferSetAttachment(source, kCVImageBufferContentLightLevelInfoKey, Data([4,5]) as CFData, .shouldPropagate)
+    CVBufferSetAttachment(source, kCVImageBufferAmbientViewingEnvironmentKey, Data([6,7]) as CFData, .shouldPropagate)
+    CVBufferSetAttachment(source, kCVImageBufferChromaSubsamplingKey, kCVImageBufferChromaSubsampling_422, .shouldPropagate)
     let config = PipelineConfiguration(downscale: false)
     let output = try LUTProcessor().process(source, configuration: config,
       colorConversion: .sourceToLUTInput(from: from, to: .rec709Video), destinationColorimetry: .rec709Video,
       declaredSourceColorimetry: from)
     XCTAssertNil(CVBufferCopyAttachment(output, kCVImageBufferMasteringDisplayColorVolumeKey, nil))
     XCTAssertNil(CVBufferCopyAttachment(output, kCVImageBufferContentLightLevelInfoKey, nil))
+    XCTAssertNil(CVBufferCopyAttachment(output, kCVImageBufferAmbientViewingEnvironmentKey, nil))
+    XCTAssertNil(CVBufferCopyAttachment(output, kCVImageBufferChromaSubsamplingKey, nil))
     XCTAssertEqual(try LUTProcessor.sourceColorimetry(output).transfer, .rec709)
   }
 

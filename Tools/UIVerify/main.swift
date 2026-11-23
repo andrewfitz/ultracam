@@ -53,7 +53,7 @@ import SystemExtensions
 /// and both monitors settle on the LUT. Scripted capture; no hardware.
 extension UIVerify {
   func lutReadsWithSync() throws {
-    let suiteName = "org.ultracam.ui-verify-lut-sync.\(UUID().uuidString)"
+    let suiteName = verifier.makeDefaultsDomain()
     guard let defaults = UserDefaults(suiteName: suiteName) else { verifier.check("lut sync: defaults suite", false); return }
     defer { defaults.removePersistentDomain(forName: suiteName) }
     let folder = FileManager.default.temporaryDirectory.appendingPathComponent("ui-verify-lut-sync-\(UUID().uuidString)")
@@ -160,7 +160,7 @@ extension UIVerify {
 /// and never while nothing happens. Scripted capture; no hardware.
 extension UIVerify {
   func lutReadsAreBounded() throws {
-    let suiteName = "org.ultracam.ui-verify-lut-reads.\(UUID().uuidString)"
+    let suiteName = verifier.makeDefaultsDomain()
     guard let defaults = UserDefaults(suiteName: suiteName) else { verifier.check("lut reads: defaults suite", false); return }
     defer { defaults.removePersistentDomain(forName: suiteName) }
     let folder = FileManager.default.temporaryDirectory.appendingPathComponent("ui-verify-lut-reads-\(UUID().uuidString)")
@@ -262,7 +262,7 @@ extension UIVerify {
 /// (starts succeed, no frames); no hardware.
 extension UIVerify {
   func cameraSymmetry() throws {
-    let suiteName = "org.ultracam.ui-verify-symmetry.\(UUID().uuidString)"
+    let suiteName = verifier.makeDefaultsDomain()
     guard let defaults = UserDefaults(suiteName: suiteName) else { verifier.check("symmetry: defaults suite", false); return }
     defer { defaults.removePersistentDomain(forName: suiteName) }
     let folder = FileManager.default.temporaryDirectory.appendingPathComponent("ui-verify-symmetry-\(UUID().uuidString)")
@@ -406,10 +406,8 @@ extension UIVerify {
 
   // MARK: Rendering
 
-  @discardableResult
   func render<V: View>(_ name: String, _ view: V, size: CGSize, titled: Bool = false, both: Bool = true,
-    viewDependent: Bool = true) -> [HostedView] {
-    var hosts: [HostedView] = []
+    viewDependent: Bool = true) {
     for dark in both ? [false, true] : [false] {
       let renderStart = Date()
       defer {
@@ -418,6 +416,8 @@ extension UIVerify {
         }
       }
       let hosted = HostedView(view, size: size, dark: dark, titled: titled)
+      // A second live window of the same split view renders an empty detail column.
+      defer { hosted.close() }
       let file = "\(name)-\(dark ? "dark" : "light").png"
       if let rep = hosted.render() {
         let colors = UISelfTest.distinctColors(rep)
@@ -440,12 +440,7 @@ extension UIVerify {
       } else {
         verifier.check("render \(file)", false, "no bitmap", viewDependent: viewDependent)
       }
-      // Close before the next appearance: a second live window of the same split view
-      // renders an empty detail column.
-      hosted.close()
-      hosts.append(hosted)
     }
-    return hosts
   }
 
   func mainWindow(_ context: UIContext) -> some View {
@@ -459,6 +454,9 @@ extension UIVerify {
     var camera = UIFixtures.camera(1, recording: .idle, inUse: true)
     switch state {
     case .ready: break
+    case .starting:
+      camera.recording.status = .recording
+      camera.recording.isStarting = true
     case .recording:
       camera.recording.status = .recording
       camera.recording.elapsed = 751
@@ -502,8 +500,7 @@ extension UIVerify {
       ("four-up", UIFixtures.fourUp()), ("stopped", UIFixtures.stopped()), ("problems", UIFixtures.problems())]
     for (name, session) in fixtures {
       for size in [CGSize(width: 1320, height: 860), CGSize(width: 980, height: 680)] {
-        let hosts = render("main-\(name)-\(Int(size.width))", mainWindow(.fixture(session)), size: size, titled: true)
-        hosts.forEach { $0.close() }
+        render("main-\(name)-\(Int(size.width))", mainWindow(.fixture(session)), size: size, titled: true)
       }
     }
     // The inspector is a panel of the content, so the window renders with it open: it starts
@@ -511,34 +508,30 @@ extension UIVerify {
     for size in [CGSize(width: 1320, height: 860), CGSize(width: 980, height: 680)] {
       var session = UIFixtures.programMeeting()
       session.inspectorOpen = true
-      render("main-inspector-\(Int(size.width))", mainWindow(.fixture(session)), size: size, titled: true).forEach { $0.close() }
+      render("main-inspector-\(Int(size.width))", mainWindow(.fixture(session)), size: size, titled: true)
     }
     for layout in UILayout.allCases {
       var session = UIFixtures.programMeeting()
       session.layout = layout
       render("layout-\(layout.rawValue)", mainWindow(.fixture(session)), size: CGSize(width: 1320, height: 860), titled: true)
-        .forEach { $0.close() }
     }
     var collapsed = UIFixtures.programMeeting()
     collapsed.collapsed = Set(collapsed.cameras.map(\.id))
-    render("main-collapsed", mainWindow(.fixture(collapsed)), size: CGSize(width: 1320, height: 860), titled: true).forEach { $0.close() }
+    render("main-collapsed", mainWindow(.fixture(collapsed)), size: CGSize(width: 1320, height: 860), titled: true)
     var inspector = UIFixtures.programMeeting()
     inspector.inspectorOpen = true
-    // `.inspector` inside a bare NSHostingView (no SwiftUI scene) throws during AppKit layout, so the
-    // whole-window inspector render is verified by the in-app self-test instead. RENDER_INSPECTOR=1 tries it here.
+    // Also render a larger, untitled inspector window on request.
     if ProcessInfo.processInfo.environment["RENDER_INSPECTOR"] == "1" {
       render("main-inspector", UIMainWindowView(context: .fixture(inspector)), size: CGSize(width: 1600, height: 900))
-        .forEach { $0.close() }
     }
 
     // Components
     let meeting = UIContext.fixture(UIFixtures.programMeeting())
     if let first = meeting.presentation.cameras.first {
       render("component-camera-column", UICameraColumnView(camera: first, context: meeting), size: CGSize(width: 560, height: 720))
-        .forEach { $0.close() }
     }
-    for state in [UIStripState.ready, .recording, .paused, .finishing, .saved, .noFolder, .failed, .recordingNoSignal, .stopped,
-      .waiting, .updating] {
+    for state in [UIStripState.ready, .starting, .recording, .paused, .finishing, .saved, .noFolder, .failed,
+      .recordingNoSignal, .stopped, .waiting, .updating] {
       var session = stripFixture(state)
       let derived = session.cameras.first.map(UIPresentationBuilder.stripState(for:))
       verifier.check("strip fixture derives \(state.rawValue)", derived == state, "derived \(String(describing: derived))")
@@ -547,7 +540,7 @@ extension UIVerify {
         let context = UIContext.fixture(session)
         guard let camera = context.presentation.cameras.first else { continue }
         render("strip-\(state.rawValue)\(collapsedStrip ? "-collapsed" : "")", UIChannelStripView(camera: camera, context: context),
-          size: CGSize(width: 560, height: collapsedStrip ? 52 : 230)).forEach { $0.close() }
+          size: CGSize(width: 560, height: collapsedStrip ? 52 : 230))
       }
     }
     // The header's densities, with a Cut slot: at 400 pt the Effects menu is its glyph; at 360 and
@@ -556,7 +549,7 @@ extension UIVerify {
     for camera in meeting.presentation.cameras.prefix(2) {
       for width in [400, 360, 300] {
         render("strip-narrow-\(width)-\(camera.number)", UIChannelStripView(camera: camera, context: meeting),
-          size: CGSize(width: CGFloat(width), height: 230), both: false).forEach { $0.close() }
+          size: CGSize(width: CGFloat(width), height: 230), both: false)
       }
     }
     verifier.check("strip header density follows width alone",
@@ -568,7 +561,7 @@ extension UIVerify {
     let listed = UIContext.fixture(UIFixtures.problems())
     if let segment = listed.presentation.statusSegments.first(where: { $0.kind == .warning }) {
       render("popover-status-warning", UIStatusPopover(kind: .warning, segment: segment, context: listed)
-        .fixedSize(horizontal: false, vertical: true), size: CGSize(width: 380, height: 560), both: false).forEach { $0.close() }
+        .fixedSize(horizontal: false, vertical: true), size: CGSize(width: 380, height: 560), both: false)
     }
     // The bar, the list, the placeholder and the panel, the list, the placeholder and the panel, in every state that changes
     // them. One appearance each: closed windows keep their SwiftUI graphs until the run ends,
@@ -576,17 +569,14 @@ extension UIVerify {
     for (name, session) in UIFixtures.problemSessions() {
       let context = UIContext.fixture(session)
       render("main-\(name)", mainWindow(context), size: CGSize(width: 1320, height: 860), titled: true, both: false)
-        .forEach { $0.close() }
       render("component-problem-list-\(name)", UIProblemList(problems: context.presentation.problems, context: context)
-        .padding(14).frame(width: 340, alignment: .leading), size: CGSize(width: 360, height: 480), both: false).forEach { $0.close() }
+        .padding(14).frame(width: 340, alignment: .leading), size: CGSize(width: 360, height: 480), both: false)
       if let camera = context.presentation.cameras.first {
         render("strip-\(name)", UIChannelStripView(camera: camera, context: context), size: CGSize(width: 560, height: 280), both: false)
-          .forEach { $0.close() }
       }
     }
     let lost = UIContext.fixture(UIFixtures.signalLostOnAir())
     render("component-program-view-signal-lost", UIProgramView(context: lost), size: CGSize(width: 1060, height: 800), both: false)
-      .forEach { $0.close() }
     // The strip never changes height: Cut stays where it was.
     let healthyStrip = UIContext.fixture(UIFixtures.standalone())
     let problemStrip = UIContext.fixture(UIFixtures.twoProblems())
@@ -598,10 +588,10 @@ extension UIVerify {
     }
     render("component-alert-panel", UIAlertPanelView(alert: UIPanelAlert(id: "a", title: "Camera 1 signal lost", body: "Still on Program",
       action: UIProblemAction(title: "Cut to Camera 2", action: .cut(cameraID: "camera-2"))), send: { _ in }),
-      size: UIAlertPanelController.size).forEach { $0.close() }
-    render("component-inspector", UIInspectorView(context: meeting), size: CGSize(width: 320, height: 860)).forEach { $0.close() }
-    render("component-status-bar", UIStatusBarView(context: meeting), size: CGSize(width: 1320, height: 40)).forEach { $0.close() }
-    render("component-program-view", UIProgramView(context: meeting), size: CGSize(width: 1060, height: 800)).forEach { $0.close() }
+      size: UIAlertPanelController.size)
+    render("component-inspector", UIInspectorView(context: meeting), size: CGSize(width: 320, height: 860))
+    render("component-status-bar", UIStatusBarView(context: meeting), size: CGSize(width: 1320, height: 40))
+    render("component-program-view", UIProgramView(context: meeting), size: CGSize(width: 1060, height: 800))
     // Program switching in each of its states, plus the separate recording control.
     var toolbarStates: [(String, UISessionSnapshot)] = []
     var manual = UIFixtures.standalone(); manual.strategy = .manual; manual.autoSwitching = false
@@ -615,7 +605,7 @@ extension UIVerify {
     for (name, session) in toolbarStates {
       let context = UIContext.fixture(session)
       render("component-switching-\(name)", UIProgramSwitchBar(context: context),
-        size: CGSize(width: 980, height: 44), both: false).forEach { $0.close() }
+        size: CGSize(width: 980, height: 44), both: false)
     }
     // The strip states that are new with the format and the LUT toggle.
     var fallback = UIFixtures.standalone()
@@ -627,25 +617,24 @@ extension UIVerify {
       let context = UIContext.fixture(session)
       let camera = context.presentation.cameras[index]
       render("strip-\(name)", UIChannelStripView(camera: camera, context: context), size: CGSize(width: 560, height: 230), both: false)
-        .forEach { $0.close() }
       var collapsedSession = session
       collapsedSession.collapsed = [camera.id]
       let collapsedContext = UIContext.fixture(collapsedSession)
       render("strip-\(name)-collapsed", UIChannelStripView(camera: collapsedContext.presentation.cameras[index], context: collapsedContext),
-        size: CGSize(width: 560, height: 52), both: false).forEach { $0.close() }
+        size: CGSize(width: 560, height: 52), both: false)
     }
     // A frozen picture says so at rest.
     UICleanViewState.shared.setFrozen(true, for: "camera-1")
     if let first = meeting.presentation.cameras.first {
       render("component-picture-frozen", UIColumnPictureLayout { UICameraPictureView(camera: first, context: meeting) },
-        size: CGSize(width: 560, height: 315), both: false).forEach { $0.close() }
+        size: CGSize(width: 560, height: 315), both: false)
     }
     UICleanViewState.shared.setFrozen(false, for: "camera-1")
     for kind in [UIStatusSegment.Kind.program, .recording, .output, .audio] {
       let segment = meeting.presentation.statusSegments.first { $0.kind == kind } ?? UIStatusSegment(kind: kind, text: "", tone: .neutral)
       let height: CGFloat = kind == .audio ? 640 : kind == .recording ? 420 : 300
       render("popover-status-\(kind.rawValue)", UIStatusPopover(kind: kind, segment: segment, context: meeting)
-        .fixedSize(horizontal: false, vertical: true), size: CGSize(width: 460, height: height), both: false).forEach { $0.close() }
+        .fixedSize(horizontal: false, vertical: true), size: CGSize(width: 460, height: height), both: false)
     }
     // The menu bar item's preview card, for every fixture (the live preview stays off while waiting).
     for (name, session) in [("program-meeting", UIFixtures.programMeeting()), ("single-meeting", UIFixtures.singleMeeting()),
@@ -653,7 +642,7 @@ extension UIVerify {
       let presentation = UIPresentationBuilder.session(session)
       render("menubar-preview-\(name)", UIMenuPreviewContent(presentation: presentation, session: session,
         pictures: UIFixturePictures(), showLive: true).fixedSize(horizontal: false, vertical: true),
-        size: CGSize(width: UIMenuPreviewContent.minimumWidth, height: 330)).forEach { $0.close() }
+        size: CGSize(width: UIMenuPreviewContent.minimumWidth, height: 330))
     }
   }
 
@@ -921,7 +910,7 @@ extension UIVerify {
   /// on restore and Forget LUT. (Burn-in identity needs a running camera; it is
   /// covered at controller level by LUTGoldenChecks.)
   func lutModel() throws {
-    let suiteName = "org.ultracam.ui-verify-lut.\(UUID().uuidString)"
+    let suiteName = verifier.makeDefaultsDomain()
     guard let defaults = UserDefaults(suiteName: suiteName) else { verifier.check("lut: defaults suite", false); return }
     defer { defaults.removePersistentDomain(forName: suiteName) }
     let folder = FileManager.default.temporaryDirectory.appendingPathComponent("ui-verify-lut-\(UUID().uuidString)")
@@ -1043,7 +1032,7 @@ extension UIVerify {
   }
 
   func bridge() throws {
-    let suiteName = "org.ultracam.ui-verify.\(UUID().uuidString)"
+    let suiteName = verifier.makeDefaultsDomain()
     guard let defaults = UserDefaults(suiteName: suiteName) else { verifier.check("defaults suite", false); return }
     defer { defaults.removePersistentDomain(forName: suiteName) }
     let settings = AppSettingsStore(defaults: defaults)
@@ -1334,16 +1323,16 @@ extension UIVerify {
 
     // Settings and Diagnostics with the real model.
     settingsWindow(model: model, interface: interface, defaults: defaults)
-    render("diagnostics", UIDiagnosticsView(model: model, interface: interface), size: CGSize(width: 1100, height: 760)).forEach { $0.close() }
+    render("diagnostics", UIDiagnosticsView(model: model, interface: interface), size: CGSize(width: 1100, height: 760))
     interface.inspectorOpen = false
     let live = UISessionBridge.live(model: model, interface: interface).context()
-    render("main-live-model", mainWindow(live), size: CGSize(width: 1320, height: 860), titled: true).forEach { $0.close() }
+    render("main-live-model", mainWindow(live), size: CGSize(width: 1320, height: 860), titled: true)
   }
 
   /// Settings' tabs, sizes, links and renders (`SettingsVerify`).
   func settingsWindow(model: AppModel, interface: UIInterfaceState, defaults: UserDefaults) {
     SettingsVerify.run(verifier: verifier, model: model, interface: interface, defaults: defaults) { name, view, size in
-      render(name, view, size: size).forEach { $0.close() }
+      render(name, view, size: size)
     }
   }
 
@@ -1385,7 +1374,7 @@ extension UIVerify {
 
   /// Hot-plug and Start refusals against a scripted device list; no hardware.
   func discovery() {
-    let suiteName = "org.ultracam.ui-verify.\(UUID().uuidString)"
+    let suiteName = verifier.makeDefaultsDomain()
     guard let defaults = UserDefaults(suiteName: suiteName) else { verifier.check("discovery: defaults suite", false); return }
     defer { defaults.removePersistentDomain(forName: suiteName) }
     let settings = AppSettingsStore(defaults: defaults)
@@ -1511,7 +1500,7 @@ extension UIVerify {
 
   /// Two units of one model, one input per camera, and which camera an arriving input fills.
   func adoption() {
-    let suiteName = "org.ultracam.ui-verify.\(UUID().uuidString)"
+    let suiteName = verifier.makeDefaultsDomain()
     guard let defaults = UserDefaults(suiteName: suiteName) else { verifier.check("adoption: defaults suite", false); return }
     defer { defaults.removePersistentDomain(forName: suiteName) }
     let alpha = FeedID(rawValue: "ui-verify-alpha"), beta = FeedID(rawValue: "ui-verify-beta")
@@ -1587,7 +1576,7 @@ extension UIVerify {
   /// Settings saved before inputs were exclusive can give two cameras one input:
   /// the first to start keeps it, and the other's Start is refused with the reason.
   func sharedInput() {
-    let suiteName = "org.ultracam.ui-verify.\(UUID().uuidString)"
+    let suiteName = verifier.makeDefaultsDomain()
     guard let defaults = UserDefaults(suiteName: suiteName) else { verifier.check("shared input: defaults suite", false); return }
     defer { defaults.removePersistentDomain(forName: suiteName) }
     let alpha = FeedID(rawValue: "ui-verify-alpha"), beta = FeedID(rawValue: "ui-verify-beta")
@@ -1618,7 +1607,7 @@ extension UIVerify {
   /// it becomes selected (its restore completes after it started). Scripted
   /// capture; no hardware.
   func lutOnAutomaticSelectedCamera() throws {
-    let suiteName = "org.ultracam.ui-verify-lut-auto.\(UUID().uuidString)"
+    let suiteName = verifier.makeDefaultsDomain()
     guard let defaults = UserDefaults(suiteName: suiteName) else { verifier.check("lut auto: defaults suite", false); return }
     defer { defaults.removePersistentDomain(forName: suiteName) }
     let folder = FileManager.default.temporaryDirectory.appendingPathComponent("ui-verify-lut-auto-\(UUID().uuidString)")
@@ -1694,7 +1683,7 @@ extension UIVerify {
   }
 
   func lutOnRunningCameras() throws {
-    let suiteName = "org.ultracam.ui-verify-lut-run.\(UUID().uuidString)"
+    let suiteName = verifier.makeDefaultsDomain()
     guard let defaults = UserDefaults(suiteName: suiteName) else { verifier.check("lut run: defaults suite", false); return }
     defer { defaults.removePersistentDomain(forName: suiteName) }
     let folder = FileManager.default.temporaryDirectory.appendingPathComponent("ui-verify-lut-run-\(UUID().uuidString)")
@@ -1823,7 +1812,7 @@ extension UIVerify {
   /// Per-device settings preserve the legacy fallback and verified overrides;
   /// this fixture never loads an SDK or touches a real capture device.
   func hdrAdvertisement() {
-    let suiteName = "org.ultracam.ui-verify.\(UUID().uuidString)"
+    let suiteName = verifier.makeDefaultsDomain()
     guard let defaults = UserDefaults(suiteName: suiteName) else { verifier.check("HDR: defaults suite", false); return }
     defer { defaults.removePersistentDomain(forName: suiteName) }
     func settle(_ label: String, until condition: () -> Bool) {
@@ -2018,7 +2007,7 @@ let exitCode: Int32 = MainActor.assumeIsolated {
   run.screens()
   // The monitor tool popovers and the scope pane, with their own fixtures.
   for screen in UIMonitorToolScreens.screens() {
-    run.render(screen.name, screen.view, size: screen.size).forEach { $0.close() }
+    run.render(screen.name, screen.view, size: screen.size)
   }
   // Custom bands in stops show the exposure-offset stepper; in IRE they do not.
   let offsetShown = ["monitor-tool-false-color-customstops": true, "monitor-tool-false-color-custom": false]
@@ -2032,13 +2021,13 @@ let exitCode: Int32 = MainActor.assumeIsolated {
       viewDependent: true)
   }
   UIScopeScreens.run(verifier: verifier) { name, view, size in
-    run.render(name, view, size: size).forEach { $0.close() }
+    run.render(name, view, size: size)
   }
   UIMonitorToolVerify.run(verifier: verifier)
   MonitorWorkspaceVerify.run(verifier: verifier)
   AudioMeterTapVerify.run(verifier: verifier)
   AudioMeterViewsVerify.run(verifier: verifier, recording: run.stripFixture(.recording), saved: run.stripFixture(.saved)) {
-    name, view, size in run.render(name, view, size: size).forEach { $0.close() }
+    name, view, size in run.render(name, view, size: size)
   }
   run.accessibility()
   run.interactions()
@@ -2048,7 +2037,7 @@ let exitCode: Int32 = MainActor.assumeIsolated {
   run.discovery()
   SyntheticCaptureVerify.run(verifier: verifier)
   run.hdrAdvertisement()
-  HardwareVerify.run(verifier: verifier) { name, view, size in run.render(name, view, size: size).forEach { $0.close() } }
+  HardwareVerify.run(verifier: verifier) { name, view, size in run.render(name, view, size: size) }
   MacCameraVerify.run(verifier: verifier) { name, view, size in run.render(name, view, size: size) }
   do { try run.lutOnRunningCameras() } catch { verifier.check("LUT running-camera tests threw", false, "\(error)") }
   do { try run.lutOnAutomaticSelectedCamera() } catch { verifier.check("LUT automatic-start tests threw", false, "\(error)") }
@@ -2060,7 +2049,7 @@ let exitCode: Int32 = MainActor.assumeIsolated {
   run.pictureMenus()
   run.menuBar()
   ProgramOutputVerify.run(verifier: verifier) { name, view, size, titled in
-    run.render(name, view, size: size, titled: titled).forEach { $0.close() }
+    run.render(name, view, size: size, titled: titled)
   }
   Images.waitForWrites()
   print("""

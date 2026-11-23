@@ -33,4 +33,39 @@ import XCTest
     // Test and ui-verify runs share the capture code; their fixtures' dropouts must not reach the real log.
     XCTAssertNil(SignalLogFile.shared)
   }
+
+  func testFailedRotationPreservesExistingDirectoryAndContinuesAppending() throws {
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent("signal-log-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let log = SignalLogFile(folder: folder, limit: 1)
+    let older = folder.appendingPathComponent("signal.1.log")
+    try FileManager.default.createDirectory(at: older, withIntermediateDirectories: true)
+    let preserved = older.appendingPathComponent("existing")
+    try Data([1]).write(to: preserved)
+    log.record("first")
+    log.record("second")
+    log.flush()
+    XCTAssertEqual(try Data(contentsOf: preserved), Data([1]))
+    let lines = try String(contentsOf: log.url, encoding: .utf8).split(separator: "\n")
+    XCTAssertEqual(lines.count, 2)
+  }
+
+  func testRefusesSymbolicLinkWithoutReplacingArchive() throws {
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent("signal-log-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: folder) }
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    let log = SignalLogFile(folder: folder, limit: 1)
+    let older = folder.appendingPathComponent("signal.1.log")
+    let target = folder.appendingPathComponent("other.log")
+    try Data([1]).write(to: older)
+    try Data([2]).write(to: target)
+    try FileManager.default.createSymbolicLink(at: log.url, withDestinationURL: target)
+
+    log.record("do not append")
+    log.flush()
+
+    XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: log.url.path), target.path)
+    XCTAssertEqual(try Data(contentsOf: older), Data([1]))
+    XCTAssertEqual(try Data(contentsOf: target), Data([2]))
+  }
 }

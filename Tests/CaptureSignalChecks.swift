@@ -44,7 +44,10 @@ private final class SignalLog: @unchecked Sendable {
     let format = try SourceFormat(width: 128, height: 72, pixel: .v210, rate: .constant(duration))
     let source = FakeCaptureSession(format: format, audio: .absent)
     let feed = FeedID(rawValue: name)
-    let controller = CaptureController(services: .registryBridge(feedID: feed, makeSession: { _ in source }))
+    var services = CaptureServices.registryBridge(feedID: feed, makeSession: { _ in source })
+    services.disconnect = {}
+    services.preNegotiate = nil
+    let controller = CaptureController(services: services)
     controller.setCameraOutputEnabled(false)
     return (source, controller, feed)
   }
@@ -55,6 +58,17 @@ private final class SignalLog: @unchecked Sendable {
   }
 
   // MARK: Reading it
+
+  func testMalformedHostAnchorsDoNotBecomePresentationStartTimes() throws {
+    let buffer = try image().value
+    let malformed = CMTime(value: -123, timescale: -1, flags: .valid, epoch: 0)
+    XCTAssertNil(CaptureController.presentationStartHostTime(for: buffer, captured: malformed,
+      reference: .presentationStart, duration: duration))
+    XCTAssertNil(CaptureController.presentationStartHostTime(for: buffer, captured: .zero,
+      reference: .presentationEnd, duration: duration))
+    XCTAssertEqual(CaptureController.presentationStartHostTime(for: buffer, captured: .zero,
+      reference: .presentationStart, duration: duration), .zero)
+  }
 
   func testInterfaceReadsTheTypedSignalBeforeAnyLabel() throws {
     let format = try SourceFormat(width: 1920, height: 1080, pixel: .v210,
@@ -216,6 +230,26 @@ private final class SignalLog: @unchecked Sendable {
     wait(for: [unsupported], timeout: 1)
   }
 
+  func testWatchdogReportsMissingFirstFrameAfterAnInformationalEvent() throws {
+    let (source, controller, feed) = try harness("signal-watchdog-first")
+    let ready = expectation(description: "Started")
+    ready.assertForOverFulfill = false
+    let lost = expectation(description: "First frame timed out")
+    controller.onUpdate = { update in
+      if update.message.hasPrefix("Waiting") { ready.fulfill() }
+      if case .lost = update.signal {
+        XCTAssertEqual(update.frames, 0)
+        XCTAssertEqual(update.signalDropouts, 0)
+        lost.fulfill()
+      }
+    }
+    defer { controller.onUpdate = nil; controller.stop() }
+    start(controller, feed)
+    wait(for: [ready], timeout: 1)
+    XCTAssertTrue(source.submit(.event(.info("Device initialized"))))
+    wait(for: [lost], timeout: 6)
+  }
+
   /// The watchdog path: frames just stop, with no report. The loss dates from the
   /// last frame, and is the same dropout to everything that counts them.
   func testFramesStoppingWithNoReportIsALoss() throws {
@@ -327,6 +361,60 @@ private final class SignalLog: @unchecked Sendable {
     submit(2)
     XCTAssertEqual(controller.sourceDropsForTesting, 1,
       "Queued epoch cleanup must preserve the first new frame as the source-drop baseline")
+  }
+
+  func testDropoutRecoveryDoesNotComparePresentationTimesAcrossEpochs() throws {
+    let (source, controller, feed) = try harness("dropout-new-clock")
+    let buffer = try image()
+    let ready = expectation(description: "Started")
+    let lost = expectation(description: "Signal lost")
+    lost.assertForOverFulfill = false
+    let measured = expectation(description: "New clock delivered frames")
+    controller.onUpdate = { update in
+      if update.message.hasPrefix("Waiting") { ready.fulfill() }
+      if case .lost = update.signal { lost.fulfill() }
+      if update.message == "new clock barrier" {
+        XCTAssertEqual(update.signal, .live)
+        XCTAssertEqual(update.signalDropouts, 1)
+        XCTAssertEqual(update.signalLostFrames, 0)
+        XCTAssertEqual(update.sourceDrops, 1)
+        measured.fulfill()
+      }
+    }
+    defer { controller.onUpdate = nil; controller.stop() }
+    start(controller, feed)
+    wait(for: [ready], timeout: 1)
+    frame(0, source, buffer)
+    XCTAssertTrue(source.submit(.event(.signalLost(reason: "No HDMI video signal"))))
+    wait(for: [lost], timeout: 1)
+    XCTAssertTrue(source.submit(.event(.discontinuity)))
+    frame(50, source, buffer)
+    frame(52, source, buffer)
+    XCTAssertTrue(source.submit(.event(.info("new clock barrier"))))
+    wait(for: [measured], timeout: 1)
+  }
+
+  func testRepeatedFormatDeclarationKeepsTheSourceClockBaseline() throws {
+    let (source, controller, feed) = try harness("repeat-format")
+    let buffer = try image()
+    let ready = expectation(description: "Started")
+    let measured = expectation(description: "Skip measured after duplicate format")
+    controller.onUpdate = { update in
+      if update.message.hasPrefix("Waiting") { ready.fulfill() }
+      if update.message == "duplicate format barrier" {
+        XCTAssertEqual(update.sourceDrops, 1)
+        measured.fulfill()
+      }
+    }
+    defer { controller.onUpdate = nil; controller.stop() }
+    start(controller, feed)
+    wait(for: [ready], timeout: 1)
+    frame(0, source, buffer)
+    let format = try SourceFormat(width: 128, height: 72, pixel: .v210, rate: .constant(duration))
+    XCTAssertTrue(source.submit(.event(.formatChanged(format))))
+    frame(2, source, buffer)
+    XCTAssertTrue(source.submit(.event(.info("duplicate format barrier"))))
+    wait(for: [measured], timeout: 1)
   }
 
   func testFrameAfterWatchdogClaimKeepsItsSourceClockBaseline() throws {

@@ -1,4 +1,3 @@
-import Darwin
 import Foundation
 
 final class RecordingSessionClock: @unchecked Sendable {
@@ -72,8 +71,9 @@ struct RecordingStatistics: Equatable, Sendable {
   var writerBufferCapacityBytes = 0
 
   var elapsedText: String {
-    let seconds = Int(max(0, elapsed))
-    return String(format: "%02d:%02d:%02d", seconds / 3600, seconds / 60 % 60, seconds % 60)
+    guard elapsed.isFinite, elapsed >= 0 else { return "00:00:00" }
+    let seconds = Int64(exactly: elapsed.rounded(.towardZero)) ?? .max
+    return String(format: "%02lld:%02lld:%02lld", seconds / 3600, seconds / 60 % 60, seconds % 60)
   }
   var sizeText: String { ByteCountFormatter.string(fromByteCount: Int64(clamping: fileBytes), countStyle: .file) }
 }
@@ -98,8 +98,9 @@ struct RecordingStatisticsSampler: Sendable {
     previousTime = now
     previousFrames = source.encodedVideo
     previousBytes = source.encodedVideoBytes
+    let (droppedVideo, overflow) = source.droppedVideo.addingReportingOverflow(source.droppedEncodedVideo)
     return RecordingStatistics(elapsed: elapsed, fileBytes: fileBytes, encodedFrames: source.encodedVideo,
-      droppedVideoFrames: source.droppedVideo + source.droppedEncodedVideo,
+      droppedVideoFrames: overflow ? .max : droppedVideo,
       droppedAudioPackets: source.droppedAudio, encoderErrors: source.encoderErrors,
       writerErrors: source.writerErrors, queueSamples: source.queueSamples, queueCapacity: source.queueCapacity,
       encoderPendingFrames: source.encoderPendingFrames, framesPerSecond: stopped ? 0 : fps,

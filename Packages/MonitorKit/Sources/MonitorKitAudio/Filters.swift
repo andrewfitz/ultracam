@@ -656,3 +656,83 @@ func foldedEnvelope(
     k += 1
   }
 }
+
+/// Instant attack with exponential return and a separately timed hold marker.
+/// The ramp applies each sample's exact age at the end of the chunk.
+struct PeakBallistics {
+  private let capacity: Int
+  private let holdFrames: Int
+  private let ramp: UnsafeMutablePointer<Double>
+  private let scratch: UnsafeMutablePointer<Double>
+
+  init(configuration: AudioMeterConfiguration, capacity: Int) {
+    self.capacity = capacity
+    let hold = configuration.peakHoldTime * configuration.sampleRate
+    holdFrames = hold >= Double(Int.max / 2) ? Int.max : Int(hold.rounded())
+    ramp = .allocate(capacity: capacity + 1)
+    scratch = .allocate(capacity: capacity)
+    scratch.initialize(repeating: 0, count: capacity)
+    let rate = -(configuration.peakDecayRate / configuration.sampleRate) * (log(10) / 20)
+    for age in 0...capacity {
+      (ramp + capacity - age).initialize(to: exp(rate * Double(age)))
+    }
+  }
+
+  func deallocate() {
+    ramp.deallocate()
+    scratch.deallocate()
+  }
+
+  func advance(
+    _ samples: UnsafePointer<Float>, count: Int, maximum: Float,
+    bar: inout Double, hold: inout Double, age: inout Int
+  ) {
+    let peak = Double(maximum)
+    let decayed = bar * ramp[capacity - count]
+    if decayed >= peak {
+      bar = decayed
+    } else if abs(samples[count - 1]) == maximum {
+      bar = peak
+    } else {
+      let n = vDSP_Length(count)
+      vDSP_vspdp(samples, 1, scratch, 1, n)
+      vDSP_vmulD(scratch, 1, ramp + capacity - count + 1, 1, scratch, 1, n)
+      var newest = 0.0
+      vDSP_maxmgvD(scratch, 1, &newest, n)
+      bar = max(decayed, newest)
+    }
+
+    if holdFrames == 0 {
+      hold = bar
+      return
+    }
+    let remaining = holdFrames - age
+    let release = max(0, count - remaining)
+    let released = hold * ramp[capacity - release]
+    if released > peak || peak == 0 {
+      hold = released
+      age += min(count, remaining)
+    } else if peak >= hold && count <= holdFrames {
+      // A new maximum supersedes every earlier peak and cannot expire
+      // within this chunk. Equal crests restart the hold at the last one.
+      var i = count - 1
+      while abs(samples[i]) != maximum { i -= 1 }
+      hold = peak
+      age = count - 1 - i
+    } else {
+      // A released marker can be caught more than once. Replay those
+      // decisions in sample order, including a crossing at the last frame.
+      let decay = ramp[capacity - 1]
+      var i = 0
+      while i < count {
+        if age < holdFrames { age += 1 } else { hold *= decay }
+        let value = Double(abs(samples[i]))
+        if value >= hold {
+          hold = value
+          age = 0
+        }
+        i += 1
+      }
+    }
+  }
+}

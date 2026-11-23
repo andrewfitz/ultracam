@@ -589,7 +589,13 @@ private struct StoredRecordingProfile: Decodable {
     var profile = AppRecordingProfile()
     if let value = (try? values.decodeIfPresent(Int.self, forKey: .videoMbps)) ?? nil { profile.videoMbps = value }
     if let value = (try? values.decodeIfPresent(String.self, forKey: .pattern)) ?? nil { profile.pattern = value }
-    profile.folderBookmark = (try? values.decodeIfPresent(Data.self, forKey: .folderBookmark)) ?? nil
+    do {
+      profile.folderBookmark = try values.decodeIfPresent(Data.self, forKey: .folderBookmark)
+    } catch {
+      // An unreadable grant still represents a custom destination. Preserve
+      // that intent even when older settings do not include its display path.
+      profile.folderBookmark = Data()
+    }
     profile.folderPath = (try? values.decodeIfPresent(String.self, forKey: .folderPath)) ?? nil
     self.profile = profile
   }

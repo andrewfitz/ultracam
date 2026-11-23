@@ -574,7 +574,7 @@ MonitorKitUI's `MonitorMetalView` should not replace the app's surfaces unless i
 | `scripts/monitor-tools-{smoke,recording,benchmark,admission-checks,stress}.sh`, `monitor-tools-fingerprint.py` | Synthetic harnesses for the old runtime | Yes | Retire with the package (`monitor-tools-recording.sh:24` also compiles `CubeLUT.swift`) |
 | `scripts/build.sh --debug` | Regenerates the project and builds the Debug app into `agent-work`; runs `validate_bundle.py` | Yes, when nobody else has project edits in flight | — |
 | `scripts/app-self-test.sh` (`SKIP_BUILD=1`) | Launches a second, Debug app with `--ui-self-test`; never starts cameras | Yes **without `LIVE=1`**; it uses the Debug preferences, so back them up first | — |
-| `scripts/ui-tour.sh` | Drives the Debug build by its own PID; saves and restores its preferences | Yes **without `LIVE=1`** | — |
+| `scripts/ui-tour.sh` | Drives the Debug build by its own PID with isolated preferences | Yes **without `LIVE=1`** | — |
 | `swift test --package-path Packages/MonitorKit --scratch-path <own>` | MonitorKit's tests; GPU tests skip without Metal | Yes | — |
 | Anything with `LIVE=1`, installer actions, or quitting or killing the installed app | Real UltraStudio or extension | **No** | — |
 

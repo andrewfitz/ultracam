@@ -34,6 +34,29 @@ import XCTest
     now = 12; converter.evictExpiredCacheForTesting()
     XCTAssertEqual(converter.cachedAllocationBytesForTesting, 0)
   }
+  func testWideRowPaddingDoesNotWidenV210Texture() throws {
+    guard let device = MTLCreateSystemDefaultDevice(), device.supportsFamily(.metal4) else { throw XCTSkip("Metal4 required") }
+    var padded: CVPixelBuffer?
+    XCTAssertEqual(CVPixelBufferCreate(nil, 192, 32, kCVPixelFormatType_422YpCbCr10,
+      [kCVPixelBufferIOSurfacePropertiesKey: [:], kCVPixelBufferBytesPerRowAlignmentKey: 131072] as CFDictionary,
+      &padded), kCVReturnSuccess)
+    let source = try XCTUnwrap(padded)
+    let stride = CVPixelBufferGetBytesPerRow(source)
+    XCTAssertGreaterThan(stride / 4, 16384)
+    CVPixelBufferLockBaseAddress(source, [])
+    let words = try XCTUnwrap(CVPixelBufferGetBaseAddress(source))
+    words.storeBytes(of: UInt32(71 << 10), as: UInt32.self)
+    words.storeBytes(of: UInt32(93 << 10), toByteOffset: stride, as: UInt32.self)
+    CVPixelBufferUnlockBaseAddress(source, [])
+    let output = try buffer(kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange)
+    _ = try RecordingPixelConverter(device: device).convert(source, into: output)
+    CVPixelBufferLockBaseAddress(output, .readOnly)
+    defer { CVPixelBufferUnlockBaseAddress(output, .readOnly) }
+    let luma = try XCTUnwrap(CVPixelBufferGetBaseAddressOfPlane(output, 0))
+    XCTAssertEqual(luma.load(as: UInt16.self) >> 6, 71)
+    XCTAssertEqual(luma.load(fromByteOffset: CVPixelBufferGetBytesPerRowOfPlane(output, 0), as: UInt16.self) >> 6, 93)
+  }
+
   func testFullRangeV210PhysicallyMapsEndpointsAndMidtonesToLegalVideoCodes() throws {
     guard let device = MTLCreateSystemDefaultDevice(), device.supportsFamily(.metal4) else { throw XCTSkip("Metal4 required") }
     let source = try buffer(kCVPixelFormatType_422YpCbCr10)

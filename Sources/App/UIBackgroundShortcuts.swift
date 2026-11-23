@@ -96,10 +96,14 @@ enum UIBackgroundShortcut: Hashable, Sendable {
     var missing: [UIBackgroundShortcut] = []
     for (index, shortcut) in UIBackgroundShortcut.all.enumerated() {
       var ref: EventHotKeyRef?
+      // A nonexclusive registration can succeed even when another app owns the chord
+      // exclusively and this app will receive no events for it.
       let status = RegisterEventHotKey(UInt32(shortcut.keyCode), UInt32(controlKey | optionKey | cmdKey),
-        EventHotKeyID(signature: uiHotKeySignature, id: UInt32(index)), GetApplicationEventTarget(), 0, &ref)
+        EventHotKeyID(signature: uiHotKeySignature, id: UInt32(index)), GetApplicationEventTarget(),
+        UInt32(kEventHotKeyExclusive), &ref)
       if status == noErr, let ref { carbon.hotKeys.append(ref) } else { missing.append(shortcut) }
     }
+    if carbon.hotKeys.isEmpty { carbon.removeAll() }
     unavailable = missing
   }
 

@@ -80,16 +80,17 @@ struct UIToolbarContent: ToolbarContent {
   }
 
   @ViewBuilder private var captureControl: some View {
-    if let start = presentation.startControl, start.enabled || !presentation.camerasRunning {
+    let canStop = presentation.cameras.contains(where: \.canStop)
+    if let start = presentation.startControl, start.enabled || !canStop {
       let title = start.action == .startAllCameras ? "Start Capture" : start.title
       Button { context.send(start.action) } label: {
         Label(title, systemImage: UISymbol.camera).labelStyle(.titleAndIcon)
       }
       .disabled(!start.enabled)
-      .help(start.enabled ? "Start receiving video from the configured inputs\(start.action == .startAllCameras ? " (⌘↩)" : ""). Use Record to save a take." : start.help)
+      .help(start.enabled ? "Start receiving video from the configured inputs\(canStop ? "" : " (⌘↩)"). Use Record to save a take." : start.help)
     } else {
       Button { context.send(.stopAllCameras) } label: {
-        Label(presentation.cameras.count > 1 ? "Stop All Capture" : "Stop Capture", systemImage: UISymbol.noSignal)
+        Label(presentation.camerasControlTitle, systemImage: UISymbol.noSignal)
           .labelStyle(.titleAndIcon)
       }
       .help("Stop capture and video output for running cameras (⌘↩). This ends any active recordings.")

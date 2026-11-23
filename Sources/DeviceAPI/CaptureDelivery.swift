@@ -54,8 +54,9 @@ struct CaptureFrameInfo: Sendable {
   /// ingest. Nil permits the consumer's documented legacy attachment fallback.
   var captureHostTime: CMTime? = nil
   func validate() throws {
-    guard presentationTime.isNumeric, presentationTime.epoch == 0, presentationTime >= .zero,
-      duration.isNumeric, duration.epoch == 0, duration > .zero else {
+    guard presentationTime.isNumeric, presentationTime.timescale > 0, presentationTime.epoch == 0,
+      presentationTime.value >= 0, duration.isNumeric, duration.timescale > 0,
+      duration.epoch == 0, duration.value > 0 else {
       throw PluginError.unsupported("Invalid source frame timestamp or duration")
     }
   }

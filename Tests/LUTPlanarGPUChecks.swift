@@ -6,6 +6,7 @@ import XCTest
     for type: OSType in [kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
       kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
       kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+      kCVPixelFormatType_420YpCbCr10BiPlanarFullRange,
       kCVPixelFormatType_422YpCbCr8BiPlanarVideoRange, 0x50323136] {
       let source = try graySource(type: type)
       let sourceColour = try LUTProcessor.sourceColorimetry(source)

@@ -11,16 +11,12 @@ struct UICameraOutputTimingRows: View {
         let state = store.state(for: cameraID)
         if store.assignment(for: cameraID) != nil, state.connected {
             ForEach(state.properties.filter { $0.role == .outputTiming }) { property in
-                if property.writable, !property.options.isEmpty {
-                    Picker(property.localizedLabel(), selection: Binding(get: { property.value }, set: { value in
-                        Task { await store.set(property, value: value, feedID: cameraID) }
-                    })) {
-                        if !property.options.contains(where: { $0.value == property.value }) {
-                            Text(UIControlPresentation.value(property)).tag(property.value)
+                if property.writable {
+                    LabeledContent(property.localizedLabel()) {
+                        UIControlPropertyField(property: property, connected: true, busy: state.busy) { value in
+                            Task { await store.set(property, value: value, feedID: cameraID) }
                         }
-                        ForEach(property.options) { Text($0.localizedLabel()).tag($0.value) }
                     }
-                    .disabled(state.busy)
                 } else {
                     LabeledContent(property.localizedLabel()) { Text(UIControlPresentation.value(property)) }
                 }

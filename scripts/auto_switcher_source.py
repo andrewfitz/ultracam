@@ -3,14 +3,16 @@
 from pathlib import Path
 import sys
 
+AUTO_SWITCHER_LOCATIONS = ('../auto-switcher', 'Apps/AutoSwitcher')
+
 
 def auto_switcher_source(root):
     required = ('Cargo.toml', 'Cargo.lock', 'src/lib.rs', 'include/auto_switcher.h')
-    for relative in ('Apps/AutoSwitcher', '../auto-switcher'):
+    for relative in AUTO_SWITCHER_LOCATIONS:
         candidate = root / relative
         if all((candidate / path).is_file() for path in required):
             return candidate
-    raise ValueError('Auto Switcher source is incomplete. Place the auto-switcher checkout beside Ultracam.')
+    raise ValueError('Auto Switcher source is incomplete in ../auto-switcher and Apps/AutoSwitcher.')
 
 
 if __name__ == '__main__':

@@ -36,6 +36,9 @@ final class Audit3RenderSceneTests: XCTestCase {
     _ = renderer.takeStatusChanges()
     scene.surfaces = []
     try draw()
+    XCTAssertNil(surface.viewport)
+    XCTAssertNil(surface.layout)
+    XCTAssertEqual(surface.status, MonitorStatus())
     source.clear()
     scene.surfaces = [surface]
     try draw()
@@ -68,6 +71,8 @@ final class Audit3RenderSceneTests: XCTestCase {
     XCTAssertNotNil(overlay.viewport)
     scene.scopes = []
     try draw()
+    XCTAssertNil(overlay.viewport)
+    XCTAssertNil(overlay.graticule)
     source.clear()
     scene.scopes = [overlay]
     try draw()
@@ -99,6 +104,13 @@ final class Audit3RenderSceneTests: XCTestCase {
     XCTAssertNotNil(surface.layout)
     XCTAssertNotNil(overlay.viewport)
     let b = MonitorRenderer(engine: gpu.engine, scene: scene, scopeEngine: try gpu.scopeEngine())
+    let wider = gpu.texture(.bgra8Unorm, 100, 50)
+    try draw(b, wider)
+    XCTAssertEqual(surface.viewport?.width, 30)
+    XCTAssertEqual(overlay.viewport?.width, 30)
+    try draw(a, big)
+    XCTAssertEqual(surface.viewport, viewport, "A must republish even when its own geometry is unchanged")
+    XCTAssertEqual(overlay.viewport, viewport)
     XCTAssertNil(region.viewport(width: 1, height: 1), "nothing of the tile in B's target")
     try draw(b, tiny)
     XCTAssertEqual(surface.viewport, viewport, "B drew nothing and left A's publication")

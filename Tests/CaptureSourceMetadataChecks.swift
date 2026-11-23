@@ -167,6 +167,7 @@ import XCTest
     let sony = Colorimetry(primaries: .sGamut3Cine, transfer: .sLog3, matrix: .rec709,
       range: .video, horizontalChromaSiting: .left, verticalChromaSiting: .center)
     configuration.sourceColorimetryOverride = sony
+    configuration.sourcePauseAllowanceSeconds = 10
     controller.start(feedID: feed, deviceID: "fake:fixture", configuration: configuration,
       previewEnabled: false)
     wait(for: [ready], timeout: 3)
@@ -198,6 +199,8 @@ import XCTest
     XCTAssertEqual(colours.map(\.transfer), [.pq, .rec709, .pq, .sLog3, .rec709, .pq, .pq, .pq],
       "Returning from unsupported output must establish a supported contract again")
     let configurations = observed.lock.withLock { observed.configurations }
+    XCTAssertTrue(configurations.allSatisfy { $0.sourcePauseAllowanceSeconds == 10 },
+      "Disabling effects must preserve the camera's advertised pause allowance")
     XCTAssertEqual(configurations.map(\.sourceColorimetryOverride),
       [nil, sony, sony, sony, sony, nil, nil, nil],
       "LUT-off and Effects-off must use native encoding, preserving the configured profile for LUT-on")

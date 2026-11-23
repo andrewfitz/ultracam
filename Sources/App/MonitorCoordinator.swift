@@ -86,6 +86,12 @@ import MonitorKit
     self.init(preferences: preferences, workspace: workspace)
   }
 
+  deinit {
+    // A registered presenter holds its host for rendering. Detach it even
+    // when the window and coordinator disappear before SwiftUI unregisters it.
+    for host in hosts.values { host.setConsumers([]) }
+  }
+
   /// Once a second: source rate from the feed host, presented rate and GPU time
   /// from the busiest live surface of each target. A surface is degraded only by
   /// a recent failure (`MonitorSurfacePresenter.failureShownFor`). Internal for tests.
@@ -112,8 +118,8 @@ import MonitorKit
         value.scopeAge = stats.compactMap(\.lastScope).map { max(0, now - $0.hostTime) }.min()
         if let failure = stats.compactMap(\.lastFailure).first {
           value.availability = .degraded(failure)
-        } else if let age = value.pictureAge {
-          value.availability = age > 1 ? .stale : .live
+        } else if let stamp = best.lastPresented {
+          value.availability = stamp.isStale(at: now) ? .stale : .live
         }
       }
       if let reason = gpu.unavailableReason { value.availability = .failed(reason) }
@@ -243,7 +249,12 @@ import MonitorKit
         preferences[target] = feed.monitor
       }
       assignedDevices[target] = feed.selectedDevice
-      refreshHost(target)
+      if available.contains(target), hosts[target] == nil, surfaces.values.contains(where: { $0.target == target }) {
+        // A detached monitor can stay bound while its camera is removed and added back.
+        _ = captureSink(for: target)
+      } else {
+        refreshHost(target)
+      }
       if !feed.previewEnabled {
         for surface in surfaces.values where surface.target == target {
           surface.presenter.setUnavailable("Preview hidden")
@@ -256,12 +267,13 @@ import MonitorKit
       release(target)
     }
     for target in Array(hosts.keys) where !available.contains(target) {
-      hosts[target]?.invalidate(rejectingCaptureGeneration: nil)
       refreshHost(target)
+      hosts[target]?.invalidate(rejectingCaptureGeneration: nil)
       for surface in surfaces.values where surface.target == target {
         surface.presenter.setUnavailable("Missing camera")
       }
     }
+    if programAvailable { refreshHost(.program) }
     if !workspace.isConfigured, let first = targets.first {
       var value = workspace
       if value.tileBindings.allSatisfy({ $0 == nil }) {
@@ -303,12 +315,16 @@ import MonitorKit
   func captureSink(for target: MonitorTargetID) -> MonitorFeedHost {
     if let host = hosts[target] { return host }
     let host = MonitorFeedHost(target: target.rawValue, gpu: gpu)
-    host.onMonitorLUTChoiceRefresh = { [weak self] old, new in
-      DispatchQueue.main.async { [weak self] in
-        MainActor.assumeIsolated { self?.monitorLUTChoiceRefreshed(target, from: old, to: new) }
+    host.onMonitorLUTChoiceRefresh = { [weak self, weak host] old, new in
+      DispatchQueue.main.async { [weak self, weak host] in
+        MainActor.assumeIsolated {
+          guard let self, let host, self.hosts[target] === host else { return }
+          self.monitorLUTChoiceRefreshed(target, from: old, to: new)
+        }
       }
     }
     hosts[target] = host
+    for surface in surfaces.values where surface.target == target { surface.presenter.setHost(host) }
     refreshHost(target)
     return host
   }

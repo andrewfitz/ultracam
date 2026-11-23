@@ -309,7 +309,7 @@ enum UIFixtures {
     session.cameras[0].signal = .noSignal
     session.cameras[0].signalLostFor = 14
     session.cameras[0].recording.status = .idle
-    session.programMoved = UIProgramMove(from: "Camera 1", to: "Camera 2", heldShot: true)
+    session.programMoved = UIProgramMove(fromID: "camera-1", from: "Camera 1", to: "Camera 2", heldShot: true)
     return session
   }
 

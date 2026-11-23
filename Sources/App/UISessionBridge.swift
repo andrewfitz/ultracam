@@ -70,7 +70,7 @@ final class UIInterfaceState {
 
   /// Settings › Alerts, Low Space: less time left than this is low. `UIAlertPreferences` writes it.
   var lowSpaceSeconds: TimeInterval {
-    TimeInterval(defaults.object(forKey: UIAlertPreferences.lowSpaceMinutesKey) as? Int ?? 30) * 60
+    TimeInterval(UIAlertPreferences.lowSpaceMinutes(in: defaults)) * 60
   }
 
   func channelsShown(for cameraID: String) -> UIChannelsShown { channelsShown[cameraID] ?? .asDetected }
@@ -239,14 +239,16 @@ struct UISessionBridge {
       case .paused: rec.status = .paused
       case .finishing: rec.status = .finishing
       }
+      rec.isStarting = state?.isStarting ?? false
       rec.note = stats?.warning
       rec.takeCodec = state?.takeCodec
       rec.takeFallbackFrom = state?.takeFallbackFrom
       rec.takeBurnsInLUT = state?.takeBurnsInLUT ?? false
       // Once someone has seen an early take, its strip goes back to the take's result.
       let acknowledged = model.acknowledgedTakes.contains(id)
-      rec.failed = !acknowledged && stats?.failed == true
-      rec.error = acknowledged ? nil : state?.error ?? stats?.lastError
+      rec.failedToStart = !acknowledged && state?.failedToStart == true
+      rec.failed = !acknowledged && !rec.failedToStart && stats?.failed == true
+      rec.error = acknowledged ? nil : state?.error ?? (rec.failedToStart ? nil : stats?.lastError)
       rec.savedURL = state?.savedURL
       rec.savedFileName = state?.savedURL?.lastPathComponent
       rec.folderPath = folder?.path

@@ -24,7 +24,11 @@ final class PeakTests: XCTestCase {
       m.feed(Signal(sampleRate: fs, channels: [tone, tone.map { $0 * 0.5 }]))
       let s = m.snapshot()
       let crest = Float(Signal.amplitude(-6))
-      XCTAssertEqual(s[0].samplePeak, 20 * log10(crest), accuracy: 1e-5)
+      // The live bar returns even between a tone's last crest and the
+      // final sample; the hold is its undecayed maximum.
+      let decay = pow(10, -(20 / 1.7) / (20 * fs))
+      let finalBar = tone.reduce(0.0) { max(abs(Double($1)), $0 * decay) }
+      XCTAssertEqual(s[0].samplePeak, Float(dB(finalBar)), accuracy: 1e-5)
       XCTAssertEqual(s[0].samplePeakHold, 20 * log10(crest), accuracy: 1e-5)
       XCTAssertEqual(s[1].samplePeakHold, 20 * log10(crest * 0.5), accuracy: 1e-5)
     }
@@ -528,7 +532,9 @@ final class PeakTests: XCTestCase {
       XCTAssertEqual(s.channelCount, count)
       for c in 0..<count {
         let level = levels[c]
-        XCTAssertEqual(Double(s[c].samplePeak), level, accuracy: 1e-3, "peak \(c)/\(count)")
+        // At 48 samples per cycle the last crest is 11 frames before the end.
+        let bar = level - m.configuration.peakDecayRate * 11 / fs
+        XCTAssertEqual(Double(s[c].samplePeak), bar, accuracy: 1e-3, "peak \(c)/\(count)")
         XCTAssertEqual(Double(s[c].truePeakMax), level, accuracy: 0.05, "true peak \(c)/\(count)")
         XCTAssertEqual(Double(s[c].rms), level, accuracy: 1e-3, "rms \(c)/\(count)")
         XCTAssertEqual(Double(s[c].vu), level + 18, accuracy: 0.02, "vu \(c)/\(count)")

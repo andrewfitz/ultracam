@@ -93,6 +93,36 @@ struct Failure: Error, CustomStringConvertible {
   init(_ description: String) { self.description = description }
 }
 
+private struct CaptureRequest {
+  let uid: String
+  let index: Int
+  let duration: CMTime
+  let samples: Int
+  let delivery: String
+
+  init(_ args: [String]) throws {
+    let uid = args[1]
+    guard !uid.isEmpty, !VirtualCameraDescriptor.isDeviceUID(uid) else {
+      throw Failure("Select an independent camera input UID")
+    }
+    let components = args[3].split(separator: "/", omittingEmptySubsequences: false)
+    guard let index = Int(args[2]), index >= 0, let samples = Int(args[4]), (2...18000).contains(samples),
+      components.count == 2, let value = Int64(components[0]), value > 0,
+      let scale = Int32(components[1]), scale > 0 else {
+      throw Failure("Choose a listed format, a positive rational duration, and 2...18000 samples")
+    }
+    let delivery = args.count == 6 ? args[5] : "native"
+    guard ["native", "420v", "420f", "2vuy", "yuvs", "BGRA"].contains(delivery) else {
+      throw Failure("Unknown delivery format")
+    }
+    self.uid = uid
+    self.index = index
+    self.duration = CMTime(value: value, timescale: scale)
+    self.samples = samples
+    self.delivery = delivery
+  }
+}
+
 func authorize() throws {
   if AVCaptureDevice.authorizationStatus(for: .video) == .notDetermined {
     let completed = DispatchSemaphore(value: 0)
@@ -110,6 +140,13 @@ func run() throws {
     ((5...6).contains(args.count) && args[0] == "--capture") else {
     throw Failure("Usage: mac-camera-probe [--request-access | --expect-feed FEED_ID | --capture UID FORMAT_INDEX DURATION_VALUE/DURATION_SCALE SAMPLE_COUNT [native|420v|420f|2vuy|yuvs|BGRA]]")
   }
+  let capture = args.first == "--capture" ? try CaptureRequest(args) : nil
+  let expectedFeed: VirtualCameraDescriptor?
+  if args.first == "--expect-feed" {
+    let id = args[1].trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !id.isEmpty else { throw Failure("Supply a feed ID for --expect-feed") }
+    expectedFeed = VirtualCameraDescriptor.feed(feedID: id)
+  } else { expectedFeed = nil }
   if args == ["--request-access"] { try authorize() }
   let authorization = AVCaptureDevice.authorizationStatus(for: .video)
   print("cameraAuthorization=\(authorization.rawValue) os=\(ProcessInfo.processInfo.operatingSystemVersionString)")
@@ -124,39 +161,38 @@ func run() throws {
   let avUIDs = Set(devices.map(\.uniqueID))
   let cmio = try cmioUIDs()
   print("CMIO UIDs=\(cmio.sorted())")
-  let requiredUIDs = [
+  var requiredUIDs = [
     VirtualCameraDescriptor.feed(feedID: "default").deviceUID,
     VirtualCameraDescriptor.program().deviceUID
-  ] + (args.first == "--expect-feed" ? [VirtualCameraDescriptor.feed(feedID: args[1]).deviceUID] : [])
-  let ownUIDs = Set(requiredUIDs).union(cmio.filter(VirtualCameraDescriptor.isDeviceUID))
+  ]
+  if let expectedFeed { requiredUIDs.append(expectedFeed.deviceUID) }
+  let ownUIDs = Set(requiredUIDs).union(cmio.union(avUIDs).filter(VirtualCameraDescriptor.isDeviceUID))
   for uid in ownUIDs.sorted() { print("Ultracam uid=\(uid) CMIO=\(cmio.contains(uid)) AVFoundation=\(avUIDs.contains(uid))") }
-  if args.first == "--expect-feed" {
+  if expectedFeed != nil {
     guard ownUIDs.isSubset(of: avUIDs), ownUIDs.isSubset(of: cmio) else {
       throw Failure("Expected Ultracam output UIDs are missing from CMIO or AVFoundation")
     }
     return
   }
-  guard args.first == "--capture" else { return }
-
-  let components = args[3].split(separator: "/", omittingEmptySubsequences: false)
-  guard let index = Int(args[2]), let count = Int(args[4]), (2...18000).contains(count),
-    components.count == 2, let value = Int64(components[0]), value > 0,
-    let scale = Int32(components[1]), scale > 0 else {
-    throw Failure("Choose a listed format, a positive rational duration, and 2...18000 samples")
-  }
-  let requested = CMTime(value: value, timescale: scale)
-  let delivery = args.count == 6 ? args[5] : "native"
-  guard ["native", "420v", "420f", "2vuy", "yuvs", "BGRA"].contains(delivery) else { throw Failure("Unknown delivery format") }
-  guard !VirtualCameraDescriptor.isDeviceUID(args[1]) else { throw Failure("Select an independent camera input") }
+  guard let capture else { return }
+  let requested = capture.duration
+  let delivery = capture.delivery
   try authorize()
-  guard let device = discovery.devices.first(where: { $0.uniqueID == args[1] }), device.formats.indices.contains(index) else {
+  let matches = discovery.devices.filter { $0.isConnected && $0.uniqueID == capture.uid }
+  guard let device = matches.first else {
+    throw Failure("Device unavailable after authorization. Run inventory again.")
+  }
+  guard matches.allSatisfy({ $0 === device }) else {
+    throw Failure("Multiple cameras report the selected UID. Choose a camera with a unique UID.")
+  }
+  let formats = device.formats
+  guard formats.indices.contains(capture.index) else {
     throw Failure("Device or format unavailable after authorization. Run inventory again.")
   }
   guard !device.isInUseByAnotherApplication else { throw Failure("This camera is in use by another application") }
-  let format = device.formats[index]
-  guard format.videoSupportedFrameRateRanges.contains(where: {
-    requested >= $0.minFrameDuration && requested <= $0.maxFrameDuration
-  }) else { throw Failure("Requested duration falls outside the selected format's ranges") }
+  let format = formats[capture.index]
+  let mode = MacCameraMode(format)
+  guard mode.supports(requested) else { throw Failure("Requested duration falls outside the selected format's ranges") }
 
   let session = AVCaptureSession()
   let input = try AVCaptureDeviceInput(device: device)
@@ -166,15 +202,13 @@ func run() throws {
   session.addInput(input)
   guard session.canAddOutput(output) else { throw Failure("Cannot add video output") }
   session.addOutput(output)
-  let collector = Samples(maximum: count)
+  let collector = Samples(maximum: capture.samples)
   let queue = DispatchQueue(label: "org.ultracam.mac-camera-probe.samples")
   output.setSampleBufferDelegate(collector, queue: queue)
   do {
     try device.lockForConfiguration()
     defer { device.unlockForConfiguration() }
-    device.activeFormat = format
-    device.activeVideoMinFrameDuration = requested
-    device.activeVideoMaxFrameDuration = requested
+    try mode.apply(to: device, minimum: requested, maximum: requested)
     if delivery == "native" {
       output.videoSettings = [:]
     } else {
@@ -193,7 +227,7 @@ func run() throws {
     queue.sync {}
   }
   print("running=\(session.isRunning) formatPreserved=\(device.activeFormat == format) active=\(label(device.activeFormat)) min=\(time(device.activeVideoMinFrameDuration)) max=\(time(device.activeVideoMaxFrameDuration))")
-  let timeout = max(15, CMTimeGetSeconds(requested) * Double(count) * 2 + 5)
+  let timeout = max(15, CMTimeGetSeconds(requested) * Double(capture.samples) * 2 + 5)
   guard session.isRunning, collector.done.wait(timeout: .now() + timeout) == .success else {
     throw Failure("Timed out waiting for requested sample count")
   }

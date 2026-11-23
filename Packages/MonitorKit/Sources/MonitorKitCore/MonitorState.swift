@@ -243,8 +243,11 @@ public struct FocusSettings: Codable, Equatable, Sendable {
     stage = c.lenient(.stage, stage)
   }
 
+  var normalizedSensitivity: Double { sensitivity.isFinite ? min(1, max(0, sensitivity)) : 0.5 }
+  package var normalizedNoiseRejection: Double { noiseRejection.isFinite ? min(1, max(0, noiseRejection)) : 0.02 }
+
   /// Gradient threshold used by the edge detector.
-  public var edgeThreshold: Double { 0.02 + (1 - min(1, max(0, sensitivity))) * 0.3 }
+  public var edgeThreshold: Double { 0.02 + (1 - normalizedSensitivity) * 0.3 }
 }
 
 /// How a frame guide is drawn: frame lines, a matte outside the frame, or both.
@@ -796,8 +799,8 @@ public struct MonitorState: Codable, Equatable, Sendable {
         bands.filter { $0.lower < $0.upper && $0.color.isFinite }
           .prefix(FalseColorSettings.maximumCustomBands))
     }
-    v.focus.sensitivity = b(focus.sensitivity, 0...1, 0.5)
-    v.focus.noiseRejection = b(focus.noiseRejection, 0...1, 0.02)
+    v.focus.sensitivity = focus.normalizedSensitivity
+    v.focus.noiseRejection = focus.normalizedNoiseRejection
     v.focus.opacity = b(focus.opacity, 0...1, 0.85)
     func validAspect(_ a: Double) -> Bool { a.isFinite && a >= 0.1 && a <= 10 }
     let frameGuides = guides.frameGuides

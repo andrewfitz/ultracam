@@ -111,6 +111,16 @@ import XCTest
       sourceRange: .video), .native)
   }
 
+  func testNativeRepackRequiresMatchingRange() throws {
+    for profile in [RecordingProfileMatrixProfile.hevcMain10, .proRes422HQ, .proRes4444] {
+      let pixel = PixelFormatID(rawValue: profile.encoderPixelFormat)
+      let expected: Colorimetry.Range = profile == .proRes4444 ? .full : .video
+      let unexpected: Colorimetry.Range = expected == .full ? .video : .full
+      XCTAssertEqual(try RecordingProfileMatrix.repackRoute(profile, sourcePixel: pixel, sourceRange: expected), .native)
+      XCTAssertThrowsError(try RecordingProfileMatrix.repackRoute(profile, sourcePixel: pixel, sourceRange: unexpected))
+    }
+  }
+
   func testFullRangePacked422DoesNotAdvertiseUnimplementedGPUConversion() throws {
     let full = Colorimetry(primaries: .rec709, transfer: .rec709, matrix: .rec709, range: .full,
       horizontalChromaSiting: .left, verticalChromaSiting: .center)

@@ -10,7 +10,7 @@ import sys
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ProgramStreamSmoke"))
-from inspect_media import output, probe, require, verify_recording
+from inspect_media import output, presentation_times, probe, require, verify_recording
 from run_receiver import free_port, receive, stop_process
 
 PROFILES = {
@@ -34,8 +34,8 @@ def window(path, output_path, start, profile="legacy"):
 
 def verify_audio_identity(path):
     pcm = array("f")
-    pcm.frombytes(output("ffmpeg", "-v", "error", "-i", str(path), "-map", "0:a",
-                         "-af", "pan=mono|c0=c0", "-f", "f32le", "-"))
+    pcm.frombytes(output("ffmpeg", "-v", "error", "-xerror", "-i", str(path), "-map", "0:a",
+                         "-f", "f32le", "-"))
     # Each 20 ms window holds exactly 18 cycles of the selected 900 Hz signal or
     # 40 cycles of the cutaway's 2 kHz tone. Compare their spectral power directly.
     def power(block, frequency):
@@ -47,19 +47,29 @@ def verify_audio_identity(path):
         return previous**2 + before_previous**2 - coefficient * previous * before_previous
 
     selected_blocks = 0
-    for i in range(0, len(pcm) - 960, 960):
-        block = pcm[i:i + 960]
-        if max(abs(x) for x in block) < .12:
-            continue
-        selected = power(block, 900)
-        cutaway = power(block, 2000)
-        # AAC burst edges put a little energy in adjacent frequency bins. A 1.5%
-        # full-scale sinusoid would yield (N * .015 / 2)^2 in the cutaway bin.
-        # The fixture's wrong pair plays a continuous, full-strength 2 kHz tone.
-        cutaway_floor = (len(block) * .015 / 2) ** 2
-        require(cutaway < max(cutaway_floor, .05 * selected), "Cutaway audio leaked into the fixed embedded track")
-        selected_blocks += 1
-    require(selected_blocks > 12, "Selected feed's tone was missing")
+    window_frames = 960
+    stereo_samples = 2 * window_frames
+    # AAC burst edges put a little energy in adjacent frequency bins. A 1.5%
+    # full-scale sinusoid yields this power in a 20 ms window.
+    floor = (window_frames * .015 / 2) ** 2
+    selected_floors = [(window_frames * level / 2) ** 2 for level in (.12, .07)]
+    for i in range(0, len(pcm) - stereo_samples + 1, stereo_samples):
+        selected_powers = []
+        for channel in range(2):
+            block = pcm[i + channel:i + stereo_samples:2]
+            selected = power(block, 900)
+            cutaway = power(block, 2000)
+            require(cutaway < max(floor, .05 * selected),
+                    f"Cutaway audio leaked into channel {channel + 1} of the fixed embedded track")
+            selected_powers.append(selected)
+        left, right = selected_powers
+        if left > selected_floors[0] and right > selected_floors[1]:
+            # The fixture sends about 0.36 on the left and 0.125 on the right.
+            # Allow for AAC variation while rejecting swapped or duplicated channels.
+            require(2.25 * right <= left <= 25 * right,
+                    "Unexpected left/right level balance in the selected stereo pair")
+            selected_blocks += 1
+    require(selected_blocks > 12, "Selected feed's tone was missing from the stereo pair")
     return selected_blocks
 
 
@@ -107,6 +117,7 @@ def run(executable, folder, seconds, profile="legacy"):
             require(receiver.returncode == 0, "Last receiver failed")
         else:
             recordings.pop()  # Listener opened just after clean Stop; no publisher attached.
+    require(len(recordings) >= 2, "No receiver captured media after the planned disconnect")
     durations = [float(probe(path, "-show_format")["format"]["duration"]) for path in recordings]
     media_length = sum(durations[1:])
     interruptions = json.loads((folder / "interruption-seconds.json").read_text())
@@ -117,9 +128,9 @@ def run(executable, folder, seconds, profile="legacy"):
                "largest_interruption_seconds": max(interruptions)}
     rates = []
     for part, path in enumerate(recordings, 1):
-        packets = probe(path, "-select_streams", "v:0", "-show_packets", "-show_entries", "packet=pts_time")["packets"]
-        times = [float(packet["pts_time"]) for packet in packets]
-        require(all(b > a for a, b in zip(times, times[1:])), "Non-monotonic Program video timestamps")
+        packets = probe(path, "-select_streams", "v:0", "-show_packets", "-show_entries", "packet=pts_time").get("packets", [])
+        require(len(packets) >= 2, f"Receiver {part} captured fewer than two video packets")
+        times = presentation_times(packets, "Program video", path)
         rates.append((len(times) - 1) / (times[-1] - times[0]))
         results[f"connection_{part}_fps"] = round(rates[-1], 3)
         # A 29.97 setting silently rounded to 30 would slip a full ten milliseconds in ten
@@ -137,8 +148,7 @@ def run(executable, folder, seconds, profile="legacy"):
     for key, path, start in [("first", first, 1), ("reconnected", second, 1),
                              ("final", recordings[-1], max(0, durations[-1] - 8))]:
         results[key] = window(path, folder / f"window-{key}.mkv", start, profile)
-    # Decode the second connection after cut automation has started. Every white flash is
-    # accompanied by the fixed camera's burst. The cutaway's continuous tone would fail this check.
+    # Inspect the final connection after cut automation has started.
     pictures = output("ffmpeg", "-v", "error", "-xerror", "-threads", "4",
                       "-i", str(folder / "window-final.mkv"), "-map", "0:v",
                       "-vf", "scale=1:1,format=gray", "-fps_mode", "passthrough", "-f", "rawvideo", "-")
@@ -163,9 +173,11 @@ def run(executable, folder, seconds, profile="legacy"):
     require(len(originals) == 2 and {path.name for path in originals} == expected_names,
             "Expected one baseline and one simultaneous original recording")
     for original in originals:
-        streams = {s["codec_type"]: s for s in probe(original, "-show_streams")["streams"]}
-        require({"video", "audio"} <= streams.keys(), f"ISO tracks missing in {original}")
-        video, audio = streams["video"], streams["audio"]
+        streams = probe(original, "-show_streams")["streams"]
+        video_tracks = [stream for stream in streams if stream["codec_type"] == "video"]
+        audio_tracks = [stream for stream in streams if stream["codec_type"] == "audio"]
+        require(len(video_tracks) == len(audio_tracks) == 1, f"Expected one ISO video and one ISO audio track in {original}")
+        video, audio = video_tracks[0], audio_tracks[0]
         # The codec resolver selects HEVC Main for the native 8-bit 420v input.
         iso_format = ("hevc", 1920, 1080) if profile == "maccamera-1080" else ("prores", 3840, 2160)
         require((video["codec_name"], video["width"], video["height"]) == iso_format,
@@ -173,7 +185,8 @@ def run(executable, folder, seconds, profile="legacy"):
         if profile == "maccamera-1080":
             require(video["r_frame_rate"] == "30000/1001", f"ISO capture cadence changed in {original}")
         require((audio["sample_rate"], audio["channels"]) == ("48000", 4), f"ISO source audio changed in {original}")
-    if seconds >= 1800 and len(rss) >= 900:
+    if seconds >= 1800:
+        require(len(rss) >= 900, "Insufficient process RSS samples for the steady-state check")
         early = statistics.median(rss[300:600])
         late = statistics.median(rss[-300:])
         results["steady_state_rss_change_mib"] = round((late - early) / 1024, 1)

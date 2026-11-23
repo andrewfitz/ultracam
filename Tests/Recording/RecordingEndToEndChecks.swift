@@ -857,6 +857,22 @@ private final class SyntheticSourceWriter: SourceRecordingWriter, @unchecked Sen
     XCTAssertEqual(recorder.state, .failed)
   }
 
+  func testDuplicateStartDoesNotReadmitOrFailAnActiveTake() throws {
+    let space = CountingSpaceCheck()
+    space.failAfter = 1
+    let config = try SourceRecordingConfiguration(feedID: .init("duplicate-start"),
+      outputURL: URL(fileURLWithPath: "/tmp/duplicate-start.mov"), width: 16, height: 16,
+      spaceCheckInterval: 60, checkAvailableSpace: { try space.check($0) })
+    let recorder = try SourceRecorderCore(configuration: config, writerFactory: { SyntheticSourceWriter() })
+    try recorder.start()
+    XCTAssertThrowsError(try recorder.start()) { error in
+      XCTAssertEqual(error as? SourceRecordingError, .invalidState(.recording, operation: "start"))
+    }
+    XCTAssertEqual(space.calls, 1)
+    XCTAssertEqual(recorder.state, .recording)
+    try recorder.stop()
+  }
+
   func testAdapterReusesOneFormatDescriptionForTheTake() throws {
     let writer = SyntheticSourceWriter()
     let config = try configuration(feed: "format-cache", url: URL(fileURLWithPath: "/tmp/format-cache.mov"))

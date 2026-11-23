@@ -77,6 +77,48 @@ final class CacheWarmUpRegressionTests: XCTestCase {
     }
   }
 
+  func testOutOfOrderLookupPreservesMostRecentUse() throws {
+    let gpu = try requireGPU()
+    let cache = MonitorTextureCache(device: gpu.device, residency: gpu.engine.residency, idleLifetime: 2)
+    for (layout, planes) in [(PixelLayout.v210, 1), (.nv12, 2)] {
+      let pixelBuffer = try buffer(layout)
+      let recent = try cache.frame(pixelBuffer, now: 10)
+      _ = try cache.frame(pixelBuffer, now: 8)
+      cache.sweep(now: 11)
+      XCTAssertEqual(cache.count, planes)
+      let retained = try cache.frame(pixelBuffer, now: 11)
+      XCTAssertTrue(retained.primaryTexture === recent.primaryTexture)
+      XCTAssertTrue(retained.chroma === recent.chroma)
+      cache.sweep(now: 14)
+      XCTAssertEqual(cache.count, 0)
+    }
+  }
+
+  func testDueSweepReusesTheCachedPlaneOfAPartialPair() throws {
+    let gpu = try requireGPU()
+    let residency = try MonitorResidency(device: gpu.device)
+    let pixelBuffer = try buffer(.nv12)
+    let surface = try XCTUnwrap(CVPixelBufferGetIOSurface(pixelBuffer)?.takeUnretainedValue())
+    for plane in 0...1 {
+      let cache = MonitorTextureCache(device: gpu.device, residency: residency)
+      let cached = try cache.makeTexture(
+        iosurface: surface, plane: plane, format: plane == 0 ? .r8Unorm : .rg8Unorm,
+        width: CVPixelBufferGetWidthOfPlane(pixelBuffer, plane),
+        height: CVPixelBufferGetHeightOfPlane(pixelBuffer, plane), owner: 1, now: 1)
+      _ = try cache.frame(try buffer(.bgra8), owner: 9, now: 1)
+      let made = cache.texturesMade
+      let commits = residency.commitCount
+
+      let frame = try cache.frame(pixelBuffer, owner: 2, now: 4)
+
+      XCTAssertTrue((plane == 0 ? frame.luma : frame.chroma) === cached)
+      XCTAssertEqual(cache.texturesMade, made + 1)
+      XCTAssertEqual(residency.commitCount, commits + 2, "one new plane and one idle removal")
+      XCTAssertEqual(cache.count(owner: 2), 2)
+      XCTAssertEqual(cache.count(owner: 9), 0)
+    }
+  }
+
   // MARK: - Warm-up: the compute stand-in
 
   /// After warm-up, a compute surface's first state change (a tool, clean, a

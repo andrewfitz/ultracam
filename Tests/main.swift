@@ -361,6 +361,7 @@ suite.addTest(XCTestSuite(forTestCaseClass: RecordingCadenceConformerChecks.self
 suite.addTest(XCTestSuite(forTestCaseClass: RecordingCadenceSettingsChecks.self))
 suite.addTest(XCTestSuite(forTestCaseClass: RecordingPackedWriterChecks.self))
 suite.addTest(XCTestSuite(forTestCaseClass: RecordingLUTBurnInChecks.self))
+suite.addTest(XCTestSuite(forTestCaseClass: RecordingLUTRendererChecks.self))
 suite.addTest(XCTestSuite(forTestCaseClass: RecordingLUTBurnInSettingsChecks.self))
 suite.addTest(XCTestSuite(forTestCaseClass: DeviceAPIConformance.self))
 suite.addTest(XCTestSuite(forTestCaseClass: CameraControlContractChecks.self))

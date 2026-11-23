@@ -7,11 +7,48 @@ import Metal
 import XCTest
 
 @objcMembers final class CaptureCPUMemoryBridgeChecks: XCTestCase {
+  func testFatalClosesNativeDeliveryBeforeCPUIngestCanActivate() throws {
+    let source = CPUMemoryBridgeSession()
+    let fixture = try auditFixture()
+    var count = 0
+    let bridge = CaptureServicesBridge(makeSession: { _ in source },
+      cpuIngest: { _, _ in XCTFail("Ingest started after the terminal event") })
+    try bridge.start(deviceID: "cpu:fixture", timing: .automatic,
+      callbacks: CaptureLegacyCallbacks(typed: { _ in count += 1 }))
+    defer { bridge.stop() }
+    let envelope = fixture.delivery
+    source.emit(CaptureDelivery(sequence: 1, epochID: envelope.epochID, formatSignature: envelope.formatSignature,
+      clockBindings: envelope.clockBindings, mappingRevision: 0, payload: .event(.fatal("Source stopped"))))
+    source.emit(CaptureDelivery(sequence: 2, epochID: envelope.epochID, formatSignature: envelope.formatSignature,
+      clockBindings: envelope.clockBindings, mappingRevision: 0, payload: envelope.payload))
+    XCTAssertEqual(count, 1)
+  }
+
   func testCPUIngestAndFollowingEventRemainOrderedWithNativePixelIdentity() throws {
     try checkBridge(allowCopy: false, vmEvidence: true)
   }
   func testExplicitCompatibilityCopyIsCountedAndNeverChangesPixelIdentity() throws {
     try checkBridge(allowCopy: true, vmEvidence: false)
+  }
+  func testMalformedHostTimeDoesNotBecomeLegacyAttachment() throws {
+    let source = CPUMemoryBridgeSession()
+    let fixture = try auditFixture()
+    let done = expectation(description: "CPU frame without host attachment")
+    let output = fixture.output
+    let bridge = CaptureServicesBridge(makeSession: { _ in source }, cpuIngest: { _, finish in finish(.success(output)) })
+    try bridge.start(deviceID: "cpu:fixture", timing: .automatic, callbacks: CaptureLegacyCallbacks(typed: { delivery in
+      defer { done.fulfill() }
+      guard case .frame(let image, _) = delivery.payload else { return XCTFail("Expected the ingested frame") }
+      XCTAssertNil(CVBufferCopyAttachment(image.value, DeviceAPI.captureHostTimeAttachmentKey as CFString, nil))
+    }))
+    defer { bridge.stop() }
+    let envelope = fixture.delivery
+    let info = CaptureFrameInfo(epochID: envelope.epochID, formatSignature: envelope.formatSignature,
+      presentationTime: .zero, duration: CMTime(value: 1, timescale: 30), signalValid: true, timecode: nil,
+      captureHostTime: CMTime(value: -123, timescale: -1, flags: .valid, epoch: 0))
+    source.emit(CaptureDelivery(sequence: 1, epochID: envelope.epochID, formatSignature: envelope.formatSignature,
+      clockBindings: envelope.clockBindings, mappingRevision: 0, payload: .cpuMemory(fixture.frame, info)))
+    wait(for: [done], timeout: 2)
   }
   func testStopCancelsLateGPUCompletionAndQueuedMetadata() throws {
     let source = CPUMemoryBridgeSession()

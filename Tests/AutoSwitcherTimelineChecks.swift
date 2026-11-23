@@ -16,18 +16,18 @@ import XCTest
         events.compactMap { $0["sequence"] as? Int }, object["ended_at_unix_ms"] != nil)
     }
 
-    for frame in 1...29 { recorder.recordTick(time: CMTime(value: Int64(frame), timescale: 30)) }
+    for frame in 1...29 { recorder.recordControlEvent(.tick(time: Double(frame) / 30)) }
     XCTAssertEqual(try snapshot(at: oldURL).count, 0)
-    recorder.recordTick(time: CMTime(value: 30, timescale: 30))
+    recorder.recordControlEvent(.tick(time: 1))
     let deadline = ContinuousClock.now + .seconds(5)
     while try snapshot(at: oldURL).count == 0, ContinuousClock.now < deadline {
       try await Task.sleep(for: .milliseconds(5))
     }
     XCTAssertEqual(try snapshot(at: oldURL).sequence, Array(1...30))
 
-    for frame in 31...63 { recorder.recordTick(time: CMTime(value: Int64(frame), timescale: 30)) }
+    for frame in 31...63 { recorder.recordControlEvent(.tick(time: Double(frame) / 30)) }
     recorder.setOutputFolder(root.appendingPathComponent("moved"))
-    recorder.recordTick(time: CMTime(value: 64, timescale: 30))
+    recorder.recordControlEvent(.tick(time: 64.0 / 30))
     recorder.finish()
     XCTAssertEqual(try snapshot(at: oldURL).sequence, Array(1...63))
     XCTAssertFalse(try snapshot(at: oldURL).ended)
@@ -57,7 +57,7 @@ import XCTest
 
     try FileManager.default.removeItem(at: root)
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-    for frame in 1...60 { recorder.recordTick(time: CMTime(value: Int64(frame), timescale: 30)) }
+    for frame in 1...60 { recorder.recordControlEvent(.tick(time: Double(frame) / 30)) }
     recorder.recordError("checkpoint during backoff")
     XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
     recorder.finish()
@@ -91,9 +91,10 @@ import XCTest
       expiresAt: CMTime(seconds: 6.0, preferredTimescale: 60_000), confidence: 0.9,
       reason: "emphasisBoundary", forced: false)
     recorder.recordInstruction(instruction, from: FeedID(rawValue: "anchor"))
-    recorder.recordApplied(decisionID: decisionID, target: FeedID(rawValue: "emphasis"),
+    recorder.markCutApplied(decisionID: decisionID, target: FeedID(rawValue: "emphasis"),
       sourceTime: CMTime(value: 300_600, timescale: 60_000),
       programTime: CMTime(value: 300_660, timescale: 60_000))
+    recorder.recordControlEvent(.acknowledge(decisionID: decisionID, time: nil))
     recorder.finish()
     if let error = recorder.lastError { XCTFail("Timeline write failed: \(error)") }
     XCTAssertNotNil(recorder.outputFileURL.lastPathComponent.range(
@@ -148,9 +149,10 @@ import XCTest
       targetCameraID: FeedID(rawValue: "B"), cutTime: CMTime(value: 100, timescale: 1),
       expiresAt: CMTime(value: 101, timescale: 1), confidence: 1, reason: "forcedMaximumShotDuration", forced: true)
     recorder.recordInstruction(instruction, from: FeedID(rawValue: "A"))
-    recorder.recordRejected(decisionID: UUID(uuidString: "00000000-0000-0000-0000-000000000124")!)
-    recorder.recordApplied(decisionID: id, target: FeedID(rawValue: "B"),
-      sourceTime: CMTime(value: 5, timescale: 1), programTime: CMTime(value: 1000, timescale: 1), directorAppliedAt: nil)
+    recorder.recordControlEvent(.reject(decisionID: UUID(uuidString: "00000000-0000-0000-0000-000000000124")!))
+    recorder.markCutApplied(decisionID: id, target: FeedID(rawValue: "B"),
+      sourceTime: CMTime(value: 5, timescale: 1), programTime: CMTime(value: 1000, timescale: 1))
+    recorder.recordControlEvent(.acknowledge(decisionID: id, time: nil))
     recorder.finish()
     let data = try Data(contentsOf: recorder.outputFileURL)
     let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
@@ -172,12 +174,28 @@ import XCTest
     let recorder = AutoSwitcherTimelineRecorder(settings: NaturalTalkingHeadSettings(),
       anchor: FeedID(rawValue: "anchor"), emphasis: FeedID(rawValue: "emphasis"), outputFolder: folder)
     for index: Int64 in [1, 2, 1_000_000] {
-      recorder.recordTick(time: CMTime(value: index * 1001, timescale: 24_000))
+      recorder.recordControlEvent(.tick(time: CMTimeGetSeconds(CMTime(value: index * 1001, timescale: 24_000))))
     }
     recorder.finish()
     let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: recorder.outputFileURL)) as? [String: Any])
     let events = try XCTUnwrap(object["events"] as? [[String: Any]])
     XCTAssertEqual(events.compactMap { $0["media_time_ticks"] as? Int64 }, [10_010, 20_020, 10_010_000_000])
+  }
+
+  func testUnconfiguredCameraHealthDoesNotAdvanceTheJournalClock() throws {
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let recorder = AutoSwitcherTimelineRecorder(settings: NaturalTalkingHeadSettings(),
+      anchor: FeedID(rawValue: "A"), emphasis: FeedID(rawValue: "B"), outputFolder: folder)
+    recorder.recordControlEvent(.health(cameraID: "unconfigured", healthy: false, time: 100))
+    recorder.recordControlEvent(.tick(time: 10))
+    recorder.recordControlEvent(.manualOverride(cameraID: "B", time: 10))
+    recorder.finish()
+
+    let data = try Data(contentsOf: recorder.outputFileURL)
+    let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    let cuts = try XCTUnwrap(object["cuts"] as? [[String: Any]])
+    XCTAssertEqual(cuts.first?["session_generation"] as? UInt64, 1)
   }
 
   func testTimelineRoundsDirectorSecondsToNearestTick() throws {
@@ -190,6 +208,7 @@ import XCTest
     recorder.recordAudioCue(AutoSwitcherAudioCue(id: 1, time: seconds,
       duration: 0.02, speechEnergy: 0, pauseDuration: 0, emphasis: 0, laughter: 0,
       speechStart: false, speechStop: false, sessionGeneration: 1))
+    recorder.recordControlEvent(.tick(time: seconds))
     recorder.recordTranscript(AutoSwitcherTranscriptCue(segmentID: "s", revision: 0,
       start: 0, end: seconds, kind: "sentenceEnd", confidence: 1, isFinal: true, sessionGeneration: 1))
     recorder.finish()
@@ -239,11 +258,12 @@ import XCTest
     let pending = instruction("B")
     recorder.recordInstruction(pending, from: nil)
     recorder.recordControlEvent(.manualOverride(cameraID: "B", time: 20))
-    recorder.recordApplied(decisionID: pending.decisionID, target: FeedID(rawValue: "B"),
+    recorder.markCutApplied(decisionID: pending.decisionID, target: FeedID(rawValue: "B"),
       sourceTime: CMTime(value: 20, timescale: 1), programTime: CMTime(value: 20, timescale: 1))
+    recorder.recordControlEvent(.acknowledge(decisionID: pending.decisionID, time: nil))
     recorder.recordInstruction(instruction("A"), from: nil)
-    recorder.recordTick(time: CMTime(value: 20, timescale: 1))
-    recorder.recordTick(time: CMTime(value: 10, timescale: 1))
+    recorder.recordControlEvent(.tick(time: 20))
+    recorder.recordControlEvent(.tick(time: 10))
     recorder.recordControlEvent(.manualOverride(cameraID: "B", time: 10))
     recorder.finish()
     let object = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: recorder.outputFileURL)) as? [String: Any])

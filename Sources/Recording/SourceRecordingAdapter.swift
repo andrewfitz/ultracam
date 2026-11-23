@@ -58,8 +58,7 @@ final class SourceRecordingCallbackAdapter: @unchecked Sendable {
   /// replacing its image buffer, format description, timing, or attachments.
   @discardableResult
   func appendRawVideo(sample: CMSampleBuffer) -> Bool {
-    guard Self.hasValidTiming(sample) else { return reject() }
-    return recorder.appendVideo(sample)
+    recorder.appendVideo(sample)
   }
 
   /// Convenience spelling for callback code that already owns a sample.
@@ -104,8 +103,7 @@ final class SourceRecordingCallbackAdapter: @unchecked Sendable {
   /// timing. The recorder retains the sample until its callback queue drains.
   @discardableResult
   func appendEmbeddedAudio(sample: CMSampleBuffer) -> Bool {
-    guard Self.hasValidTiming(sample) else { return reject(video: false) }
-    return recorder.appendAudio(sample)
+    recorder.appendAudio(sample)
   }
 
   @discardableResult
@@ -156,8 +154,9 @@ final class SourceRecordingCallbackAdapter: @unchecked Sendable {
     Callbacks(
       video: { [weak self] pixelBuffer, presentationTime, duration, signalValid in
         guard let self else { return false }
-        if signalValid {
-          self.clockLock.withLock { self.audioClock.noteVideo(presentationTime, duration: duration) }
+        self.clockLock.withLock {
+          if signalValid { self.audioClock.noteVideo(presentationTime, duration: duration) }
+          else { self.audioClock.clearVideoPair() }
         }
         return self.appendRawVideo(pixelBuffer: pixelBuffer, presentationTime: presentationTime,
           duration: duration, signalValid: signalValid)
@@ -171,9 +170,10 @@ final class SourceRecordingCallbackAdapter: @unchecked Sendable {
         return self.appendPairedSourceAudio(sourcePCM32, sampleFrameCount: sampleFrameCount,
           packetTime: presentationTime, channelCount: channelCount)
       }, audioPair: { [weak self] time, duration in
-        self?.clockLock.withLock {
-          self?.audioClock.clearVideoPair()
-          if let time, let duration { self?.audioClock.noteVideo(time, duration: duration) }
+        guard let self else { return }
+        self.clockLock.withLock {
+          if let time, let duration { self.audioClock.noteVideo(time, duration: duration) }
+          else { self.audioClock.clearVideoPair() }
         }
       }, sourceAdmission: { [weak self] snapshot in
         guard let self else { return false }
@@ -186,8 +186,9 @@ final class SourceRecordingCallbackAdapter: @unchecked Sendable {
           self.recorder.failSourceAdmission(String(describing: error))
           return false
         }
-        if signalValid {
-          self.clockLock.withLock { self.audioClock.noteVideo(metadata.presentationTime, duration: metadata.duration) }
+        self.clockLock.withLock {
+          if signalValid { self.audioClock.noteVideo(metadata.presentationTime, duration: metadata.duration) }
+          else { self.audioClock.clearVideoPair() }
         }
         return self.appendRawVideo(pixelBuffer: image, presentationTime: metadata.presentationTime,
           duration: metadata.duration, signalValid: signalValid, presentationStartHostTime: metadata.presentationStartHostTime)
@@ -243,7 +244,10 @@ final class SourceRecordingCallbackAdapter: @unchecked Sendable {
     source: SourceAdmissionSnapshot, signalValid: Bool, timecode: Timecode?) -> Bool {
     do {
       try source.validate(metadata, stage: .recordingSource)
-      guard signalValid else { return reject() }
+      guard signalValid else {
+        clockLock.withLock { audioClock.clearVideoPair() }
+        return reject()
+      }
       guard let sample = makeSample(pixelBuffer: image, presentationTime: metadata.presentationTime,
         duration: metadata.duration, presentationStartHostTime: metadata.presentationStartHostTime) else { return reject() }
       let provenance = RecordingSourceProvenance(epochID: source.epochID, formatSignature: source.formatSignature,
@@ -280,8 +284,12 @@ final class SourceRecordingCallbackAdapter: @unchecked Sendable {
   /// a clock jump, and every one is logged and counted on the take.
   private func appendPairedSourceAudio(_ sourcePCM32: Data, sampleFrameCount: Int, packetTime: CMTime,
     channelCount: Int) -> Bool {
-    let (placement, continuation) = clockLock.withLock { () -> (EmbeddedAudioPlacement, [Int32]?) in
-      let placement = audioClock.place(packetTime, sampleFrameCount: sampleFrameCount)
+    let bytesPerFrame = EmbeddedAudioFormat.channelCount * EmbeddedAudioFormat.sourceBytesPerSample
+    guard channelCount == EmbeddedAudioFormat.channelCount, sampleFrameCount > 0,
+      sourcePCM32.count.isMultiple(of: bytesPerFrame), sourcePCM32.count / bytesPerFrame == sampleFrameCount
+    else { return reject(video: false) }
+    let placed = clockLock.withLock { () -> (EmbeddedAudioPlacement, [Int32]?)? in
+      guard let placement = audioClock.place(packetTime, sampleFrameCount: sampleFrameCount) else { return nil }
       if placement.keepsContinuation {
         self.continuation = Self.head(of: sourcePCM32, frames: EmbeddedAudioClockAnchor.crossfadeFrames,
           channelCount: channelCount)
@@ -290,6 +298,7 @@ final class SourceRecordingCallbackAdapter: @unchecked Sendable {
       defer { self.continuation = nil }
       return (placement, self.continuation)
     }
+    guard let (placement, continuation) = placed else { return reject(video: false) }
     let ordinary = placement.trimmedFrames == 0 && placement.silenceFrames == 0 &&
       placement.reanchorShift == nil && placement.drift == nil && !placement.crossfades
     guard ordinary else {
@@ -305,7 +314,7 @@ final class SourceRecordingCallbackAdapter: @unchecked Sendable {
     let feed = feedID.rawValue
     let at = String(format: "%.3f", placement.takeTime)
     if let shift = placement.reanchorShift {
-      let ms = String(format: "%.1f", Double(abs(shift)) / 48)
+      let ms = String(format: "%.1f", Double(shift.magnitude) / 48)
       let way = shift < 0 ? "earlier" : "later"
       if placement.backward {
         Self.log.error("\(feed, privacy: .public): audio re-synced backward: re-anchored \(ms, privacy: .public) ms \(way, privacy: .public) at \(at, privacy: .public) s of the take, into audio already recorded; its overlap is left out")
@@ -332,7 +341,7 @@ final class SourceRecordingCallbackAdapter: @unchecked Sendable {
         presentationTime: CMTime(value: silenceStart, timescale: EmbeddedAudioFormat.sampleRateTimescale)) else {
         return reject(video: false)
       }
-      _ = recorder.appendAudio(silence)
+      guard recorder.appendAudio(silence) else { return false }
       silenceStart += Int64(frames)
       silenceLeft -= frames
     }
@@ -418,14 +427,6 @@ final class SourceRecordingCallbackAdapter: @unchecked Sendable {
     return created
   }
 
-  private static func hasValidTiming(_ sample: CMSampleBuffer) -> Bool {
-    let presentationTime = CMSampleBufferGetPresentationTimeStamp(sample)
-    let duration = CMSampleBufferGetDuration(sample)
-    return presentationTime.isValid && presentationTime.isNumeric &&
-      presentationTime.epoch == 0 && presentationTime.value >= 0 &&
-      duration.isValid && duration.isNumeric && duration.epoch == 0 && duration.value > 0
-  }
-
   private func reject(video: Bool = true) -> Bool {
     recorder.recordDrop(.invalidSample, video: video)
     return false
@@ -506,43 +507,39 @@ struct EmbeddedAudioClockAnchor {
   mutating func clearVideoPair() { pendingVideo = nil }
 
   mutating func noteVideo(_ time: CMTime, duration: CMTime) {
-    guard time.isNumeric, time.epoch == 0, duration.isNumeric, duration.value > 0 else { return }
-    let start = Self.samples(time)
-    pendingVideo = (start, max(1, Self.samples(duration)))
+    pendingVideo = nil
+    guard time.epoch == 0, duration.epoch == 0, duration.value > 0,
+      let start = Self.samples(time), let length = Self.samples(duration) else { return }
+    pendingVideo = (start, max(1, length))
     if firstVideoStart == nil { firstVideoStart = start }
   }
 
-  /// Places one packet. A packet time this contract cannot read is passed
-  /// through whole for the recorder to reject.
-  mutating func place(_ packetTime: CMTime, sampleFrameCount: Int) -> EmbeddedAudioPlacement {
+  /// Places one packet only if its entire interval fits the 48 kHz grid.
+  mutating func place(_ packetTime: CMTime, sampleFrameCount: Int) -> EmbeddedAudioPlacement? {
     guard packetTime.isNumeric, packetTime.epoch == 0,
-      packetTime.timescale == EmbeddedAudioFormat.sampleRateTimescale, sampleFrameCount > 0 else {
-      return EmbeddedAudioPlacement(start: packetTime, keptFrames: sampleFrameCount)
-    }
+      packetTime.timescale == EmbeddedAudioFormat.sampleRateTimescale, packetTime.value >= 0,
+      sampleFrameCount > 0 else { return nil }
     let raw = packetTime.value
     let count = Int64(sampleFrameCount)
     var reanchorShift: Int64?
     var drift: Int64?
-    var natural: Int64
+    var nextOffset = offset ?? 0
     var frameDuration: Int64?
     if let video = pendingVideo {
-      pendingVideo = nil
       frameDuration = video.duration
       let measured = raw - video.start
-      if let current = offset, abs(measured - current) * 2 > video.duration {
-        reanchorShift = current - measured
-        offset = measured
+      if let current = offset, abs(Int128(measured) - Int128(current)) > Int128(video.duration / 2) {
+        reanchorShift = Int64(clamping: Int128(current) - Int128(measured))
+        nextOffset = measured
       } else if offset == nil {
-        offset = measured
+        nextOffset = measured
       }
-      natural = raw - (offset ?? measured)
-      // Sanity: whatever the anchor did, paired audio sits on its frame.
-      if abs(natural - video.start) > video.duration { drift = natural - video.start }
-    } else {
-      // Audio ahead of any frame keeps its own clock.
-      if offset == nil { offset = 0 }
-      natural = raw - (offset ?? 0)
     }
+    let (natural, overflow) = raw.subtractingReportingOverflow(nextOffset)
+    guard !overflow, natural >= 0, natural <= Int64.max - count else { return nil }
+    if let video = pendingVideo, abs(natural - video.start) > video.duration { drift = natural - video.start }
+    pendingVideo = nil
+    offset = nextOffset
     var placement = EmbeddedAudioPlacement(
       start: CMTime(value: natural, timescale: EmbeddedAudioFormat.sampleRateTimescale),
       keptFrames: sampleFrameCount, reanchorShift: reanchorShift, drift: drift,
@@ -557,7 +554,7 @@ struct EmbeddedAudioClockAnchor {
           crossfadePending = true
           placement.keepsContinuation = true
         }
-        if reanchorShift != nil, (next - natural) * 2 > (frameDuration ?? 0) { placement.backward = true }
+        if reanchorShift != nil, next - natural > (frameDuration ?? 0) / 2 { placement.backward = true }
       } else if natural > next, natural - next <= Int64(Self.maximumSilenceFrames) {
         placement.silenceFrames = Int(natural - next)
       }
@@ -570,9 +567,11 @@ struct EmbeddedAudioClockAnchor {
     return placement
   }
 
-  private static func samples(_ time: CMTime) -> Int64 {
-    CMTimeConvertScale(time, timescale: EmbeddedAudioFormat.sampleRateTimescale,
-      method: .roundHalfAwayFromZero).value
+  private static func samples(_ time: CMTime) -> Int64? {
+    let scaled = CMTimeConvertScale(time, timescale: EmbeddedAudioFormat.sampleRateTimescale,
+      method: .roundHalfAwayFromZero)
+    return scaled.isNumeric && scaled.timescale == EmbeddedAudioFormat.sampleRateTimescale && scaled.value >= 0
+      ? scaled.value : nil
   }
 }
 

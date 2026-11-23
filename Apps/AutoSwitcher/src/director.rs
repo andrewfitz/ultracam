@@ -13,6 +13,15 @@ struct Boundary {
     kind: Option<CueKind>,
 }
 
+impl Boundary {
+    fn matches_transcript(&self, cue: &TranscriptCue) -> bool {
+        cue.is_final
+            && self.time == cue.end
+            && self.confidence == cue.confidence
+            && self.kind.as_ref() == Some(&cue.kind)
+    }
+}
+
 // Transcript storage is a HashMap: iteration order must not choose the
 // evidence (and therefore the cut score or return reason) for tied boundaries.
 fn boundary_order(a: &Boundary, b: &Boundary, origin: MediaTime) -> std::cmp::Ordering {
@@ -144,6 +153,10 @@ impl Director {
         self.session_generation
     }
 
+    pub(crate) fn media_time(&self) -> Option<MediaTime> {
+        self.last_media_time
+    }
+
     pub fn process_event(&mut self, event: StreamEvent) -> Vec<SwitcherOutput> {
         match event {
             StreamEvent::Take { camera_id, time } => {
@@ -187,7 +200,7 @@ impl Director {
                 // Emit expiry before `tick` clears the pending decision. A
                 // backward clock, an elapsed deadline, or a target that has
                 // gone unhealthy all invalidate that decision.
-                if let Some(pending) = self.pending.clone() {
+                if let Some(pending) = &self.pending {
                     let time_ok = time.is_finite() && time >= 0.0;
                     let discontinuous =
                         time_ok && self.last_media_time.is_some_and(|last| time + 1e-6 < last);
@@ -245,110 +258,125 @@ impl Director {
         }
     }
 
-    pub fn ingest_audio(&mut self, mut cue: AudioCue) {
+    pub fn ingest_audio(&mut self, cue: AudioCue) {
+        self.accept_audio(cue);
+    }
+
+    /// Returns whether the director accepted an evidence event. Controls use process_event.
+    pub(crate) fn ingest_observation(&mut self, event: &StreamEvent) -> Option<bool> {
+        match event {
+            StreamEvent::Audio { cue } => Some(self.accept_audio(cue.clone())),
+            StreamEvent::Transcript { cue } => Some(self.accept_transcript(cue.clone())),
+            StreamEvent::Video { observation } => Some(self.accept_video(observation)),
+            _ => None,
+        }
+    }
+
+    fn accept_audio(&mut self, mut cue: AudioCue) -> bool {
         if cue.session_generation == 0 {
             cue.session_generation = self.session_generation;
         }
+        let now = self.last_media_time.unwrap_or(0.0);
         if cue.session_generation != self.session_generation
-            || !cue.time.is_finite()
-            || cue.time < 0.0
-            || !cue.duration.is_finite()
-            || cue.duration < 0.0
-            || !cue.speech_energy.is_finite()
-            || !cue.pause_duration.is_finite()
-            || !cue.emphasis.is_finite()
-            || !cue.laughter.is_finite()
+            || !cue.has_valid_values()
+            || cue.time < self.keep_evidence_from(now)
+            || self.audio.back().is_some_and(|last| cue.time < last.time)
         {
-            return;
+            return false;
         }
         cue.speech_energy = cue.speech_energy.clamp(0.0, 1.0);
         cue.emphasis = cue.emphasis.clamp(0.0, 1.0);
         cue.laughter = cue.laughter.clamp(0.0, 1.0);
         cue.pause_duration = cue.pause_duration.max(0.0);
-        if self.audio.back().is_some_and(|last| cue.time < last.time) {
-            return;
-        }
         self.audio.push_back(cue);
-        self.prune(self.last_media_time.unwrap_or(0.0));
+        true
     }
 
-    pub fn ingest_transcript(&mut self, mut cue: TranscriptCue) {
+    pub fn ingest_transcript(&mut self, cue: TranscriptCue) {
+        self.accept_transcript(cue);
+    }
+
+    fn accept_transcript(&mut self, mut cue: TranscriptCue) -> bool {
         if cue.session_generation == 0 {
             cue.session_generation = self.session_generation;
         }
         if cue.session_generation != self.session_generation
             || cue.segment_id.is_empty()
-            || !cue.start.is_finite()
-            || !cue.end.is_finite()
-            || cue.start < 0.0
-            || cue.end < cue.start
-            || !cue.confidence.is_finite()
+            || !cue.has_valid_values()
         {
-            return;
+            return false;
         }
         cue.confidence = cue.confidence.clamp(0.0, 1.0);
         if let Some(existing) = self.transcripts.get(&cue.segment_id) {
             let same_revision_finalization =
                 cue.revision == existing.revision && !existing.is_final && cue.is_final;
             if existing.is_final && !cue.is_final
-                || (cue.revision < existing.revision && !same_revision_finalization)
+                || cue.revision < existing.revision
                 || (cue.revision == existing.revision && !same_revision_finalization)
             {
-                return;
+                return false;
+            }
+            if self.candidate.as_ref().is_some_and(|candidate| {
+                let boundary = &candidate.boundary;
+                boundary.matches_transcript(existing)
+                    && !boundary.matches_transcript(&cue)
+                    && !self.transcripts.values().any(|other| {
+                        other.segment_id != cue.segment_id && boundary.matches_transcript(other)
+                    })
+            }) {
+                self.clear_candidate();
             }
         }
-        self.transcripts.insert(cue.segment_id.clone(), cue);
-        self.prune(self.last_media_time.unwrap_or(0.0));
+        let now = self.last_media_time.unwrap_or(0.0);
+        if cue.end < self.keep_evidence_from(now) {
+            self.transcripts.remove(&cue.segment_id);
+            false
+        } else {
+            self.transcripts.insert(cue.segment_id.clone(), cue);
+            true
+        }
     }
 
     pub fn ingest_video(&mut self, observation: VideoObservation) {
+        self.accept_video(&observation);
+    }
+
+    fn accept_video(&mut self, observation: &VideoObservation) -> bool {
         if observation.session_generation != 0
             && observation.session_generation != self.session_generation
         {
-            return;
+            return false;
         }
-        if !observation.time.is_finite()
-            || observation.time < 0.0
-            || !observation.motion.is_finite()
-            || !observation.scene_change.is_finite()
-        {
-            return;
+        if !observation.has_valid_values() {
+            return false;
         }
-        if observation.camera_id.is_empty() {
-            return;
+        let Some(camera) = self.health.get_mut(&observation.camera_id) else {
+            return false;
+        };
+        if observation.time < camera.observed_at {
+            return false;
         }
-        if self.health.contains_key(&observation.camera_id) {
-            if self
-                .health
-                .get(&observation.camera_id)
-                .is_some_and(|health| observation.time < health.observed_at)
-            {
-                return;
+        *camera = CameraHealth {
+            motion: Some(observation.motion),
+            gaze: observation.eye_contact,
+            provider: observation.provider_score,
+            score: match self.config.strategy {
+                Strategy::Motion => Some(observation.motion),
+                Strategy::EyeContact => observation.eye_contact,
+                Strategy::Provider => observation.provider_score,
+                _ => None,
             }
-            self.health.insert(
-                observation.camera_id,
-                CameraHealth {
-                    motion: Some(observation.motion),
-                    gaze: observation.eye_contact,
-                    provider: observation.provider_score,
-                    score: match self.config.strategy {
-                        Strategy::Motion => Some(observation.motion),
-                        Strategy::EyeContact => observation.eye_contact,
-                        Strategy::Provider => observation.provider_score,
-                        _ => None,
-                    }
-                    .filter(|score| (0.0..=1.0).contains(score)),
-                    healthy: observation.healthy,
-                    observed_at: observation.time,
-                },
-            );
-        }
+            .filter(|score| (0.0..=1.0).contains(score)),
+            healthy: observation.healthy,
+            observed_at: observation.time,
+        };
         if self
             .last_media_time
             .is_none_or(|last| observation.time >= last)
         {
             self.last_media_time = Some(observation.time);
         }
+        true
     }
 
     pub fn tick(&mut self, now: MediaTime) -> Option<CutInstruction> {
@@ -363,8 +391,9 @@ impl Director {
             self.rebase_after_clock_discontinuity(now);
             return None;
         }
-        self.last_media_time = Some(now);
-        self.prune(now);
+        let clock = self.last_media_time.map_or(now, |last| last.max(now));
+        self.last_media_time = Some(clock);
+        self.prune(clock);
 
         if let Some(pending) = &self.pending {
             let drop_pending =
@@ -379,6 +408,9 @@ impl Director {
             }
         }
         if self.config.manual_hold {
+            if self.candidate.is_some() {
+                self.clear_candidate();
+            }
             return None;
         }
         if self.config.strategy != Strategy::TalkingHead {
@@ -393,7 +425,9 @@ impl Director {
             .last_cut_at
             .is_none_or(|last| now - last >= self.config.cooldown);
         if self.current_camera_id == self.config.emphasis_camera_id
-            && self.latest_audio(now).is_none()
+            && self
+                .latest_audio(now, now + self.config.boundary_window)
+                .is_none()
             && shot_age >= self.config.minimum_shot_duration
             && cooldown_ready
             && self.is_healthy(&self.config.anchor_camera_id)
@@ -407,6 +441,7 @@ impl Director {
                 now + 1.0,
             );
             self.pending = Some(instruction.clone());
+            self.candidate = None;
             self.state = DirectorState::RequestPending;
             return Some(instruction);
         }
@@ -416,6 +451,9 @@ impl Director {
         }
 
         if shot_age < self.config.minimum_shot_duration || !cooldown_ready {
+            if self.candidate.is_some() {
+                self.clear_candidate();
+            }
             return None;
         }
 
@@ -426,12 +464,11 @@ impl Director {
             .as_ref()
             .is_some_and(|candidate| now > candidate.boundary.time + 1.0)
         {
-            self.candidate = None;
-            self.state = self.state_for_current();
+            self.clear_candidate();
         }
 
-        let Some(audio) = self.latest_audio(now) else {
-            self.state = self.state_for_current();
+        let Some(audio) = self.latest_audio(now, now + self.config.boundary_window) else {
+            self.clear_candidate();
             return None;
         };
         let boundary = self.nearest_boundary(now).or_else(|| {
@@ -448,6 +485,7 @@ impl Director {
                 + audio.laughter * 0.08)
                 .clamp(0.0, 1.0);
             if emphasis_score < 0.55 || !self.is_healthy(&self.config.emphasis_camera_id) {
+                self.clear_candidate();
                 return None;
             }
             let pause_score = (audio.pause_duration / 0.5).clamp(0.0, 1.0) as f32;
@@ -465,6 +503,7 @@ impl Director {
             if score < self.config.cut_threshold
                 || score - current_score < self.config.hysteresis_margin
             {
+                self.clear_candidate();
                 return None;
             }
             return self.consider_candidate(now, boundary, score, false);
@@ -475,6 +514,7 @@ impl Director {
             if shot_age < self.config.emphasis_hold
                 || !self.is_healthy(&self.config.anchor_camera_id)
             {
+                self.clear_candidate();
                 return None;
             }
             let resolved = matches!(
@@ -482,6 +522,7 @@ impl Director {
                 Some(CueKind::SentenceEnd | CueKind::Transition)
             ) || audio.pause_duration >= self.config.pause_boundary_duration;
             if !resolved || audio.emphasis > 0.5 {
+                self.clear_candidate();
                 return None;
             }
             let score = (boundary.confidence * 0.6
@@ -489,6 +530,7 @@ impl Director {
                 + (audio.pause_duration / 0.5).clamp(0.0, 1.0) as f32 * 0.15)
                 .clamp(0.0, 1.0);
             if score < self.config.cut_threshold - 0.08 {
+                self.clear_candidate();
                 return None;
             }
             return self.consider_candidate(now, boundary, score, true);
@@ -540,37 +582,47 @@ impl Director {
         true
     }
 
-    fn matches_rule(&self, rule: &crate::model::SwitchRule, now: MediaTime) -> bool {
+    fn matching_rule(&self, now: MediaTime) -> Option<&crate::model::SwitchRule> {
         use crate::model::Signal;
-        let camera = self
-            .health
-            .get(&rule.target)
-            .filter(|c| (0.0..=1.0).contains(&(now - c.observed_at)));
-        let audio = self.latest_audio(now);
-        rule.all.iter().all(|condition| {
-            let value = match condition.signal {
-                Signal::Motion => camera.and_then(|c| c.motion),
-                Signal::EyeContact => camera.and_then(|c| c.gaze),
-                Signal::ProviderScore => camera.and_then(|c| c.provider),
-                Signal::AudioFeature => audio
-                    .and_then(|a| a.features.get(condition.name.as_deref()?))
-                    .copied(),
-                Signal::Energy => audio.map(|a| a.speech_energy),
-                Signal::Emphasis => audio.map(|a| a.emphasis),
-                Signal::Laughter => audio.map(|a| a.laughter),
-                Signal::PauseSeconds => audio.map(|a| a.pause_duration as f32),
-                Signal::QuestionConfidence => self
-                    .transcripts
-                    .values()
-                    .filter(|t| {
-                        t.is_final
-                            && t.kind == CueKind::Question
-                            && (0.0..=1.0).contains(&(now - t.end))
-                    })
-                    .map(|t| t.confidence)
-                    .max_by(f32::total_cmp),
+        let audio = self.latest_audio(now, now);
+        let question_confidence = std::cell::OnceCell::new();
+        self.config.rules.iter().find(|rule| {
+            let Some(camera) = self
+                .health
+                .get(&rule.target)
+                .filter(|camera| camera.healthy)
+            else {
+                return false;
             };
-            value.is_some_and(|v| v >= condition.minimum)
+            let video = (0.0..=1.0)
+                .contains(&(now - camera.observed_at))
+                .then_some(camera);
+            rule.all.iter().all(|condition| {
+                let value = match condition.signal {
+                    Signal::Motion => video.and_then(|c| c.motion),
+                    Signal::EyeContact => video.and_then(|c| c.gaze),
+                    Signal::ProviderScore => video.and_then(|c| c.provider),
+                    Signal::AudioFeature => audio
+                        .and_then(|a| a.features.get(condition.name.as_deref()?))
+                        .copied(),
+                    Signal::Energy => audio.map(|a| a.speech_energy),
+                    Signal::Emphasis => audio.map(|a| a.emphasis),
+                    Signal::Laughter => audio.map(|a| a.laughter),
+                    Signal::PauseSeconds => audio.map(|a| a.pause_duration as f32),
+                    Signal::QuestionConfidence => *question_confidence.get_or_init(|| {
+                        self.transcripts
+                            .values()
+                            .filter(|t| {
+                                t.is_final
+                                    && t.kind == CueKind::Question
+                                    && (0.0..=1.0).contains(&(now - t.end))
+                            })
+                            .map(|t| t.confidence)
+                            .max_by(f32::total_cmp)
+                    }),
+                };
+                value.is_some_and(|v| v >= condition.minimum)
+            })
         })
     }
 
@@ -582,16 +634,15 @@ impl Director {
         {
             return None;
         }
-        let routes: Vec<_> = self.config.targets().collect();
-        let index = routes
-            .iter()
-            .position(|id| id.as_str() == self.current_camera_id)?;
-        let mut candidates = routes
-            .iter()
-            .cycle()
+        let index = self
+            .config
+            .targets()
+            .position(|id| id == &self.current_camera_id)?;
+        let mut candidates = self
+            .config
+            .targets()
             .skip(index + 1)
-            .take(routes.len() - 1)
-            .copied()
+            .chain(self.config.targets().take(index))
             .filter(|id| self.is_healthy(id));
         let score = |id: &String| {
             let camera = self.health.get(id)?;
@@ -602,11 +653,7 @@ impl Director {
         let (target, confidence) = if self.config.strategy == Strategy::Timer || !current_ok {
             (candidates.next()?, 1.0)
         } else if self.config.strategy == Strategy::Rules {
-            let rule = self
-                .config
-                .rules
-                .iter()
-                .find(|r| self.is_healthy(&r.target) && self.matches_rule(r, now))?;
+            let rule = self.matching_rule(now)?;
             if rule.target == self.current_camera_id {
                 return None;
             }
@@ -745,20 +792,21 @@ impl Director {
         }
         let deadline = self.shot_started_at + self.config.maximum_shot_duration;
         let grace_deadline = deadline + self.config.forced_cut_grace_period;
+        let earliest = deadline - self.config.forced_boundary_lookback;
+        let audio_start = self.audio.partition_point(|cue| cue.time < earliest);
         let boundary = self
-            .boundaries()
+            .boundaries(audio_start)
             .filter(|b| {
-                b.time >= deadline - self.config.forced_boundary_lookback
+                b.time >= earliest
                     && b.time <= grace_deadline + self.config.boundary_window
+                    && b.time <= now + self.config.boundary_window
                     // Sparse ticks may arrive after this boundary's decision
                     // would expire. Let the absolute-cap fallback cut at now.
                     && now <= grace_deadline.max(b.time.max(self.shot_started_at)) + 1.0
             })
             .min_by(|a, b| boundary_order(a, b, deadline));
         let (cut_time, confidence) = match boundary {
-            Some(boundary) if boundary.time <= now + self.config.boundary_window => {
-                (boundary.time.max(self.shot_started_at), boundary.confidence)
-            }
+            Some(boundary) => (boundary.time.max(self.shot_started_at), boundary.confidence),
             _ if now >= grace_deadline => (now, 0.35),
             _ => return None,
         };
@@ -783,31 +831,26 @@ impl Director {
         return_to_anchor: bool,
     ) -> Option<CutInstruction> {
         let target = if return_to_anchor {
-            self.config.anchor_camera_id.clone()
+            &self.config.anchor_camera_id
         } else {
-            self.config.emphasis_camera_id.clone()
+            &self.config.emphasis_camera_id
         };
         let same = self.candidate.as_ref().is_some_and(|candidate| {
-            candidate.target == target
-                && candidate.return_to_anchor
-                && return_to_anchor
-                && (candidate.boundary.time - boundary.time).abs() < self.config.boundary_window
-                || candidate.target == target
-                    && !candidate.return_to_anchor
-                    && !return_to_anchor
-                    && (candidate.boundary.time - boundary.time).abs() < self.config.boundary_window
+            &candidate.target == target
+                && candidate.return_to_anchor == return_to_anchor
+                && (candidate.boundary.time - boundary.time).abs() <= self.config.boundary_window
         });
         if same {
             if let Some(candidate) = self.candidate.as_mut() {
-                candidate.score = candidate.score.max(score);
                 if score >= candidate.score {
+                    candidate.score = score;
                     candidate.boundary = boundary;
                 }
             }
         } else {
             self.candidate = Some(Candidate {
-                target,
-                boundary: boundary.clone(),
+                target: target.clone(),
+                boundary,
                 score,
                 // Dwell measures how long this candidate has been observed,
                 // rather than how far its boundary lies in the past.
@@ -825,13 +868,6 @@ impl Director {
             return None;
         }
         let candidate = self.candidate.take()?;
-        if candidate.boundary.time <= self.shot_started_at + 1e-6
-            || self
-                .last_cut_at
-                .is_some_and(|last| candidate.boundary.time <= last + 1e-6)
-        {
-            return None;
-        }
         let reason = if return_to_anchor {
             CutReason::EmphasisResolved
         } else {
@@ -871,27 +907,36 @@ impl Director {
         }
     }
 
-    fn latest_audio(&self, now: MediaTime) -> Option<&AudioCue> {
-        self.audio
-            .iter()
-            .rev()
-            .find(|cue| cue.time <= now + self.config.boundary_window && now - cue.time <= 1.2)
+    fn latest_audio(&self, now: MediaTime, latest: MediaTime) -> Option<&AudioCue> {
+        let cue = self.audio.back()?;
+        let cue = if cue.time <= latest {
+            cue
+        } else {
+            let end = self.audio.partition_point(|cue| cue.time <= latest);
+            self.audio.get(end.checked_sub(1)?)?
+        };
+        (now - cue.time <= 1.2).then_some(cue)
     }
 
     fn nearest_boundary(&self, now: MediaTime) -> Option<Boundary> {
-        self.boundaries()
+        let audio_start = self
+            .audio
+            .partition_point(|cue| now - cue.time > self.config.boundary_window);
+        self.boundaries(audio_start)
             .filter(|b| {
                 let window = if b.kind.is_some() && self.config.mode == "transcriptAssisted" {
                     self.config.boundary_window + self.config.transcript_output_delay
                 } else {
                     self.config.boundary_window
                 };
-                (b.time - now).abs() <= window && now <= b.time + 1.0
+                (b.time - now).abs() <= window
+                    && now <= b.time + 1.0
+                    && b.time > self.shot_started_at + 1e-6
             })
             .min_by(|a, b| boundary_order(a, b, now))
     }
 
-    fn boundaries(&self) -> impl Iterator<Item = Boundary> + '_ {
+    fn boundaries(&self, audio_start: usize) -> impl Iterator<Item = Boundary> + '_ {
         let transcripts = self
             .transcripts
             .values()
@@ -905,7 +950,7 @@ impl Director {
             });
         let pauses = self
             .audio
-            .iter()
+            .range(audio_start..)
             .filter(|cue| cue.pause_duration >= self.config.pause_boundary_duration)
             .map(|cue| Boundary {
                 time: cue.time,
@@ -929,10 +974,18 @@ impl Director {
         }
     }
 
+    fn clear_candidate(&mut self) {
+        self.candidate = None;
+        self.state = self.state_for_current();
+    }
+
+    fn keep_evidence_from(&self, now: MediaTime) -> MediaTime {
+        (now - self.config.maximum_shot_duration - self.config.forced_boundary_lookback - 2.0)
+            .max(0.0)
+    }
+
     fn prune(&mut self, now: MediaTime) {
-        let keep_from =
-            (now - self.config.maximum_shot_duration - self.config.forced_boundary_lookback - 2.0)
-                .max(0.0);
+        let keep_from = self.keep_evidence_from(now);
         while self.audio.front().is_some_and(|cue| cue.time < keep_from) {
             self.audio.pop_front();
         }

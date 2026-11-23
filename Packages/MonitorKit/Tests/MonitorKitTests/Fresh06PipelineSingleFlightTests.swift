@@ -52,11 +52,20 @@ final class Fresh06PipelineSingleFlightTests: XCTestCase {
       target: .init(colorPixelFormat: .rgba16Float), layout: 0, variant: .uber, color: .fromUniforms)
     _ = try engine.specializedPipeline(key)
     _ = try engine.specializedComputePipeline(key)
-    _ = try engine.renderPipeline(key)
-    _ = try engine.computePipeline(key)
-    _ = try engine.copyPipeline(integer: true)
-    _ = try engine.copyPipeline(integer: false)
-    XCTAssertEqual(engine.pipelinesBuiltOnCaller, 0)
-    XCTAssertEqual(engine.computeCompilationsOnCaller, 0)
+    XCTAssertEqual(engine.asynchronousBuildsStarted, 2)
+
+    // A background compile can outlast the join deadline. Only that request
+    // may compile on the caller, even if another key timed out earlier.
+    func verifyJoin<T>(_ counter: KeyPath<MonitorEngine, Int>, _ request: () throws -> T) throws {
+      let builds = engine[keyPath: counter]
+      let abandoned = engine.asynchronousJoinsAbandoned
+      _ = try request()
+      XCTAssertLessThanOrEqual(engine[keyPath: counter] - builds, engine.asynchronousJoinsAbandoned - abandoned)
+    }
+    try verifyJoin(\.pipelinesBuiltOnCaller) { try engine.renderPipeline(key) }
+    try verifyJoin(\.computeCompilationsOnCaller) { try engine.computePipeline(key) }
+    try verifyJoin(\.computeCompilationsOnCaller) { try engine.copyPipeline(integer: true) }
+    try verifyJoin(\.computeCompilationsOnCaller) { try engine.copyPipeline(integer: false) }
+    XCTAssertEqual(engine.failedPipelineCount, 0)
   }
 }

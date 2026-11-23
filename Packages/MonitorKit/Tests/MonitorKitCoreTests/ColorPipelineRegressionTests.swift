@@ -24,6 +24,59 @@ final class ColorPipelineRegressionTests: XCTestCase {
 
   func grey(_ v: Double) -> ColorRGB { ColorRGB(r: v, g: v, b: v) }
 
+  func testOverlayClampsAuthoredChannelsOnNativeAndConvertedTargets() {
+    let extreme = ColorRGB(r: .greatestFiniteMagnitude, g: -.greatestFiniteMagnitude, b: 0.25)
+    let clamped = ColorRGB(r: 1, g: 0, b: 0.25)
+    let native = pipeline(.signalNative)
+    XCTAssertEqual(native.overlayColor(extreme), clamped)
+    XCTAssertEqual(
+      native.overlayColor(ColorRGB(r: .nan, g: .infinity, b: -.infinity)),
+      ColorRGB(r: 0, g: 1, b: 0))
+
+    let converted = pipeline(MonitorOutputColor(primaries: .rec2020, encoding: .extendedLinear))
+    XCTAssertEqual(converted.overlayColor(extreme), converted.overlayColor(clamped))
+  }
+
+  func testLogReferenceDefaultsToDeclaredRangeAndAllowsOverrides() {
+    var signal = log
+    let sample = grey(0.22)
+    for range in [CodeRange.legal, .full] {
+      signal.range = range
+      let p = pipeline(.signalNative, signal: signal, mode: .logToRec709)
+      let expected = DisplayAssist.rec709(sample, log: .sLog3SGamut3Cine, range: range)
+      XCTAssertEqual(p.transformed(sample), expected)
+      XCTAssertEqual(p.present(sample), expected)
+      let otherRange: CodeRange = range == .legal ? .full : .legal
+      let override = DisplayAssist.rec709(sample, log: .sLog3SGamut3Cine, range: otherRange, bitDepth: 8)
+      XCTAssertNotEqual(override, expected)
+      XCTAssertEqual(p.present(sample, range: otherRange, bitDepth: 8), override)
+    }
+  }
+
+  func testLogReferenceUsesConfiguredPictureContainer() {
+    let encoding = LogEncoding(
+      curve: .sLog3, gamut: .sGamut3Cine, transport: .fullRescaledToLegal)
+    let signal = SignalDescription(range: .legal, encoding: .log(encoding))
+    let transform = DisplayTransformSettings(mode: .logToRec709)
+    let value = grey(0.22)
+    for layout in [PixelLayout.bgra8, .rgba16Float, .rgba32Float] {
+      let expectedRange: CodeRange = layout.isFloat ? .full : .legal
+      let expectedDepth = layout.isFloat ? 10 : 8
+      XCTAssertEqual(layout.effectiveRange(signal.range), expectedRange)
+      XCTAssertEqual(layout.codeBitDepth, expectedDepth)
+      let pipeline = MonitorColorPipeline(
+        output: .signalNative, signal: signal, transform: transform,
+        range: layout.effectiveRange(signal.range), bitDepth: layout.codeBitDepth)
+      XCTAssertEqual(
+        pipeline.present(value),
+        DisplayAssist.rec709(value, log: encoding, range: expectedRange, bitDepth: expectedDepth))
+    }
+    let full8 = MonitorColorPipeline(
+      output: .signalNative, signal: signal, transform: transform, range: .full, bitDepth: 8)
+    XCTAssertEqual(full8.present(value), DisplayAssist.rec709(value, log: encoding, range: .full, bitDepth: 8))
+    XCTAssertNotEqual(full8.present(value), full8.present(value, bitDepth: 10))
+  }
+
   // MARK: - LUT convention
 
   /// LUT output is Rec.709 display R'G'B' in every mode, so no transform runs on it:

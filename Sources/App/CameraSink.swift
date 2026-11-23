@@ -181,11 +181,12 @@ final class CameraStreamStopRecovery: @unchecked Sendable {
           size % UInt32(MemoryLayout<CMIODeviceID>.size) == 0, size <= 64 * 1024 else { return true }
     var values = [CMIODeviceID](repeating: 0, count: Int(size) / MemoryLayout<CMIODeviceID>.size)
     if values.isEmpty { return false }
+    var used: UInt32 = 0
     let status = values.withUnsafeMutableBytes { bytes in
-      CMIOObjectGetPropertyData(system, &address, 0, nil, size, &size, bytes.baseAddress!)
+      CMIOObjectGetPropertyData(system, &address, 0, nil, size, &used, bytes.baseAddress!)
     }
-    guard status == noErr else { return true }
-    return values.prefix(Int(size) / MemoryLayout<CMIODeviceID>.size).contains(device)
+    guard status == noErr, used <= size, used.isMultiple(of: UInt32(MemoryLayout<CMIODeviceID>.size)) else { return true }
+    return values.prefix(Int(used) / MemoryLayout<CMIODeviceID>.size).contains(device)
   }
 
   func attach(_ queue: CameraBufferQueue, to token: UUID) {
@@ -201,7 +202,7 @@ final class CameraStreamStopRecovery: @unchecked Sendable {
       guard var entry = entries[token], !entry.retryScheduled else { return }
       entry.queue?.close()
       let status = entry.stop()
-      if status == noErr {
+      if status == noErr || status == kCMIOHardwareNotRunningError {
         entry.queue?.drain()
         entries.removeValue(forKey: token)
       } else if !deviceExists(entry.deviceID) {
@@ -269,22 +270,66 @@ enum CameraStreamNames {
   static let sinkDirection: UInt32 = 0
   static let sourceDirection: UInt32 = 1
 
-  static func pair(_ streams: [(id: UInt32, name: String, direction: UInt32?)],
+  typealias Stream = (id: UInt32, name: String, direction: UInt32?)
+
+  static func describe(_ streams: [CMIOStreamID]) -> [Stream] {
+    streams.map { ($0, name($0), direction($0)) }
+  }
+
+  private static func address(_ selector: Int) -> CMIOObjectPropertyAddress {
+    CMIOObjectPropertyAddress(mSelector: UInt32(selector),
+      mScope: UInt32(kCMIOObjectPropertyScopeGlobal), mElement: UInt32(kCMIOObjectPropertyElementMain))
+  }
+
+  private static func name(_ object: CMIOObjectID) -> String {
+    var property = address(kCMIOObjectPropertyName)
+    var value: Unmanaged<CFString>?
+    let capacity = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+    var size: UInt32 = 0
+    guard CMIOObjectGetPropertyData(object, &property, 0, nil, capacity, &size, &value) == noErr,
+      let value else { return "" }
+    let name = value.takeRetainedValue()
+    return size == capacity ? name as String : ""
+  }
+
+  private static func direction(_ object: CMIOObjectID) -> UInt32? {
+    var property = address(kCMIOStreamPropertyDirection)
+    var value: UInt32 = 0
+    var size = UInt32(MemoryLayout<UInt32>.size)
+    guard CMIOObjectGetPropertyData(object, &property, 0, nil, size, &size, &value) == noErr,
+      size == MemoryLayout<UInt32>.size else { return nil }
+    return value
+  }
+
+  static func source(_ streams: [Stream], named name: String) -> UInt32? {
+    if let source = streams.first(where: { $0.direction == sourceDirection }) { return source.id }
+    if let pair = pair(streams, sinkName: name + " Input", sourceName: name) { return pair.source }
+    return streams.first(where: { $0.direction == nil && !$0.name.isEmpty && $0.name == name })?.id
+  }
+
+  static func pair(_ streams: [Stream],
     sinkName: String, sourceName: String) -> (sink: UInt32, source: UInt32)? {
     let sinkByDirection = streams.first { $0.direction == sinkDirection }?.id
     let sourceByDirection = streams.first { $0.direction == sourceDirection && $0.id != sinkByDirection }?.id
     if let sinkByDirection, let sourceByDirection { return (sinkByDirection, sourceByDirection) }
-    if let sink = streams.first(where: { $0.name == sinkName })?.id,
-      let source = streams.first(where: { $0.name == sourceName && $0.id != sink })?.id {
+    if streams.count == 2, streams[0].id != streams[1].id,
+      let unknown = streams.first(where: { $0.direction == nil }) {
+      if let sinkByDirection { return (sinkByDirection, unknown.id) }
+      if let sourceByDirection { return (unknown.id, sourceByDirection) }
+    }
+    let sinkCandidates = streams.filter { $0.direction == nil || $0.direction == sinkDirection }
+    let sourceCandidates = streams.filter { $0.direction == nil || $0.direction == sourceDirection }
+    if let sink = sinkCandidates.first(where: { !$0.name.isEmpty && $0.name == sinkName })?.id,
+      let source = sourceCandidates.first(where: { !$0.name.isEmpty && $0.name == sourceName && $0.id != sink })?.id {
       return (sink, source)
     }
     guard streams.count == 2 else { return nil }
-    let first = streams[0]
-    let second = streams[1]
-    if first.name == second.name + " Input" { return (first.id, second.id) }
-    if second.name == first.name + " Input" { return (second.id, first.id) }
-    if let source = streams.first(where: { $0.name == sourceName }) {
-      guard let sink = streams.first(where: { $0.id != source.id }) else { return nil }
+    for source in sourceCandidates where !source.name.isEmpty {
+      guard let sink = sinkCandidates.first(where: { $0.id != source.id }) else { continue }
+      if sink.name == source.name + " Input" { return (sink.id, source.id) }
+    }
+    if let source = sourceCandidates.first(where: { !$0.name.isEmpty && $0.name == sourceName }),
+      let sink = sinkCandidates.first(where: { $0.id != source.id }) {
       return (sink.id, source.id)
     }
     return nil
@@ -335,7 +380,7 @@ final class CameraSink {
   let route: CameraSinkRoute
 
   init(bufferQueue: CameraBufferQueue? = nil, route: CameraSinkRoute,
-    registrySnapshot: @escaping () -> VirtualCameraRegistrySnapshot? = { VirtualCameraRegistryStore().load() }) {
+    registrySnapshot: @escaping () -> VirtualCameraRegistrySnapshot? = { VirtualCameraRegistryStore().load(repairPrimary: false) }) {
     queue = bufferQueue
     self.route = route
     self.registrySnapshot = registrySnapshot
@@ -603,14 +648,10 @@ final class CameraSink {
     DerivedOutputContract(format: try program.formatDescription(), duration: program.duration)
   }
 
-  /// The UID selects the feed. Match the published names, then the source/input
-  /// pair. A display name that contains "input" is still the source; the input
-  /// stream is the one named "<source> Input" or the stream whose direction is
-  /// into the device.
+  /// The UID selects the device. Use DAL directions where available, then
+  /// infer the legacy source and sink from their published names.
   private func pairedStreams(_ streams: [UInt32]) throws -> (sink: UInt32, source: UInt32) {
-    let namedStreams = try streams.map { stream -> (id: UInt32, name: String, direction: UInt32?) in
-      (stream, try string(stream, selector: kCMIOObjectPropertyName), direction(stream))
-    }
+    let namedStreams = CameraStreamNames.describe(streams)
     guard let paired = CameraStreamNames.pair(namedStreams, sinkName: route.sinkStreamName,
       sourceName: route.sourceStreamName) else {
       throw VideoError.message("The virtual camera for \(route.feedID ?? "Program") does not publish its source and input streams.")
@@ -622,8 +663,10 @@ final class CameraSink {
     var address = CMIOObjectPropertyAddress(mSelector: UInt32(kCMIOStreamPropertyFormatDescription),
       mScope: UInt32(kCMIOObjectPropertyScopeGlobal), mElement: UInt32(kCMIOObjectPropertyElementMain))
     var description = Unmanaged.passUnretained(format).toOpaque()
-    try check(CMIOObjectSetPropertyData(stream, &address, 0, nil,
-      UInt32(MemoryLayout<CMVideoFormatDescription>.size), &description), "Set virtual camera format")
+    try withExtendedLifetime(format) {
+      try check(CMIOObjectSetPropertyData(stream, &address, 0, nil,
+        UInt32(MemoryLayout<CMVideoFormatDescription>.size), &description), "Set virtual camera format")
+    }
     address.mSelector = UInt32(kCMIOStreamPropertyFrameRate)
     var rate = Double(duration.timescale) / Double(duration.value)
     try check(CMIOObjectSetPropertyData(stream, &address, 0, nil, UInt32(MemoryLayout<Double>.size), &rate),
@@ -788,19 +831,14 @@ final class CameraSink {
     }
     var values = [UInt32](repeating: 0, count: Int(size) / MemoryLayout<UInt32>.size)
     if values.isEmpty { return [] }
+    var used: UInt32 = 0
     try values.withUnsafeMutableBytes { bytes in
-      try check(CMIOObjectGetPropertyData(object, &address, 0, nil, size, &size, bytes.baseAddress!), "Read camera list")
+      try check(CMIOObjectGetPropertyData(object, &address, 0, nil, size, &used, bytes.baseAddress!), "Read camera list")
     }
-    return Array(values.prefix(Int(size) / MemoryLayout<UInt32>.size))
-  }
-
-  private func direction(_ object: CMIOObjectID) -> UInt32? {
-    var address = CMIOObjectPropertyAddress(mSelector: UInt32(kCMIOStreamPropertyDirection),
-      mScope: UInt32(kCMIOObjectPropertyScopeGlobal), mElement: UInt32(kCMIOObjectPropertyElementMain))
-    var value: UInt32 = 0
-    var size = UInt32(MemoryLayout<UInt32>.size)
-    guard CMIOObjectGetPropertyData(object, &address, 0, nil, size, &size, &value) == noErr else { return nil }
-    return value
+    guard used <= size, used.isMultiple(of: UInt32(MemoryLayout<UInt32>.size)) else {
+      throw VideoError.message("Invalid camera device list.")
+    }
+    return Array(values.prefix(Int(used) / MemoryLayout<UInt32>.size))
   }
 
   private func string(_ object: CMIOObjectID, selector: Int) throws -> String {

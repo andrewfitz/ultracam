@@ -111,7 +111,7 @@ pub unsafe extern "C" fn auto_switcher_destroy(handle: *mut AutoSwitcherHandle) 
 #[no_mangle]
 pub extern "C" fn auto_switcher_version() -> *const c_char {
     // The string has static storage and must not be freed by the caller.
-    c"0.1.0".as_ptr()
+    concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr().cast()
 }
 
 /// Stateless interval policy for hosts with an existing frame scheduler.
@@ -120,7 +120,8 @@ pub extern "C" fn auto_switcher_version() -> *const c_char {
 /// selected index. The host retains its route/pending state until application.
 ///
 /// # Safety
-/// origin must point to writable storage and health must contain count bytes.
+/// origin must point to writable storage. If count is nonzero, health must
+/// point to count readable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn auto_switcher_interval(
     origin: *mut f64,
@@ -132,7 +133,7 @@ pub unsafe extern "C" fn auto_switcher_interval(
     count: usize,
     current: isize,
 ) -> isize {
-    if origin.is_null() || health.is_null() || !now.is_finite() || now < 0.0 {
+    if origin.is_null() || (count != 0 && health.is_null()) || !now.is_finite() || now < 0.0 {
         return -1;
     }
     if held {
@@ -150,6 +151,9 @@ pub unsafe extern "C" fn auto_switcher_interval(
         return -1;
     }
     *origin = now;
+    if count == 0 {
+        return -2;
+    }
     let health = std::slice::from_raw_parts(health, count);
     let first = if current < 0 { 0 } else { current as usize + 1 };
     for offset in 0..count {
@@ -159,4 +163,24 @@ pub unsafe extern "C" fn auto_switcher_interval(
         }
     }
     -2
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interval_handles_empty_host_route_array() {
+        let mut origin = f64::NAN;
+        let health = std::ptr::null();
+        // An empty C array may use a null base pointer.
+        let before =
+            unsafe { auto_switcher_interval(&mut origin, 10.0, 2.0, false, false, health, 0, -1) };
+        assert_eq!(before, -1);
+        assert_eq!(origin, 10.0);
+        let elapsed =
+            unsafe { auto_switcher_interval(&mut origin, 12.0, 2.0, false, false, health, 0, -1) };
+        assert_eq!(elapsed, -2);
+        assert_eq!(origin, 12.0);
+    }
 }

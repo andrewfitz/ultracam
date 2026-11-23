@@ -27,6 +27,7 @@ actor CameraControlKeychain: CameraControlCredentialStoring {
             kSecAttrSynchronizable as String: false]
     }
     func load(service: String, account: String) async throws -> ControlCredentials? {
+        try Task.checkCancellation()
         var request = try query(service, account)
         request[kSecReturnData as String] = true
         request[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -44,6 +45,7 @@ actor CameraControlKeychain: CameraControlCredentialStoring {
         return .usernamePassword(username: payload.user, password: payload.password)
     }
     func save(_ credentials: ControlCredentials, service: String, account: String) async throws {
+        try Task.checkCancellation()
         let request = try query(service, account)
         let payload: Payload
         switch credentials { case .usernamePassword(let username, let password): payload = .init(user: username, password: password) }
@@ -61,6 +63,7 @@ actor CameraControlKeychain: CameraControlCredentialStoring {
         guard status == errSecSuccess else { throw CameraControlCredentialError(action: "save", status: status) }
     }
     func delete(service: String, account: String) async throws {
+        try Task.checkCancellation()
         let status = SecItemDelete(try query(service, account) as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else {
             throw CameraControlCredentialError(action: "delete", status: status)

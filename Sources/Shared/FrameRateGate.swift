@@ -17,8 +17,8 @@ struct FrameRateGate {
     // and allowed every frame through while an epoch-bearing PTS could poison
     // the next source generation.
     let durationSeconds = duration.seconds
-    guard pts.isValid, pts.isNumeric, pts.epoch == 0,
-      duration.isValid, duration.isNumeric, duration.epoch == 0,
+    guard pts.isValid, pts.isNumeric, pts.timescale > 0, pts.epoch == 0,
+      duration.isValid, duration.isNumeric, duration.timescale > 0, duration.epoch == 0,
       durationSeconds.isFinite, durationSeconds > 0 else { return false }
     if last.isValid, lastDuration.isValid, CMTimeCompare(lastDuration, duration) != 0 {
       // Callers normally reset on a source-rate change. Keeping this local

@@ -61,7 +61,7 @@ struct UIHelpView: View {
         }
       }
       Section("Good to Know") {
-        Text("Clicking a picture selects that camera; it never cuts. Cut with the toolbar, a strip’s Cut button or ⌃1–⌃4.")
+        Text("Click a picture to select its camera. To cut, use the Program bar below the pictures, a strip’s Cut button or ⌃1–⌃4.")
         Text("Stopping a camera that is recording or on air asks first, and so do stopping several takes and quitting. Cancel is the default, so Return never ends a take.")
         Text("Record › Pause All pauses every take. When every take is paused, it becomes Resume All.")
         Text("LUT On and LUT Off change the picture only, so meeting apps keep their format. Everything in a strip’s Effects menu changes the format they receive, so the meeting’s video updates briefly.")
@@ -78,7 +78,7 @@ struct UIHelpView: View {
         Text("An interrupted take is listed in the toolbar’s Recording Options and in Record › Recover Interrupted Takes. Recovery copies complete fragments into a separate _Recovered.mov without re-encoding and keeps the original.")
       }
       Section("Monitor Tools") {
-        Text("Each camera has its own guides, zebra, false color, focus peaking and scopes. Hover a picture for the full tool bar, or use View › Monitor Tools. Scopes' refresh is set per camera in its Scopes popover.")
+        Text("Each camera has its own guides, zebra, false color, focus peaking and scopes. Hover a picture or focus it with Full Keyboard Access for the full tool bar. You can also use View › Monitor Tools. Scopes' refresh is set per camera in its Scopes popover.")
         Text("New cameras start with monitor tools off. Zebra starts at 95 IRE, and the picture shows the camera’s output with its LUT. Right-click a picture to copy its tools to another camera.")
         Text("Monitor tools never change camera output or recordings. Six-band false color works with any source; S-Log3 and LogC modes need the matching source declaration.")
       }
@@ -87,7 +87,7 @@ struct UIHelpView: View {
       } header: {
         Text("Keyboard Shortcuts")
       } footer: {
-        Text("The keys cover cameras 1 to 4. Cut or select a higher-numbered camera from the Program and Camera menus, the Program bar or its strip’s Cut button. ⌃1–⌃4 are also Mission Control’s Switch to Desktop shortcuts, and macOS takes them first while those are on. If a cut does nothing, turn them off in System Settings › Keyboard › Keyboard Shortcuts › Mission Control, or cut with the toolbar.")
+        Text("The keys cover cameras 1 to 4. Select a higher-numbered camera from the Camera menu. Cut to it from the Program menu, the Program bar or its strip’s Cut button. ⌃1–⌃4 are also Mission Control’s Switch to Desktop shortcuts, and macOS takes them first while those are on. If a cut does nothing, turn them off in System Settings › Keyboard › Keyboard Shortcuts › Mission Control, or cut with the Program bar.")
           .font(.uiMeta).foregroundStyle(.secondary)
           .fixedSize(horizontal: false, vertical: true)
       }
@@ -96,7 +96,7 @@ struct UIHelpView: View {
       } header: {
         Text("Background Shortcuts")
       } footer: {
-        Text("Off until you turn them on in [Settings › General](ultracam-settings:general). They reach Ultracam while a meeting app is in front, and the meeting app doesn’t get the key. Cuts cover cameras 1 to 7, numbered as in the toolbar.")
+        Text("Off until you turn them on in [Settings › General](ultracam-settings:general). They reach Ultracam while a meeting app is in front, and the meeting app doesn’t get the key. Cuts cover cameras 1 to 7, numbered as in the Program bar.")
           .font(.uiMeta).foregroundStyle(.secondary)
           .fixedSize(horizontal: false, vertical: true)
       }

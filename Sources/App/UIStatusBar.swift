@@ -422,8 +422,12 @@ struct UIStatusPopover: View {
         if stream.audioMissing { Text("Stream audio missing").foregroundStyle(.orange).font(.uiMeta) }
         else { LabeledContent("Peak", value: UISettingsStreamingPane.level(stream.audioPeak)).font(.uiValue) }
       }
-      if stream.phase == .streaming && !stream.pictureFresh {
-        Text("No Program picture").foregroundStyle(.orange).font(.uiMeta)
+      if stream.phase == .streaming {
+        if !stream.pictureFresh {
+          Text("No Program picture").foregroundStyle(.orange).font(.uiMeta)
+        } else if let camera = session.cameras.first(where: { $0.id == stream.pictureFeedID }) {
+          LabeledContent("Camera on Stream", value: camera.name).font(.uiRow)
+        }
       }
     }
     if stream.phase == .failed, let error = stream.lastError {
@@ -447,14 +451,16 @@ struct UIStatusPopover: View {
   }
 
   private func recording(_ session: UISessionSnapshot, _ presentation: UISessionPresentation) -> some View {
-    let takes = presentation.cameras.filter { $0.sizeLine != nil }
+    let takes = presentation.cameras.filter(\.recordButtonActive)
     let paused = takes.filter { $0.stripState == .paused }.count
+    let starting = takes.filter { $0.stripState == .starting }.count
+    let rolling = takes.count - paused - starting
     let subtitle = takes.isEmpty ? "Not recording"
-      : [takes.count - paused > 0 ? "\(takes.count - paused) rolling" : nil, paused > 0 ? "\(paused) paused" : nil]
+      : [rolling > 0 ? (rolling == 1 && takes.count == 1 ? "1 take rolling" : "\(rolling) rolling") : nil,
+        paused > 0 ? "\(paused) paused" : nil, starting > 0 ? "\(starting) starting" : nil]
         .compactMap { $0 }.joined(separator: ", ")
     return Group {
-      UIPopoverHeader(symbol: UISymbol.record, title: "Recording", subtitle: takes.isEmpty ? subtitle
-        : takes.count == 1 && paused == 0 ? "1 take rolling" : subtitle)
+      UIPopoverHeader(symbol: UISymbol.record, title: "Recording", subtitle: subtitle)
       if !takes.isEmpty {
         Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 4) {
           GridRow {
@@ -463,19 +469,20 @@ struct UIStatusPopover: View {
           .font(.uiMeta.weight(.semibold)).foregroundStyle(.secondary)
           ForEach(takes) { camera in
             let snapshot = session.cameras.first { $0.id == camera.id }
+            let isStarting = camera.stripState == .starting
             GridRow {
               HStack(spacing: 4) {
-                UIStateGlyph(state: camera.stripState == .paused ? .paused
+                UIStateGlyph(state: isStarting ? .starting : camera.stripState == .paused ? .paused
                   : camera.dropsWarning ? .warning : .recording, size: 7)
                 Text(camera.name).font(.uiRowEmphasis).lineLimit(1)
               }
-              Text(camera.stripState == .paused ? "Paused" : camera.recordDetail).font(.uiValueStrong)
+              Text(isStarting ? "Starting…" : camera.stripState == .paused ? "Paused" : camera.recordDetail).font(.uiValueStrong)
               Text(camera.sizeLine ?? "—").font(.uiValue)
-              Text(snapshot.map { UIFormat.bitrate($0.recording.megabitsPerSecond) } ?? "—").font(.uiValue).fixedSize()
-              Text("\(snapshot?.recording.droppedFrames ?? 0)").font(.uiValue).gridColumnAlignment(.trailing)
+              Text(isStarting ? "—" : snapshot.map { UIFormat.bitrate($0.recording.megabitsPerSecond) } ?? "—").font(.uiValue).fixedSize()
+              Text(isStarting ? "—" : "\(snapshot?.recording.droppedFrames ?? 0)").font(.uiValue).gridColumnAlignment(.trailing)
               Text(camera.timeLeftLine?.replacingOccurrences(of: " left", with: "") ?? "—").font(.uiValue)
             }
-            if let audio = snapshot?.recording.audio {
+            if !isStarting, let audio = snapshot?.recording.audio {
               GridRow {
                 UIIconValue(symbol: UISymbol.audio, label: Self.audioLine(audio), help: audio.note, accessibilityLabel: audio.note)
                   .font(.uiMeta)

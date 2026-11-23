@@ -164,6 +164,8 @@ struct RecordingFeedState: Identifiable, Equatable, Sendable {
   /// (output file, encoder). `status` is already `.recording`; capture
   /// connects to the recorder only once it is ready.
   var isStarting = false
+  /// The current error came from preparation. Saved media and statistics can still belong to the prior take.
+  var failedToStart = false
   /// The format this take records in. A rolling camera shows this, whatever the global choice
   /// has become since. Stale once the take is idle.
   var takeCodec: RecordingCodec?
@@ -177,6 +179,7 @@ struct RecordingFeedState: Identifiable, Equatable, Sendable {
   var takeBurnsInLUT = false
   var isActive: Bool { status != .idle }
   var displayStatus: String {
+    if failedToStart { return "Couldn't start" }
     if statistics?.failed == true { return "Failed" }
     if isStarting && status == .recording { return "Starting…" }
     if status == .idle && statistics != nil { return error == nil ? "Finished" : "Failed" }
@@ -745,12 +748,15 @@ final class NativeRecordingSessionDriver: RecordingSessionDriver, RecordingSessi
   private func manager(for folder: URL, fileExtension: String, naming: RecordingFileNaming) throws -> RecordingOutputManager {
     let root = folder.standardizedFileURL.resolvingSymlinksInPath()
     let key = "\(root.path)\u{0}\(fileExtension.lowercased())\u{0}\(naming.tokens.map(\.rawValue).joined(separator: ","))\u{0}\(naming.cameraSubfolders)"
-    sessionLock.lock()
-    defer { sessionLock.unlock() }
-    if let existing = outputManagers[key] { return existing }
+    if let existing = sessionLock.withLock({ outputManagers[key] }) { return existing }
+    // Preparing a root checks its filesystem and volume. Other cameras can
+    // start or stop while a slow external recording folder is being opened.
     let manager = try RecordingOutputManager(rootDirectory: root, fileExtension: fileExtension, naming: naming)
-    outputManagers[key] = manager
-    return manager
+    return sessionLock.withLock {
+      if let existing = outputManagers[key] { return existing }
+      outputManagers[key] = manager
+      return manager
+    }
   }
 
   private static func timecodePolicy(for mode: RecordingTimecodeMode) -> RecordingTimecodePolicy {
@@ -830,6 +836,7 @@ final class RecordingModel {
   /// The codec or timecode choice changed. Both apply to the next take.
   var onRecordingChoicesChanged: (() -> Void)?
   var onManualStop: ((FeedID) -> Void)?
+  var onRecordingAttempted: ((FeedID) -> Void)?
   var onRecordingStarted: ((FeedID, URL) -> Void)?
   var onRecordingFinished: ((FeedID, URL?) -> Void)?
   var onRecordingSourceEpochCutoff: ((FeedID, CMTime?) -> Void)?
@@ -846,6 +853,7 @@ final class RecordingModel {
   @ObservationIgnored private var statisticsRequest: UInt64 = 0
   @ObservationIgnored private var lastAppliedStatisticsRequest: UInt64 = 0
   private var recordingGenerations: [FeedID: UInt64] = [:]
+  @ObservationIgnored private var deferredStopResults: [FeedID: Result<Void, Error>] = [:]
 
   init(feeds: [RecordingFeedDescriptor] = [], driver: RecordingSessionDriver = UnavailableRecordingSessionDriver(),
     folderStore: RecordingFolderStore? = nil,
@@ -1034,13 +1042,16 @@ final class RecordingModel {
   /// as soon as the take exists; Pause waits for it.
   func record(feedID: FeedID, appTake: AppRecordingTake? = nil) {
     guard let index = index(of: feedID), feeds[index].status == .idle else { return }
+    onRecordingAttempted?(feedID)
     let appFolder: URL?
     do { appFolder = try appTake?.profile.folder() }
     catch {
+      feeds[index].failedToStart = true
       feeds[index].error = "Choose the recording folder for \(appTake?.appName ?? "this app") again."
       return
     }
     guard let folder = appFolder ?? outputFolder(for: feedID) else {
+      feeds[index].failedToStart = true
       feeds[index].error = RecordingUIError.outputFolderRequired.localizedDescription
       return
     }
@@ -1074,6 +1085,7 @@ final class RecordingModel {
     feeds[index].takeVideoMbps = appTake.map { $0.profile.bitrate / 1_000_000 }
     feeds[index].triggerAppID = appTake?.appID
     feeds[index].isStarting = true
+    feeds[index].failedToStart = false
     feeds[index].error = nil
     feeds[index].statistics = (driver is RecordingSessionDriverStatistics) ? RecordingStatistics(compatibilityPolicy: take.compatibilityPolicy) : nil
     driver.startRecording(feedID: feedID, configuration: take) { [weak self] result in
@@ -1093,22 +1105,26 @@ final class RecordingModel {
     switch result {
     case .success:
       startStatisticsUpdates()
-      // A stop that arrived while starting already moved the take on.
-      guard feeds[index].status == .recording else { return }
-      feeds[index].error = (driver as? RecordingSessionDriverDiagnostics)?.startWarning?.localizedDescription
-      if let output = (driver as? RecordingSessionDriverArtifacts)?.recordingOutputURL(feedID: feedID) {
-        onRecordingStarted?(feedID, output)
+      if feeds[index].status == .recording {
+        feeds[index].error = (driver as? RecordingSessionDriverDiagnostics)?.startWarning?.localizedDescription
+        if let output = (driver as? RecordingSessionDriverArtifacts)?.recordingOutputURL(feedID: feedID) {
+          onRecordingStarted?(feedID, output)
+        }
       }
     case let .failure(error):
+      feeds[index].failedToStart = true
       feeds[index].error = error.localizedDescription
-      // A stop requested meanwhile completes on its own and reports idle.
-      guard feeds[index].status == .recording else { return }
-      feeds[index].status = .idle
       feeds[index].savedURL = previousSavedURL
       feeds[index].statistics = previousStatistics
-      activeTakeFolders.removeValue(forKey: feedID)
-      refreshRecovery()
-      notifyFinished()
+      if feeds[index].status == .recording {
+        feeds[index].status = .idle
+        activeTakeFolders.removeValue(forKey: feedID)
+        refreshRecovery()
+        notifyFinished()
+      }
+    }
+    if let stopped = deferredStopResults.removeValue(forKey: feedID) {
+      finishStop(feedID: feedID, generation: generation, result: stopped)
     }
   }
 
@@ -1142,35 +1158,44 @@ final class RecordingModel {
   }
 
   private func stop(feedID: FeedID, automatic: Bool, expectedTakeID: UUID?) {
-    guard let index = index(of: feedID),
+    guard let index = index(of: feedID), let generation = recordingGenerations[feedID],
       feeds[index].status == .recording || feeds[index].status == .paused else { return }
-    if !automatic { onManualStop?(feedID) }
-    let artifacts = driver as? RecordingSessionDriverArtifacts
-    let folder = activeTakeFolders[feedID] ?? outputFolder(for: feedID)
     feeds[index].status = .finishing
     feeds[index].error = nil
+    if !automatic { onManualStop?(feedID) }
     let complete: NativeRecordingSessionDriver.StopCompletion = { [weak self] result in
-      guard let self, let index = self.index(of: feedID) else { return }
-      self.feeds[index].status = .idle
-      self.feeds[index].isStarting = false
-      self.activeTakeFolders.removeValue(forKey: feedID)
-      let saved = self.resolveFinishedFile(artifacts?.finishedOutputURL(feedID: feedID), folder)
-      // A start that failed after Stop was pressed already set the error.
-      if case let .failure(error) = result {
-        self.feeds[index].error = error.localizedDescription
-        // A failed take whose movie closed cleanly is published: Show in Finder finds it.
-        self.feeds[index].savedURL = saved
-      } else if self.feeds[index].error == nil { self.feeds[index].savedURL = saved }
-      self.onRecordingFinished?(feedID, saved)
-      self.refreshRecovery()
-      self.notifyFinished()
-      Task { [weak self] in await self?.refreshStatistics() }
+      self?.finishStop(feedID: feedID, generation: generation, result: result)
     }
     if let expectedTakeID, let native = driver as? NativeRecordingSessionDriver {
       native.stopAtSourceEpoch(feedID: feedID, takeID: expectedTakeID, completion: complete)
     } else {
       driver.stopRecording(feedID: feedID, completion: complete)
     }
+  }
+
+  private func finishStop(feedID: FeedID, generation: UInt64, result: Result<Void, Error>) {
+    guard let index = index(of: feedID), recordingGenerations[feedID] == generation,
+      feeds[index].status == .finishing else { return }
+    // The driver can finish stopping before the pending start result reaches us.
+    // Keep the feed and quit waiters pending until both results are known.
+    if feeds[index].isStarting {
+      deferredStopResults[feedID] = result
+      return
+    }
+    let folder = activeTakeFolders.removeValue(forKey: feedID) ?? outputFolder(for: feedID)
+    var saved: URL?
+    // After a start failure, finishStart restored the prior take's movie and statistics.
+    if !feeds[index].failedToStart {
+      let artifacts = driver as? RecordingSessionDriverArtifacts
+      saved = resolveFinishedFile(artifacts?.finishedOutputURL(feedID: feedID), folder)
+      feeds[index].savedURL = saved
+      if case let .failure(error) = result { feeds[index].error = error.localizedDescription }
+      Task { [weak self] in await self?.refreshStatistics() }
+    }
+    feeds[index].status = .idle
+    onRecordingFinished?(feedID, saved)
+    refreshRecovery()
+    notifyFinished()
   }
 
   private func startStatisticsUpdates() {

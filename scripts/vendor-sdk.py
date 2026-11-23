@@ -19,8 +19,9 @@ import tempfile
 import zipfile
 
 sys.dont_write_bytecode = True
+from vendors import SDK_STAMP as STAMP, check_sdk_version_stamp, stream_sha256, verify_sdk_version_stamp
+
 ROOT = Path(__file__).resolve().parents[1]
-STAMP = '.ultracam-sdk.json'
 MAX_BYTES = 2 * 1024**3
 
 
@@ -61,7 +62,8 @@ def _config(manifest, checkout, sdk_roots=()):
             path = checkout / path
         if not path.is_relative_to(root) or path == root or not re.fullmatch('[0-9a-f]{64}', checksum):
             raise ValueError('Invalid SDK file pin or path outside SDK root')
-        pins[path.relative_to(root).as_posix()] = checksum
+        name = _safe_name(path.relative_to(root).as_posix())
+        pins[name.as_posix()] = checksum
     required = []
     for key in sdk['requiredFiles']:
         path = Path(key)
@@ -83,14 +85,11 @@ def _verify_tree(root, sdk, pins):
         path = root / name
         if path.is_symlink() or path.resolve() != path or not path.is_file():
             raise ValueError(f'Missing or unsafe SDK file: {name}')
-        if _hash(path.read_bytes()) != checksum:
+        with path.open('rb') as stream:
+            actual = stream_sha256(stream)
+        if actual != checksum:
             raise ValueError(f'SDK checksum mismatch: {name}')
-    stamp = root / STAMP
-    if stamp.exists():
-        if stamp.is_symlink():
-            raise ValueError('Unsafe SDK version stamp')
-        if json.loads(stamp.read_text()).get('version') != sdk['version']:
-            raise ValueError('Installed SDK version does not match manifest')
+    verify_sdk_version_stamp(root, sdk['version'])
 
 
 def verify(manifest, checkout=ROOT, sdk_roots=()):
@@ -104,7 +103,7 @@ def verify(manifest, checkout=ROOT, sdk_roots=()):
 def status(manifest, checkout=ROOT, sdk_roots=()):
     try:
         return verify(manifest, checkout, sdk_roots)
-    except (ValueError, OSError, zipfile.BadZipFile) as error:
+    except (ValueError, OSError, RuntimeError, zipfile.BadZipFile) as error:
         sdk = manifest.get('sdk', {})
         reason = str(error)
         if sdk.get('optional', True):
@@ -118,7 +117,7 @@ def _zip_files(archive):
         if len(source.infolist()) > 20000:
             raise ValueError('SDK archive has too many entries')
         for entry in source.infolist():
-            path = _safe_name(entry.filename)
+            path = _safe_name(entry.orig_filename)
             name = path.as_posix()
             key = name.casefold()
             if key in names:
@@ -136,16 +135,21 @@ def _zip_files(archive):
     return files
 
 
-def _archive_files(archive, layout=None):
+def _archive_files(archive, version, layout=None):
     files = _zip_files(archive)
+    if STAMP in files:
+        check_sdk_version_stamp(files[STAMP], version)
     if layout is None:
         return files
-    nested_name = str(_safe_name(layout['nestedArchive']))
-    if nested_name not in files:
-        raise ValueError(f'Missing nested SDK archive: {nested_name}')
-    nested = _zip_files(io.BytesIO(files[nested_name]))
+    if layout.get('nestedArchive') is not None:
+        nested_name = str(_safe_name(layout['nestedArchive']))
+        if nested_name not in files:
+            raise ValueError(f'Missing nested SDK archive: {nested_name}')
+        files = _zip_files(io.BytesIO(files[nested_name]))
+        if STAMP in files:
+            check_sdk_version_stamp(files[STAMP], version)
     mapped, names = {}, set()
-    for name, data in nested.items():
+    for name, data in files.items():
         for mapping in layout['mappings']:
             prefix = mapping['prefix']
             _safe_name(prefix)
@@ -160,6 +164,8 @@ def _archive_files(archive, layout=None):
                 raise ValueError('Duplicate mapped SDK archive path')
             mapped[target] = data
             names.add(target.casefold())
+    if STAMP in mapped:
+        check_sdk_version_stamp(mapped[STAMP], version)
     return mapped
 
 
@@ -171,13 +177,12 @@ def install(manifest, checkout, archive, sdk_roots=()):
         entries = list(destination.iterdir())
         if any(p.name != 'README.md' or p.is_symlink() or not p.is_file() for p in entries):
             raise ValueError('SDK destination contains existing payload; refusing to replace installed files')
-    archive = Path(archive)
-    checksum = _hash(archive.read_bytes())
-    if sdk.get('sha256') and checksum != sdk['sha256']:
-        raise ValueError('SDK archive checksum mismatch')
-    files = _archive_files(archive, sdk.get('archiveLayout'))
-    if STAMP in files and json.loads(files[STAMP]).get('version') != sdk['version']:
-        raise ValueError('SDK archive version does not match manifest')
+    with Path(archive).open('rb') as source:
+        checksum = stream_sha256(source)
+        if sdk.get('sha256') and checksum != sdk['sha256']:
+            raise ValueError('SDK archive checksum mismatch')
+        source.seek(0)
+        files = _archive_files(source, sdk['version'], sdk.get('archiveLayout'))
     # Check all pins before writing even a staging tree. Only pinned files ship.
     for name, expected in pins.items():
         if name not in files or _hash(files[name]) != expected:

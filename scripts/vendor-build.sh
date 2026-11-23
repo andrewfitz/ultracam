@@ -1,11 +1,17 @@
 #!/bin/bash
 # Shared, validated vendor inputs. Manifest data is never evaluated as shell.
 vendor_load_list() {
-  local kind="$1" item
+  local kind="$1" item query_file status=0
   shift
-  python3 "$task_root/scripts/vendors.py" query ${vendor_query_args[@]+"${vendor_query_args[@]}"} --kind "$kind" --null "$@" > "$vendor_query_file" || return $?
+  query_file="$(mktemp "$vendor_output_root/vendor-query.XXXXXX")" || return $?
   vendor_values=()
-  while IFS= read -r -d '' item; do vendor_values+=("$item"); done < "$vendor_query_file"
+  if python3 "$task_root/scripts/vendors.py" query ${vendor_query_args[@]+"${vendor_query_args[@]}"} --kind "$kind" --null "$@" > "$query_file"; then
+    while IFS= read -r -d '' item; do vendor_values+=("$item"); done < "$query_file"
+  else
+    status=$?
+  fi
+  rm -f "$query_file"
+  return "$status"
 }
 
 vendor_configure() {
@@ -13,8 +19,7 @@ vendor_configure() {
   vendor_selected_bridge=""
   vendor_output_root="${test_root:-${check_root:-}}"
   [[ -n "$vendor_output_root" ]] || { echo 'vendor_configure requires test_root or check_root' >&2; return 1; }
-  mkdir -p "$vendor_output_root/native" "$vendor_output_root/modules"
-  vendor_query_file="$vendor_output_root/vendor-query.nul"
+  mkdir -p "$vendor_output_root/native" "$vendor_output_root/modules" || return $?
   vendor_query_args=(--root "$task_root" --membership "$membership")
   [[ -z "$vendor_id" ]] || vendor_query_args+=(--vendor "$vendor_id")
   [[ -z "$group" ]] || vendor_query_args+=(--group "$group")

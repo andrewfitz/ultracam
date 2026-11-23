@@ -95,6 +95,19 @@ import XCTest
 
   // MARK: Sources
 
+  func testCapturePreferencesSaveWithoutRepublishingIdenticalVirtualCameras() throws {
+    try prepare()
+    defer { finish() }
+    let id = ids[0]
+    let published = publisher.published
+    model.updateCamera(id, shareProcessing: false) { $0.automaticFeed = true }
+    XCTAssertEqual(publisher.published, published)
+    let saved = AppSettingsStore(defaults: defaults).loadSnapshot()
+    XCTAssertEqual(saved.feeds.first(where: { $0.id == id })?.automaticFeed, true)
+    XCTAssertTrue(model.renameFeed(id, name: "Renamed Camera"))
+    XCTAssertEqual(publisher.published, published + 1)
+  }
+
   func testAManualStartStartsOnlyThatCamera() throws {
     try prepare()
     defer { finish() }
@@ -834,6 +847,9 @@ import XCTest
     }
     tick(CameraAppRecordingDemand.startDelay + 0.1)
     try emitUntil("Zoom's helper starts an automatic take") { state(first).status == .recording && !state(first).isStarting }
+    try emitUntil("The automatic take writes video before the client disconnects") {
+      (state(first).statistics?.encodedFrames ?? 0) > 0
+    }
     XCTAssertTrue(state(first).startedByCameraApp)
     XCTAssertEqual(state(first).takeVideoMbps, 10)
     XCTAssertTrue([RecordingCodec.hevcMain, .hevcMain10].contains(state(first).takeCodec ?? .hevcMain10_422))

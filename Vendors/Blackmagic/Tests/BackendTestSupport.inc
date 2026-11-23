@@ -48,13 +48,14 @@ class FakeRawAudioPacket final : public IDeckLinkAudioInputPacket {
   std::atomic<ULONG> references{1};
   std::vector<int32_t> samples;
   size_t channelCount = 2;
+  int byteReads = 0;
   BMDTimeValue packetTime = 48000 * 3 + 17;
   explicit FakeRawAudioPacket(std::initializer_list<int32_t> values) : samples(values) {}
   HRESULT QueryInterface(REFIID, LPVOID *result) override { *result = nullptr; return E_NOINTERFACE; }
   ULONG AddRef() override { return ++references; }
   ULONG Release() override { ULONG n = --references; if (!n) delete this; return n; }
   long GetSampleFrameCount() override { return static_cast<long>(samples.size() / channelCount); }
-  HRESULT GetBytes(void **result) override { if (!result) return E_INVALIDARG; *result = samples.data(); return S_OK; }
+  HRESULT GetBytes(void **result) override { if (!result) return E_INVALIDARG; ++byteReads; *result = samples.data(); return S_OK; }
   HRESULT GetPacketTime(BMDTimeValue *result, BMDTimeScale) override { if (!result) return E_INVALIDARG; *result = packetTime; return S_OK; }
 };
 
@@ -126,6 +127,7 @@ class FakeFrame final : public IDeckLinkVideoInputFrame {
   FakeTimecode *hfrTimecode = nullptr;   // bmdTimecodeRP188HighFrameRate only.
   BMDTimeValue frameDuration = 1001;
   BMDTimeValue streamTime = 123123;
+  CMTimeScale streamTimeScale = 60000;
   BMDTimeValue hardwareTime = 0;         // Microseconds; 0 is unavailable.
   uint64_t bufferSize = 0;               // 0: no IDeckLinkVideoBuffer interface.
   bool hdrFlag = false;
@@ -140,7 +142,7 @@ class FakeFrame final : public IDeckLinkVideoInputFrame {
   long wrappedHeight = 2160;
   BMDPixelFormat pixel = bmdFormat10BitYUV;
   IDeckLinkVideoBuffer *ownedBuffer = nullptr;
-  unsigned videoBufferQueries = 0;
+  unsigned videoBufferQueries = 0, streamTimeReads = 0;
   FakeFrame(bool *result) : destroyed(result) {}
   ~FakeFrame() override { if (ownedBuffer) ownedBuffer->Release(); *destroyed = true; }
   HRESULT QueryInterface(REFIID iid, LPVOID *result) override {
@@ -177,8 +179,10 @@ class FakeFrame final : public IDeckLinkVideoInputFrame {
   }
   HRESULT GetAncillaryData(IDeckLinkVideoFrameAncillary **) override { return E_NOTIMPL; }
   HRESULT GetStreamTime(BMDTimeValue *pts, BMDTimeValue *duration, BMDTimeScale scale) override {
-    const int multiplier = scale == 240000 ? 4 : 1;
-    *pts = negativeTime ? -1 : streamTime * multiplier; *duration = frameDuration * multiplier; return invalidTime ? E_FAIL : S_OK;
+    ++streamTimeReads;
+    *pts = negativeTime ? -1 : CMTimeConvertScale(CMTimeMake(streamTime, streamTimeScale), int32_t(scale), kCMTimeRoundingMethod_Default).value;
+    *duration = CMTimeConvertScale(CMTimeMake(frameDuration, streamTimeScale), int32_t(scale), kCMTimeRoundingMethod_Default).value;
+    return invalidTime ? E_FAIL : S_OK;
   }
   HRESULT GetHardwareReferenceTimestamp(BMDTimeScale scale, BMDTimeValue *time, BMDTimeValue *duration) override {
     if (!hardwareTime || scale != 1000000) return E_NOTIMPL;
@@ -325,6 +329,7 @@ class FakeConfiguration final : public IDeckLinkConfiguration {
   int64_t audioConnection = bmdAudioConnectionAnalog;
   HRESULT audioWriteResult = S_OK;
   bool failAudioReadback = false, audioReadbackPending = false;
+  bool failConnectionReadback = false, connectionReadbackPending = false;
   bool ignoreAudioWrites = false;
   int writes = 0, persistentWrites = 0;
   bool ignoreConnectionWrites = false;
@@ -342,6 +347,7 @@ class FakeConfiguration final : public IDeckLinkConfiguration {
     }
     if (key != bmdDeckLinkConfigVideoInputConnection) return E_INVALIDARG;
     if (!ignoreConnectionWrites) connection = value;
+    connectionReadbackPending = failConnectionReadback;
     ++writes; return S_OK;
   }
   HRESULT GetInt(BMDDeckLinkConfigurationID key, int64_t *value) override {
@@ -350,6 +356,7 @@ class FakeConfiguration final : public IDeckLinkConfiguration {
       *value = audioConnection; return S_OK;
     }
     if (key != bmdDeckLinkConfigVideoInputConnection) return E_INVALIDARG;
+    if (connectionReadbackPending) { connectionReadbackPending = false; return E_FAIL; }
     *value = connection; return S_OK;
   }
   HRESULT SetFloat(BMDDeckLinkConfigurationID, double) override { return E_NOTIMPL; }
@@ -449,11 +456,13 @@ BOOL UltracamRunCallbackOrderSyntheticChecks(NSError **error) {
     auto audio = new FakeRawAudioPacket({1, 2, 3, 4});
     callback->VideoInputFrameArrived(frame, audio);
     if (!expect("VMA", @"A delivered frame was not handed off before its callback's audio.")) return NO;
+    if (audio->byteReads != 1) return fail(error, @"Metering and raw delivery read the same SDK packet twice.");
 
     // Signal loss: the event, then the audio, with no frame delivered.
     frame->noSignal = true;
     callback->VideoInputFrameArrived(frame, audio);
     if (!expect("EMA", @"Audio was not reported after a frame without signal.")) return NO;
+    if (frame->streamTimeReads != 1) return fail(error, @"A frame without video signal queried the SDK stream clock.");
     frame->noSignal = false;
     frame->streamTime += frame->frameDuration;
     callback->VideoInputFrameArrived(frame, audio);
@@ -981,9 +990,17 @@ static BOOL runFrameFeatureChecks(NSError **error) {
       for (uint8_t value = 5; value != 8; ++value) { pair(value, false); pair(value, true); }
       if (![timecodeText isEqualToString:@"01:02:03:15"]) return fail(error, @"A reconfiguration did not relearn the RP188 cadence.");
       callback->accepting = false; callback->Release();
+      // A 50 fps stream starting at label 25 already exceeds the maximum paired label.
+      callback = new CaptureCallback(bmdMode4K2160p50, 60000, framesBlock, eventsBlock, mediaBlock);
+      callback->setActiveContract(NativeFrameContract{3840, 2160, CMTimeMake(1, 50)});
+      frame->frameDuration = 1200; timecode->frames = 25; timecode->flags = bmdTimecodeFlagDefault;
+      callback->VideoInputFrameArrived(frame, nullptr);
+      if (![timecodeText isEqualToString:@"01:02:03:25"]) return fail(error, @"The first full-rate label at 50 fps was discarded.");
+      callback->Release();
       // 29.97: labels pass through, with the field mark ignored.
       callback = new CaptureCallback(bmdMode4K2160p2997, 30000, framesBlock, eventsBlock, mediaBlock);
-      frame->frameDuration = 1001; timecode->frames = 14; timecode->flags = bmdTimecodeFieldMark | bmdTimecodeIsDropFrame;
+      frame->streamTimeScale = 30000; frame->frameDuration = 1001;
+      timecode->frames = 14; timecode->flags = bmdTimecodeFieldMark | bmdTimecodeIsDropFrame;
       callback->VideoInputFrameArrived(frame, nullptr);
       if (![timecodeText isEqualToString:@"01:02:03;14"]) return fail(error, @"29.97 RP188 label was altered.");
       // Components unavailable: the SDK string is reported as-is.
@@ -1108,6 +1125,9 @@ static BOOL runFrameFeatureChecks(NSError **error) {
       callback->VideoInputFrameArrived(frame, nullptr);
       if (![attachmentString(retained, kCVImageBufferTransferFunctionKey) isEqualToString:(__bridge NSString *)kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ])
         return fail(error, @"PQ frame metadata was not attached.");
+      applyColorimetry(retained, bmdColorspaceRec2020, true, kEOTFHDRGamma, true);
+      if (attachmentString(retained, kCVImageBufferTransferFunctionKey))
+        return fail(error, @"A reused buffer kept the previous PQ label for an unmapped HDR transfer function.");
       // No HDR InfoFrame on an HDR-capable device: SDR, but never over the SDK's own value.
       frame->hdrFlag = false; frame->sdkTransfer = kCVImageBufferTransferFunction_SMPTE_ST_428_1;
       callback->VideoInputFrameArrived(frame, nullptr);

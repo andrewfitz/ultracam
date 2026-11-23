@@ -64,6 +64,18 @@ final class ScopeSplitTests: XCTestCase {
     XCTAssertEqual(Texels(a), Texels(b))
   }
 
+  func testHiddenScopeUpdateKeepsLastPicture() throws {
+    let gpu = try requireGPU()
+    let r = try rig(gpu, hidden: true)
+    r.source.submit(try gpu.sdrFrame())
+    let target = gpu.texture(.bgra8Unorm, 64, 36)
+    try r.renderer.update()
+    try gpu.run { try r.renderer.encodePictures(target: target, into: $0) }
+    try gpu.run { XCTAssertTrue(r.renderer.encodeScopes(into: $0)) }
+    XCTAssertEqual(generation(r), 1)
+    XCTAssertFalse(r.renderer.needsDisplay(width: 64, height: 36, pixelFormat: .bgra8Unorm))
+  }
+
   /// The split on Metal 4: two submissions, the same pixels.
   func testSplitEncodeOnMetal4() throws {
     let gpu = try requireGPU()
@@ -104,7 +116,7 @@ final class ScopeSplitTests: XCTestCase {
     view.driver.noteApplied(MonitorLayerColor(primaries: .rec709, kind: .sdr(.bt1886)))
     view.driver.tick(drawable: drawable, texture: drawable.texture, timestamp: 0, commandBuffer: nil)
     let scopes = try XCTUnwrap(view.driver.lastScopeBuffer, "a scope buffer after the pictures'")
-    XCTAssertEqual(view.driver.probe.map { ObjectIdentifier($0) }, scopes, "the scope buffer is watched")
+    XCTAssertEqual(view.driver.lastTrackedBuffer.map { ObjectIdentifier($0) }, scopes, "the scope buffer is watched")
     XCTAssertEqual(view.renderer.accumulator(for: r.overlay)?.generation, 1)
     XCTAssertEqual(view.drawCount, 1)
     try gpu.run { _ in }

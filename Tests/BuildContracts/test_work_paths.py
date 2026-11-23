@@ -32,13 +32,23 @@ class WorkPathsTests(unittest.TestCase):
         resolved = self.module.derived_data_path('xcode-shared', self.checkout, environ={})
         self.assertEqual(resolved, paths['build_root'] / 'xcode-shared')
         self.assertFalse(resolved.exists())
-        for value in (self.checkout / 'Sources', paths['build_root'], self.base / 'outside'):
+        for value in ('', 'bad\npath', self.checkout / 'Sources', paths['build_root'], self.base / 'outside'):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 self.module.derived_data_path(value, self.checkout, environ={})
         paths['build_root'].mkdir(parents=True)
         (paths['build_root'] / 'escape').symlink_to(self.base, target_is_directory=True)
         with self.assertRaises(ValueError):
             self.module.derived_data_path('escape/DerivedData', self.checkout, environ={})
+
+    def test_derived_data_accepts_an_alternate_case_build_subdirectory(self):
+        build = self.paths()['build_root']
+        build.mkdir(parents=True)
+        alias = build.with_name(build.name.upper())
+        if not alias.exists():
+            self.skipTest('requires a case-insensitive filesystem')
+        with self.assertRaises(ValueError):
+            self.module.derived_data_path(alias, self.checkout, environ={})
+        self.assertEqual(self.module.derived_data_path(alias / 'runs', self.checkout, environ={}), alias / 'runs')
 
     def test_default_is_checkout_build_without_creating_directories(self):
         paths = self.paths()
@@ -47,6 +57,7 @@ class WorkPathsTests(unittest.TestCase):
 
     def test_designated_checkout_build_subtree_is_allowed(self):
         self.assertEqual(self.paths('.build/custom runs')['work_root'], self.checkout / '.build/custom runs')
+        (self.checkout / 'Sources').mkdir()
         (self.checkout / '.build').symlink_to(self.checkout / 'Sources', target_is_directory=True)
         with self.assertRaises(ValueError):
             self.paths()
@@ -59,11 +70,20 @@ class WorkPathsTests(unittest.TestCase):
     def test_rejects_empty_file_and_source_overlap(self):
         file = self.base / 'file'
         file.write_text('preserve')
-        for value in ('', str(file), str(file / 'child'), '/', str(self.base), str(self.checkout), str(self.checkout / 'Sources/build')):
+        for value in ('', str(file), str(file / 'child'), str(self.base / 'missing/../file/child'),
+                      '/', str(self.base), str(self.checkout), str(self.checkout / 'Sources/build')):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 self.paths(value)
         self.assertEqual(file.read_text(), 'preserve')
         self.assertEqual(list(self.checkout.iterdir()), [])
+
+    def test_alternate_case_paths_cannot_overlap_sources(self):
+        alias = self.checkout.with_name(self.checkout.name.upper())
+        if not alias.exists():
+            self.skipTest('requires a case-insensitive filesystem')
+        for value in (alias, alias / 'Sources/work', self.base.with_name(self.base.name.upper())):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.paths(str(value))
 
     def test_derived_paths_stay_below_root_and_symlink_escape_is_rejected(self):
         root = self.base / 'work'
@@ -76,6 +96,24 @@ class WorkPathsTests(unittest.TestCase):
         (root / 'agent-work').symlink_to(self.checkout, target_is_directory=True)
         with self.assertRaises(ValueError):
             self.paths(str(root))
+
+    def test_layout_aliases_cannot_overlap_or_move_logs_outside_artifacts(self):
+        paths = self.paths()
+        paths['build_root'].mkdir(parents=True)
+        paths['artifact_root'].symlink_to(paths['build_root'], target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, 'must be separate'):
+            self.paths()
+        paths['artifact_root'].unlink()
+        paths['artifact_root'].mkdir()
+        paths['logs_root'].symlink_to(paths['build_root'], target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, 'logs_root must stay inside artifact_root'):
+            self.paths()
+
+    def test_symlink_target_cannot_introduce_a_line_break(self):
+        alias = self.base / 'work'
+        alias.symlink_to(self.base / 'work\n', target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, 'single-line'):
+            self.paths(str(alias))
 
     def test_cli_json_and_exact_path_preserve_shell_metacharacters(self):
         value = str(self.base / 'work space $(touch NEVER); quote\'')

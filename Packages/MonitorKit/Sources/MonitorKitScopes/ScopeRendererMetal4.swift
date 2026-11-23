@@ -31,8 +31,7 @@ extension ScopeRenderer {
     var succeeded = false
     defer {
       if !succeeded {
-        metal4Draw = nil
-        forgetEncodedState()
+        invalidateGPUResults()
       }
     }
     let area = try Self.checkedViewport(viewport, target)
@@ -73,7 +72,7 @@ extension ScopeRenderer {
       let work = try update(accumulator, display: display, viewport: area, target: target)
       uniforms = try encodeMetal4(work, accumulator, submission)
     } catch {
-      forgetEncodedState()
+      invalidateGPUResults()
       throw error
     }
     metal4Draw = (uniforms, max(traceWrittenIn, graticuleWrittenIn) > submission.completedIndex)
@@ -85,10 +84,6 @@ extension ScopeRenderer {
   {
     let table = try argumentTable()
     let r = engine.residency
-    // A same-device accumulator may belong to another engine. Its bins must
-    // survive this resolve too, even when it was last accumulated classically.
-    if accumulator.engine.residency !== r { accumulator.engine.residency.observe(submission) }
-    accumulator.updateBinResidency()
     r.track(traceTexture, in: &residentTrace)
     r.track(graticuleTexture, in: &residentGraticule)
     if work.resolve != nil || ringParameters != parameters {
@@ -102,6 +97,10 @@ extension ScopeRenderer {
       if let resolve = work.resolve { scopeStore(resolve, base, Self.resolveOffset) }
     }
     if let resolve = work.resolve {
+      // A same-device accumulator may belong to another engine. Its bins
+      // must survive the resolve, even when last accumulated classically.
+      if accumulator.engine.residency !== r { accumulator.engine.residency.observe(submission) }
+      accumulator.updateBinResidency()
       try encodeResolve(accumulator, resolve, uniforms: u.address + UInt64(Self.resolveOffset), table, submission)
       traceWrittenIn = submission.index
     }

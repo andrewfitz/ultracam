@@ -763,15 +763,15 @@ extension RTMPStream: _Stream {
         sendCompressedVideo(sampleBuffer, usesLegacyCompositionOffset: false)
     }
 
-    /// Sets a host-time origin for both tracks before appending publish media.
-    public func setPublishEpoch(_ epoch: CMTime) {
+    /// Sets a host-time origin for the published media and compensates for encoder priming when audio is expected.
+    public func setPublishEpoch(_ epoch: CMTime, includesAudio: Bool = true) {
         guard readyState == .publishing, publishEpochSeconds == nil, epoch.isNumeric, epoch.epoch == 0 else {
             return
         }
         publishEpochSeconds = epoch.seconds
         // Receivers present the audio encoder's priming before the first PCM sample.
         // Delay pictures by the same interval so they decode with their PCM.
-        videoEpochDelay = outgoing.audioSettings.encoderDelay
+        videoEpochDelay = includesAudio ? outgoing.audioSettings.encoderDelay : 0
     }
 
     private func sendCompressedVideo(_ sampleBuffer: CMSampleBuffer, usesLegacyCompositionOffset: Bool) {

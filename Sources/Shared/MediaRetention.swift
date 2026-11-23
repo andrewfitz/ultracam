@@ -56,10 +56,7 @@ final class MediaRetentionLedger: @unchecked Sendable {
   let policy: MediaRetentionPolicy
   private let lock = NSLock()
   private var slots = 0, bytes = 0, peakSlots = 0, peakBytes = 0
-  private var duration = 0.0, peakDuration = 0.0
-  // Compensate additions AND releases so a full cadence window does not
-  // lose a slot to accumulated floating-point rounding (e.g. 48 / 120 s).
-  private var durationCompensation = 0.0
+  private var durationSum = 0.0, durationCorrection = 0.0, peakDuration = 0.0
   private var accepted: UInt64 = 0, rejected: UInt64 = 0, released: UInt64 = 0
 
   init(policy: MediaRetentionPolicy) { self.policy = policy }
@@ -73,16 +70,15 @@ final class MediaRetentionLedger: @unchecked Sendable {
         let (nextBytes, overflow) = bytes.addingReportingOverflow(candidateBytes)
         guard !overflow, nextBytes <= policy.maximumBytes else { throw MediaRetentionFailure.byteLimit }
         guard slots < policy.maximumSlots else { throw MediaRetentionFailure.slotLimit }
-        let adjustedDuration = candidateDuration - durationCompensation
-        let nextDuration = duration + adjustedDuration
-        let nextCompensation = (nextDuration - duration) - adjustedDuration
-        guard nextDuration.isFinite else { throw MediaRetentionFailure.invalidMedia }
+        let (nextSum, nextCorrection) = addingDuration(candidateDuration)
+        let nextDuration = nextSum + nextCorrection
+        guard nextSum.isFinite, nextDuration.isFinite else { throw MediaRetentionFailure.invalidMedia }
         guard slots < policy.minimumSlots || nextDuration <= policy.maximumDuration + policy.maximumDuration.ulp * 4 else {
           throw MediaRetentionFailure.durationLimit
         }
-        slots += 1; bytes = nextBytes; duration = nextDuration
-        durationCompensation = nextCompensation
-        peakSlots = max(peakSlots, slots); peakBytes = max(peakBytes, bytes); peakDuration = max(peakDuration, duration)
+        slots += 1; bytes = nextBytes
+        durationSum = nextSum; durationCorrection = nextCorrection
+        peakSlots = max(peakSlots, slots); peakBytes = max(peakBytes, bytes); peakDuration = max(peakDuration, nextDuration)
         accepted += 1
         return Lease(ledger: self, bytes: candidateBytes, duration: candidateDuration)
       } catch { rejected += 1; throw error }
@@ -93,20 +89,27 @@ final class MediaRetentionLedger: @unchecked Sendable {
     lock.withLock {
       slots -= 1; bytes -= releasedBytes
       if slots == 0 {
-        duration = 0
-        durationCompensation = 0
+        durationSum = 0
+        durationCorrection = 0
       } else {
-        let adjustedDuration = -releasedDuration - durationCompensation
-        let nextDuration = duration + adjustedDuration
-        durationCompensation = (nextDuration - duration) - adjustedDuration
-        duration = max(0, nextDuration)
+        (durationSum, durationCorrection) = addingDuration(-releasedDuration)
       }
       released += 1
     }
   }
 
+  private func addingDuration(_ delta: Double) -> (sum: Double, correction: Double) {
+    let sum = durationSum + delta
+    // Neumaier summation retains short samples even after a much longer
+    // sample is released. It also keeps a full cadence window available.
+    let lost = abs(durationSum) >= abs(delta)
+      ? (durationSum - sum) + delta
+      : (delta - sum) + durationSum
+    return (sum, durationCorrection + lost)
+  }
+
   var snapshot: Snapshot {
-    lock.withLock { Snapshot(currentSlots: slots, currentBytes: bytes, currentDuration: duration, peakSlots: peakSlots, peakBytes: peakBytes, peakDuration: peakDuration, accepted: accepted, rejected: rejected, released: released) }
+    lock.withLock { Snapshot(currentSlots: slots, currentBytes: bytes, currentDuration: max(0, durationSum + durationCorrection), peakSlots: peakSlots, peakBytes: peakBytes, peakDuration: peakDuration, accepted: accepted, rejected: rejected, released: released) }
   }
 }
 

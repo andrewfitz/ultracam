@@ -22,4 +22,13 @@ import CoreMedia
     let samples = try mapping.audioSamples(forVideoDuration: CMTime(value: 10, timescale: 1), sampleRate: 48_000)
     XCTAssertEqual(samples, 480_000 / 1.001, accuracy: 1e-6)
   }
+
+  func testSampleCountRefusesInvalidTimescaleAndOverflow() throws {
+    let clock = try ClockMapping(sourceAnchor: .zero, hostAnchor: .zero, rate: .one)
+    let mapping = try AudioVideoClockMapping(audio: clock, video: clock)
+    let malformed = CMTime(value: 1, timescale: 0, flags: .valid, epoch: 0)
+    XCTAssertThrowsError(try mapping.audioSamples(forVideoDuration: malformed, sampleRate: 48000))
+    XCTAssertThrowsError(try mapping.audioSamples(forVideoDuration: CMTime(value: 2, timescale: 1),
+      sampleRate: .greatestFiniteMagnitude))
+  }
 }

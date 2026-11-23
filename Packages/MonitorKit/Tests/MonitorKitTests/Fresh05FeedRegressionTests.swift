@@ -16,16 +16,16 @@ final class Fresh05FeedRegressionTests: XCTestCase {
       focus.enabled = true
       focus.stage = stage
       try gpu.run { try feed.analyze(frame, focus: focus, into: $0) }
-      XCTAssertTrue(feed.hasFocusMask(for: frame, stage: stage, monitorLUTEnabled: true))
+      XCTAssertTrue(feed.hasFocusMask(for: frame, focus: focus, monitorLUTEnabled: true))
       var relabelled = frame
       relabelled.signal.range = .full
       XCTAssertEqual(relabelled.id, frame.id)
       XCTAssertFalse(relabelled.signal.hasDistinctOutputReading)
-      XCTAssertFalse(feed.hasFocusMask(for: relabelled, stage: stage, monitorLUTEnabled: true))
+      XCTAssertFalse(feed.hasFocusMask(for: relabelled, focus: focus, monitorLUTEnabled: true))
       try gpu.run { try feed.analyze(relabelled, focus: focus, into: $0) }
       XCTAssertEqual(feed.analysisCount, 2)
-      XCTAssertTrue(feed.hasFocusMask(for: relabelled, stage: stage, monitorLUTEnabled: true))
-      XCTAssertFalse(feed.hasFocusMask(for: frame, stage: stage, monitorLUTEnabled: true))
+      XCTAssertTrue(feed.hasFocusMask(for: relabelled, focus: focus, monitorLUTEnabled: true))
+      XCTAssertFalse(feed.hasFocusMask(for: frame, focus: focus, monitorLUTEnabled: true))
     }
   }
 

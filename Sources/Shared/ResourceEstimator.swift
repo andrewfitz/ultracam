@@ -50,6 +50,7 @@ public struct ResourceEstimator: Sendable {
   }
 
   @discardableResult public mutating func admit(_ demand: ResourceDemand) -> Result<ResourceEstimate, ResourceRejection> {
+    guard limits.duration >= 0 else { return .failure(.invalid("duration limit must be nonnegative")) }
     do { try Self.validate(demand) } catch let error as ResourceRejection { return .failure(error) } catch { return .failure(.invalid(String(describing: error))) }
     var next = demands; next[demand.owner] = demand
     let total: ResourceEstimate

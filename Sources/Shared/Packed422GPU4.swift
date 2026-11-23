@@ -36,14 +36,10 @@ final class Packed422GPU4 {
       parameters.storageMode == .shared else { throw Packed422GPU.Failure.invalidLayout }
     try format.validate(width: width, height: height, rowBytes: rowBytes,
       dataSize: source.length, alphaRowBytes: alphaRowBytes)
-    guard luma.pixelFormat == .r16Uint, chroma.pixelFormat == .rg16Uint,
-      luma.width == width, luma.height == height,
-      chroma.width == width / 2, chroma.height == height,
-      luma.usage.contains(.shaderWrite), chroma.usage.contains(.shaderWrite),
-      source.device.registryID == pipeline.device.registryID,
-      parameters.device.registryID == pipeline.device.registryID,
-      luma.device.registryID == pipeline.device.registryID,
-      chroma.device.registryID == pipeline.device.registryID else { throw Packed422GPU.Failure.invalidTexture }
+    let device = pipeline.device
+    guard encoder.commandBuffer?.device === device, table.device === device,
+      source.device === device, parameters.device === device,
+      Packed422GPU.validOutputs(luma: luma, chroma: chroma, width: width, height: height, device: device) else { throw Packed422GPU.Failure.invalidTexture }
     var p = SIMD4<UInt32>(UInt32(width), UInt32(height), UInt32(rowBytes), format == .yuvs ? 1 : 0)
     withUnsafeBytes(of: &p) { parameters.contents().advanced(by: parameterOffset).copyMemory(from: $0.baseAddress!, byteCount: $0.count) }
     table.setAddress(source.gpuAddress, index: 0)
@@ -62,18 +58,15 @@ final class Packed422GPU4 {
                      source: MTLTexture, format: Packed422Format,
                      luma: MTLTexture, chroma: MTLTexture) throws {
     guard format == .twoVuy || format == .yuvs || format == .uyva else { throw Packed422GPU.Failure.unsupportedFormat }
-    guard source.pixelFormat == .rgba8Uint, source.width > 0,
+    let device = texturePipeline.device
+    guard source.textureType == .type2D, source.pixelFormat == .rgba8Uint, source.width > 0,
       source.width <= Int(UInt32.max) / 2, source.height <= UInt32.max,
-      luma.pixelFormat == .r16Uint, chroma.pixelFormat == .rg16Uint,
-      luma.width == source.width * 2, luma.height == source.height,
-      chroma.width == source.width, chroma.height == source.height,
-      source.usage.contains(.shaderRead), luma.usage.contains(.shaderWrite), chroma.usage.contains(.shaderWrite),
+      source.usage.isEmpty || source.usage.contains(.shaderRead),
+      Packed422GPU.validOutputs(luma: luma, chroma: chroma, width: source.width * 2, height: source.height, device: device),
       parameterOffset >= 0, parameterOffset.isMultiple(of: 16), parameters.length >= 16,
       parameterOffset <= parameters.length - 16, parameters.storageMode == .shared,
-      source.device.registryID == texturePipeline.device.registryID,
-      luma.device.registryID == texturePipeline.device.registryID,
-      chroma.device.registryID == texturePipeline.device.registryID,
-      parameters.device.registryID == texturePipeline.device.registryID else { throw Packed422GPU.Failure.invalidTexture }
+      encoder.commandBuffer?.device === device, table.device === device,
+      source.device === device, parameters.device === device else { throw Packed422GPU.Failure.invalidTexture }
     var p = SIMD4<UInt32>(UInt32(luma.width), UInt32(luma.height), 0, format == .yuvs ? 1 : 0)
     withUnsafeBytes(of: &p) { parameters.contents().advanced(by: parameterOffset).copyMemory(from: $0.baseAddress!, byteCount: $0.count) }
     table.setAddress(parameters.gpuAddress + UInt64(parameterOffset), index: 1)

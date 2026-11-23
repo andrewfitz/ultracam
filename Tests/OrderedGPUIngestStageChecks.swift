@@ -2,6 +2,15 @@ import Foundation
 import XCTest
 
 @objcMembers final class OrderedGPUIngestStageChecks: XCTestCase {
+  func testHalfSecondBudgetAcceptsTwentyFiveFramesAtFiftyFPS() {
+    let stage = OrderedGPUIngestStage<Int, Int>(capacity: 32, maximumDuration: 0.5,
+      weight: { _ in .init(bytes: 0, duration: 1.0 / 50) },
+      transform: { _, _ in }, emit: { _ in })
+    for index in 0..<25 { XCTAssertTrue(stage.enqueue(index)) }
+    XCTAssertFalse(stage.enqueue(25))
+    stage.cancel()
+  }
+
   func testDrainedStageAcceptsFrameAtExactDurationLimit() {
     let state = OrderedIngestTestState()
     let drained = expectation(description: "both inputs emitted")
@@ -42,6 +51,38 @@ import XCTest
     stage.cancel()
     state.lock.lock(); let complete = state.complete; state.complete = nil; state.lock.unlock()
     complete?(.success(4))
+  }
+
+  func testZeroDurationEnvelopesStillFitBehindSlowFrame() {
+    let stage = OrderedGPUIngestStage<Double, Int>(capacity: 3, minimumSlots: 1, maximumDuration: 0.5,
+      weight: { .init(bytes: 0, duration: $0) }, transform: { _, _ in }, emit: { _ in })
+    defer { stage.cancel() }
+    XCTAssertTrue(stage.enqueue(1))
+    XCTAssertTrue(stage.enqueue(0), "Metadata adds no retained duration")
+    XCTAssertFalse(stage.enqueue(0.01))
+    XCTAssertTrue(stage.enqueue(0))
+    XCTAssertFalse(stage.enqueue(0), "Metadata still counts against the slot limit")
+  }
+
+  func testCompletingLongFramePreservesPendingShortDuration() {
+    let state = OrderedIngestTestState()
+    let shortStarted = expectation(description: "Short frame entered the transform")
+    let stage = OrderedGPUIngestStage<Double, Int>(capacity: 4, minimumSlots: 2, maximumDuration: 0.5,
+      weight: { .init(bytes: 0, duration: $0) }, transform: { input, done in
+        if input == 1e18 { state.lock.withLock { state.complete = done } }
+        else { shortStarted.fulfill() }
+      }, emit: { _ in })
+    defer { stage.cancel() }
+    XCTAssertTrue(stage.enqueue(1e18))
+    XCTAssertTrue(stage.enqueue(0.25))
+    let complete = state.lock.withLock {
+      defer { state.complete = nil }
+      return state.complete
+    }
+    complete?(.success(0))
+    wait(for: [shortStarted], timeout: 2)
+    XCTAssertTrue(stage.enqueue(0.20))
+    XCTAssertFalse(stage.enqueue(0.10), "The short frame still consumes one quarter second")
   }
 
   func testBytesAndDurationIncludeInFlightEnvelope() {

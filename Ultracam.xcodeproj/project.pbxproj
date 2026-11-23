@@ -2692,7 +2692,7 @@
 				"OTHER_SWIFT_FLAGS" = ("$(inherited)", "-DULTRACAM_STREAM_PUBLISHING");
 				"ASSETCATALOG_COMPILER_APPICON_NAME" = "AppIcon";
 				"SWIFT_OBJC_BRIDGING_HEADER" = "Sources/DeviceAPI/GeneratedBridgingHeader.h";
-				"HEADER_SEARCH_PATHS" = ("$(inherited)", "$(SRCROOT)/../auto-switcher/include", "$(SRCROOT)/Vendors/Blackmagic/SDK/include");
+				"HEADER_SEARCH_PATHS" = ("$(inherited)", "$(SRCROOT)/../auto-switcher/include", "$(SRCROOT)/Apps/AutoSwitcher/include", "$(SRCROOT)/Vendors/Blackmagic/SDK/include");
 				"LIBRARY_SEARCH_PATHS" = ("$(inherited)", "$(SRCROOT)/.build/agent-work/build/ultracam/auto-switcher-target/release");
 				"OTHER_LDFLAGS" = ("$(inherited)", "-lauto_switcher", "-lc++", "-lz", "-liconv", "-framework", "Security", "-framework", "CoreFoundation", "-framework", "SystemConfiguration", "-framework", "Foundation", "-framework", "AVFoundation", "-framework", "AudioToolbox", "-framework", "CoreMedia", "-framework", "CoreVideo", "-framework", "IOKit");
 				"SWIFT_OPTIMIZATION_LEVEL" = "-Onone";
@@ -2713,7 +2713,7 @@
 				"OTHER_SWIFT_FLAGS" = ("$(inherited)", "-DULTRACAM_STREAM_PUBLISHING");
 				"ASSETCATALOG_COMPILER_APPICON_NAME" = "AppIcon";
 				"SWIFT_OBJC_BRIDGING_HEADER" = "Sources/DeviceAPI/GeneratedBridgingHeader.h";
-				"HEADER_SEARCH_PATHS" = ("$(inherited)", "$(SRCROOT)/../auto-switcher/include", "$(SRCROOT)/Vendors/Blackmagic/SDK/include");
+				"HEADER_SEARCH_PATHS" = ("$(inherited)", "$(SRCROOT)/../auto-switcher/include", "$(SRCROOT)/Apps/AutoSwitcher/include", "$(SRCROOT)/Vendors/Blackmagic/SDK/include");
 				"LIBRARY_SEARCH_PATHS" = ("$(inherited)", "$(SRCROOT)/.build/agent-work/build/ultracam/auto-switcher-target/release");
 				"OTHER_LDFLAGS" = ("$(inherited)", "-lauto_switcher", "-lc++", "-lz", "-liconv", "-framework", "Security", "-framework", "CoreFoundation", "-framework", "SystemConfiguration", "-framework", "Foundation", "-framework", "AVFoundation", "-framework", "AudioToolbox", "-framework", "CoreMedia", "-framework", "CoreVideo", "-framework", "IOKit");
 				"SWIFT_OPTIMIZATION_LEVEL" = "-O";

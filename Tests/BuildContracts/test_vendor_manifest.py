@@ -150,6 +150,35 @@ class VendorManifestTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.module.resolve_sdk_inventory([result], {'example': True}, self.root)
 
+    def test_enabled_inventory_checks_the_declared_sdk_path_and_stamp(self):
+        import hashlib
+        sdk_root = self.vendor / 'SDK'
+        sdk_root.mkdir()
+        binary = sdk_root / 'core.dylib'
+        approved = b'fixture binary'
+        binary.write_bytes(approved)
+        value = self.manifest()
+        value['sdk'] = {'policy': 'local', 'version': '2.2.0', 'requiredFiles': ['SDK/core.dylib'],
+                        'fileSHA256': {'SDK/core.dylib': hashlib.sha256(approved).hexdigest()}}
+        manifest_path = self.vendor / 'vendor.json'
+        manifest = self.module.validate_manifest(value, manifest_path, self.root)
+        self.assertTrue(self.module.resolve_sdk_inventory([manifest], {'example': True}, self.root)['example']['available'])
+        self.assertEqual(self.module.resolve_sdk_inventory([manifest], {'example': True}, self.root)['example']['files'],
+                         manifest['sdk']['fileSHA256'])
+
+        stamp = sdk_root / self.module.SDK_STAMP
+        stamp.write_text('{"version":"elsewhere"}')
+        with self.assertRaisesRegex(ValueError, 'version stamp'):
+            self.module.resolve_sdk_inventory([manifest], {'example': True}, self.root)
+        stamp.unlink()
+
+        binary.rename(sdk_root / 'other.dylib')
+        binary.symlink_to('other.dylib')
+        manifest = self.module.validate_manifest(value, manifest_path, self.root)
+        self.assertFalse(self.module.resolve_sdk_inventory([manifest], {}, self.root)['example']['available'])
+        with self.assertRaisesRegex(ValueError, 'symlink'):
+            self.module.resolve_sdk_inventory([manifest], {'example': True}, self.root)
+
     def test_sdk_archive_layout_and_external_driver_roots_are_data(self):
         value = self.manifest()
         value['sdk'] = {'policy': 'local', 'version': '2', 'requiredFiles': ['SDK/a.h'],

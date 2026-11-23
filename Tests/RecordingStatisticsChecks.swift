@@ -77,6 +77,22 @@ import XCTest
     XCTAssertEqual(AppGPUActivity.busyPercent([(1, 2), (12, 13)], from: 10, to: 11), 0)
     XCTAssertEqual(AppGPUActivity.busyPercent([(0, .infinity), (.nan, 1)], from: 0, to: 1), 0)
     XCTAssertEqual(AppGPUActivity.busyPercent([(0, 1)], from: 1, to: 1), 0)
+    XCTAssertEqual(AppGPUActivity.busyPercent([(0, 1)], from: -.infinity, to: 1), 0)
+    XCTAssertEqual(AppGPUActivity.busyPercent([(-1e308, 1e308)], from: -1e308, to: 1e308), 0)
+  }
+
+  func testCounterSumAndElapsedDisplayHandleExtremeValues() throws {
+    let writer = Writer()
+    writer.value.droppedEncodedVideo = .max
+    let recorder = try core(writer)
+    recorder.recordDrop(.queueFull)
+    var sampler = RecordingStatisticsSampler()
+    let stats = sampler.sample(recorder.telemetry, elapsed: Double(Int32.max) * 3600 + 3600,
+      fileBytes: 0, fileURL: nil)
+    XCTAssertEqual(stats.droppedVideoFrames, .max)
+    XCTAssertEqual(stats.elapsedText, "2147483648:00:00")
+    XCTAssertEqual(RecordingStatistics(elapsed: .nan).elapsedText, "00:00:00")
+    XCTAssertEqual(RecordingStatistics(elapsed: .infinity).elapsedText, "00:00:00")
   }
 
   func testInvalidAudioIsNotCountedAsVideoLoss() throws {

@@ -6,6 +6,46 @@ import XCTest
 /// locking, before the first frame declares the format. Build 41 stopped
 /// Camera 2 at every launch for it.
 @objcMembers final class CaptureStartupChecks: XCTestCase {
+  func testRawPCMFrameCountRequiresWholeInterleavedFrames() {
+    var audio = CaptureRawAudio(samples: Data(count: 16), packetTime: .zero,
+      sampleFrames: 2, channels: 2, bytesPerSample: 4)
+    XCTAssertEqual(audio.pcmFrameCount, 2)
+    audio.sampleFrames = UInt64.max
+    XCTAssertNil(audio.pcmFrameCount)
+    audio.sampleFrames = 2
+    audio.channels = Int.max
+    XCTAssertNil(audio.pcmFrameCount)
+    audio.channels = 2
+    audio.samples = Data(count: 15)
+    XCTAssertNil(audio.pcmFrameCount)
+    audio.samples = Data(count: 24)
+    XCTAssertNil(audio.pcmFrameCount)
+  }
+
+  func testPoolRemovalPreservesFeedWhileStartIsWaitingForTheDevice() {
+    let entered = DispatchSemaphore(value: 0)
+    let release = DispatchSemaphore(value: 0)
+    let feed = FeedID(rawValue: "starting-feed")
+    let pool = FeedCapturePool { _ in
+      var services = CaptureServices(startTyped: { _, _, _ in }, stop: {},
+        connect: { _, _ in }, disconnect: {}, send: { _ in true })
+      services.sourcePauseAllowance = { _ in
+        entered.signal()
+        _ = release.wait(timeout: .now() + 3)
+        return nil
+      }
+      return CaptureController(services: services)
+    }
+    let controller = pool.controller(for: feed)
+    controller.start(feedID: feed, deviceID: "starting:device", configuration: .init(),
+      pipelineEnabled: false, previewEnabled: false)
+    defer { release.signal(); controller.stop() }
+    XCTAssertEqual(entered.wait(timeout: .now() + 2), .success)
+    XCTAssertFalse(controller.isAccepting(feedID: feed))
+    XCTAssertFalse(pool.remove(feed))
+    XCTAssertTrue(pool.existingController(for: feed) === controller)
+  }
+
   func testAudioBeforeTheFirstDeclarationIsSkippedNotFatal() throws {
     let format = try SourceFormat(width: 128, height: 72, pixel: .v210, rate: .constant(VideoContract.fastDuration))
     let audio = try SourceAudioFormat(sampleRate: 48000, channels: 2, sample: .int32,

@@ -129,9 +129,13 @@ struct UIMainWindowView: View {
     // Hidden until laid out at the real size and strip heights: at startup they were first
     // fitted to a placeholder size and guessed strips, scaled, then refitted, a flash of garble.
     .opacity(revealed ? 1 : 0)
+    .allowsHitTesting(revealed)
+    .accessibilityHidden(!revealed)
     .task {
       // Never hidden for long, whatever the measurements do.
+      guard !revealed else { return }
       try? await Task.sleep(for: .milliseconds(500))
+      guard !Task.isCancelled else { return }
       revealed = true
     }
   }
@@ -203,7 +207,9 @@ struct UIInspectorPanel: View {
   static let defaultWidth = 320.0
 
   private var width: Double {
-    min(max(dragWidth ?? storedWidth, Self.widths.lowerBound), Self.widths.upperBound)
+    let proposed = dragWidth ?? storedWidth
+    guard proposed.isFinite else { return Self.defaultWidth }
+    return min(max(proposed, Self.widths.lowerBound), Self.widths.upperBound)
   }
 
   var body: some View {
@@ -235,7 +241,10 @@ struct UIInspectorPanel: View {
           dragWidth = nil
           dragStart = nil
         })
-      .accessibilityHidden(true)
+      .accessibilityRepresentation {
+        Stepper("Inspector width", value: Binding(get: { width }, set: { storedWidth = $0 }), in: Self.widths, step: 20)
+          .accessibilityValue("\(Int(width.rounded())) points")
+      }
   }
 }
 

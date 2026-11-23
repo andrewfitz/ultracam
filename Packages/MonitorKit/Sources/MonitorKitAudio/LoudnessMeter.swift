@@ -44,6 +44,7 @@ public final class LoudnessMeter: @unchecked Sendable {
 
   /// The standard layout for the channel count (see `LoudnessChannel.standardLayout`).
   public convenience init(sampleRate: Double, channelCount: Int) throws(AudioMeterError) {
+    try validateFormat(sampleRate: sampleRate, channelCount: channelCount)
     try self.init(sampleRate: sampleRate, channels: LoudnessChannel.standardLayout(channelCount: channelCount))
   }
 
@@ -57,47 +58,64 @@ public final class LoudnessMeter: @unchecked Sendable {
   // MARK: Input
 
   /// Deinterleaved Float32, e.g. `AVAudioPCMBuffer.floatChannelData`.
+  /// Zero-frame calls do not read input pointers and still apply pending resets.
   public func process(planar channels: UnsafePointer<UnsafeMutablePointer<Float>>, frameCount: Int) {
-    forEachIndex(stage.channelCount) { stage.bindPlanar($0, channels[$0]) }
+    if frameCount > 0 {
+      forEachIndex(stage.channelCount) { stage.bindPlanar($0, channels[$0]) }
+    }
     run(frameCount, .float32)
   }
 
   public func process(planar channels: UnsafePointer<UnsafePointer<Float>>, frameCount: Int) {
-    forEachIndex(stage.channelCount) { stage.bindPlanar($0, channels[$0]) }
+    if frameCount > 0 {
+      forEachIndex(stage.channelCount) { stage.bindPlanar($0, channels[$0]) }
+    }
     run(frameCount, .float32)
   }
 
   public func process(planar channels: UnsafePointer<UnsafeMutablePointer<Int16>>, frameCount: Int) {
-    forEachIndex(stage.channelCount) { stage.bindPlanar($0, channels[$0]) }
+    if frameCount > 0 {
+      forEachIndex(stage.channelCount) { stage.bindPlanar($0, channels[$0]) }
+    }
     run(frameCount, .int16)
   }
 
   public func process(planar channels: UnsafePointer<UnsafeMutablePointer<Int32>>, frameCount: Int) {
-    forEachIndex(stage.channelCount) { stage.bindPlanar($0, channels[$0]) }
+    if frameCount > 0 {
+      forEachIndex(stage.channelCount) { stage.bindPlanar($0, channels[$0]) }
+    }
     run(frameCount, .int32)
   }
 
   /// Interleaved samples; `frameStride` (default: the channel count) is the
   /// number of samples per frame, so the first channels of a wider stream can be metered.
   public func process(interleaved samples: UnsafePointer<Float>, frameCount: Int, frameStride: Int? = nil) {
-    stage.bindInterleaved(samples, format: .float32, frameStride: checkedStride(frameStride))
+    if frameCount > 0 {
+      stage.bindInterleaved(samples, format: .float32, frameStride: checkedStride(frameStride))
+    }
     run(frameCount, .float32)
   }
 
   public func process(interleaved samples: UnsafePointer<Int16>, frameCount: Int, frameStride: Int? = nil) {
-    stage.bindInterleaved(samples, format: .int16, frameStride: checkedStride(frameStride))
+    if frameCount > 0 {
+      stage.bindInterleaved(samples, format: .int16, frameStride: checkedStride(frameStride))
+    }
     run(frameCount, .int16)
   }
 
   public func process(interleaved samples: UnsafePointer<Int32>, frameCount: Int, frameStride: Int? = nil) {
-    stage.bindInterleaved(samples, format: .int32, frameStride: checkedStride(frameStride))
+    if frameCount > 0 {
+      stage.bindInterleaved(samples, format: .int32, frameStride: checkedStride(frameStride))
+    }
     run(frameCount, .int32)
   }
 
   /// Core Audio buffers, planar or interleaved; channels are taken in order
   /// and channels the list does not carry read as silence.
   public func process(bufferList: UnsafePointer<AudioBufferList>, frameCount: Int, format: AudioSampleFormat) {
-    stage.bindBufferList(bufferList, frameCount: frameCount, format: format)
+    if frameCount > 0 {
+      stage.bindBufferList(bufferList, frameCount: frameCount, format: format)
+    }
     run(frameCount, format)
   }
 

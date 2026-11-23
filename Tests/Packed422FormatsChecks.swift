@@ -28,4 +28,11 @@ import XCTest
     XCTAssertThrowsError(try Packed422Format.r12L.minimumRowBytes(width: Int.max))
     XCTAssertNoThrow(try Packed422Format.p216.validate(width: 4, height: 2, rowBytes: 8, dataSize: 32, planeCount: 2))
   }
+
+  func testUYVARejectsAnIncompletePixelPairEvenWhenThePlanesFit() {
+    XCTAssertThrowsError(try Packed422Format.uyva.validate(width: 5, height: 2,
+      rowBytes: 12, dataSize: 34, alphaRowBytes: 5)) {
+      XCTAssertEqual($0 as? Packed422AdmissionError, .invalidDimensions)
+    }
+  }
 }

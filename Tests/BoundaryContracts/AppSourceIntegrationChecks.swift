@@ -18,7 +18,7 @@ import XCTest
       audioPresent: false, audioActivityRMS: 0.75, audioActivityPeak: 0.9))
     XCTAssertNil(model.autoSwitcherBridge?.rms)
     XCTAssertEqual(model.autoSwitcherBridge?.tickTime, 3)
-    XCTAssertEqual(model.autoSwitcherTimeline?.tickTime, 3)
+    XCTAssertNil(model.autoSwitcherTimeline?.tickTime, "The bridge reports the tick in director order")
   }
 
   func testInterruptionClearsDirectorAudio() {

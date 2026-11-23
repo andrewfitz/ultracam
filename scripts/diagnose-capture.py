@@ -60,6 +60,7 @@ def movie_gaps(movie):
     """Return uncovered intervals; only a declared CFR contract implies frame loss."""
     if not shutil.which("ffprobe"):
         sys.exit("ffprobe is required: brew install ffmpeg")
+    movie = movie.absolute()
     info = json.loads(run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
         "stream=time_base,r_frame_rate,nb_frames:format_tags=creation_time", "-of", "json", str(movie)]))
     if not info.get("streams"):
@@ -86,6 +87,10 @@ def movie_gaps(movie):
     if frame_seconds:
         fps = float(1 / frame_seconds)
     created = info.get("format", {}).get("tags", {}).get("creation_time")
+    try:
+        start = dt.datetime.fromisoformat(created.replace("Z", "+00:00")).astimezone() if created else None
+    except (AttributeError, ValueError):
+        start = None
     packets = json.loads(run(["ffprobe", "-v", "error", "-select_streams", "v:0",
         "-show_entries", "packet=pts,duration", "-of", "json", str(movie)])).get("packets", [])
     timed = []
@@ -100,8 +105,10 @@ def movie_gaps(movie):
             duration = 0
         timed.append((pts, duration))
     timed.sort()
+    if not timed:
+        sys.exit("The movie has no video packets with presentation timestamps")
     gaps = []
-    origin = timed[0][0] if timed else 0
+    origin = timed[0][0]
     covered_until = origin
     for index, (pts, duration) in enumerate(timed):
         if index:
@@ -109,7 +116,7 @@ def movie_gaps(movie):
                 prior = timed[index - 1][0]
                 missing = round((pts - prior) * base / frame_seconds) - 1
                 if missing > 0:
-                    gaps.append(Gap(float((prior - origin) * base),
+                    gaps.append(Gap(float((prior - origin) * base + frame_seconds),
                                     float(missing * frame_seconds), missing))
             elif pts > covered_until:
                 # Missing sample durations do not establish an uncovered range.
@@ -119,7 +126,6 @@ def movie_gaps(movie):
                     gaps.append(Gap(float((covered_until - origin) * base),
                                     float((pts - covered_until) * base), None))
         covered_until = max(covered_until, pts + duration)
-    start = dt.datetime.fromisoformat(created.replace("Z", "+00:00")).astimezone() if created else None
     return gaps, len(timed), start, fps
 
 
@@ -151,6 +157,17 @@ def capture_camera(message):
     return None
 
 
+def signal_dropout_start(when, message):
+    """Use the measured outage interval, including warnings during an ongoing loss."""
+    if message.startswith("Signal back on "):
+        match = re.search(r"\(([0-9]+) ms without video\)", message)
+        return when - dt.timedelta(milliseconds=int(match[1])) if match else when
+    if message.startswith("No video from "):
+        match = re.search(r" for ([0-9.]+) s;", message)
+        return when - dt.timedelta(seconds=float(match[1])) if match else when
+    return None
+
+
 def gap_description(gap):
     if gap.missing_frames is None:
         return f"{gap.duration:.6f} s uncovered presentation interval (frame loss unknown)"
@@ -178,22 +195,23 @@ def take(args):
     # Current take metadata has no feed ID. Require the caller to supply the
     # exact capture feed ID rather than guessing from a filename or another run.
     camera = getattr(args, "camera", None)
-    camera_lines = [(w, c, t) for w, c, t in lines
-                    if camera is not None and c == "capture" and capture_camera(t) == camera]
+    camera_lines = [(w, c, t, signal_dropout_start(w, t)) for w, c, t in lines
+                    if camera is not None and c == "capture" and capture_camera(t) == camera
+                    and not t.startswith("Live ")]
     dropouts = 0
     for gap in gaps:
         wall = start + dt.timedelta(seconds=gap.at)
         gap_end = wall + dt.timedelta(seconds=gap.duration)
-        near = [(w, c, t) for w, c, t in camera_lines
-                if wall - dt.timedelta(seconds=WINDOW) <= w <= gap_end + dt.timedelta(seconds=WINDOW)
-                and not t.startswith("Live ")]
-        dropout = any("after a dropout" in t or "No video from" in t for _, _, t in near)
+        near = [(w, c, t, lost_at) for w, c, t, lost_at in camera_lines
+                if w >= wall - dt.timedelta(seconds=WINDOW)
+                and (lost_at or w) <= gap_end + dt.timedelta(seconds=WINDOW)]
+        dropout = any(lost_at is not None for _, _, _, lost_at in near)
         dropouts += dropout
         # A movie gap alone cannot distinguish device, ingest or writer loss.
         kind = "signal dropout" if dropout else ("unknown: no camera ID; use --camera" if camera is None
                                                     else "unknown: no matching signal dropout")
         print(f"\n{gap.at:10.3f} s  {wall:%H:%M:%S.%f}"[:-3] + f"  {gap_description(gap)}  [{kind}]")
-        for w, c, t in near[: args.lines]:
+        for w, c, t, _ in near[: args.lines]:
             print(f"    {w:%H:%M:%S.%f}"[:-3] + f"  {c:<9} {t[:200]}")
     print(f"\n{dropouts} of {len(gaps)} gaps line up with a logged signal dropout for this camera.")
     for text in summaries:
@@ -289,7 +307,13 @@ def main():
     t.set_defaults(func=take)
     sub.add_parser("devices", help="UltraStudio status now").set_defaults(func=devices)
     args = parser.parse_args()
-    args.func(args)
+    try:
+        args.func(args)
+    except subprocess.CalledProcessError as error:
+        detail = (error.stderr or '').strip() or (error.stdout or '').strip() or str(error)
+        parser.exit(1, f"{detail}\n")
+    except OSError as error:
+        parser.exit(1, f"{error}\n")
 
 
 if __name__ == "__main__":

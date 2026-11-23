@@ -24,7 +24,7 @@ struct VendorSetting: Identifiable, Sendable {
   }
   let id: ID
   let labelKey: String
-  let value: VendorSettingValue
+  var value: VendorSettingValue
   let allowedValues: AllowedValues
   let mutable: Bool
   let availabilityReason: String?
@@ -40,6 +40,35 @@ struct VendorSetting: Identifiable, Sendable {
 
   enum Interruption: Sendable {
     case video, audio
+  }
+
+  func validate(_ value: VendorSettingValue) throws {
+    try value.validate()
+    guard mutable else { throw PluginError.unsupported(availabilityReason ?? "Setting is read-only") }
+    if let formats = captureFormats {
+      if value == VendorCaptureMode.automatic { return }
+      guard let mode = VendorCaptureMode(selection: value), let format = formats.first(where: { $0.id == mode.formatID }) else {
+        throw PluginError.unsupported("The requested capture format is unavailable")
+      }
+      guard format.supports(mode.duration) else {
+        throw PluginError.unsupported("The requested frame rate is outside this format’s supported ranges")
+      }
+      return
+    }
+    let allowed: Bool
+    switch (allowedValues, value) {
+    case (.unrestricted, _):
+      switch (self.value, value) {
+      case (.boolean, .boolean), (.signed, .signed), (.unsigned, .unsigned), (.decimal, .decimal), (.text, .text), (.choice, .choice): allowed = true
+      default: allowed = false
+      }
+    case (.choices(let choices), .choice(let id)): allowed = choices.contains { $0.id == id }
+    case (.signed(let range), .signed(let number)): allowed = range.contains(number)
+    case (.unsigned(let range), .unsigned(let number)): allowed = range.contains(number)
+    case (.decimal(let range), .decimal(let number)): allowed = range.contains(number)
+    default: allowed = false
+    }
+    guard allowed else { throw PluginError.unsupported("Setting value is outside the supported values") }
   }
 
   func localizedLabel(in bundle: Bundle = .main) -> String {

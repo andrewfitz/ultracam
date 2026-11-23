@@ -142,7 +142,7 @@ final class ProgramStreamMedia: @unchecked Sendable {
       picture = pictures.removeFirst()
     }
     if metrics.sentFrames == 0 {
-      publisher.setMediaEpoch(picture.sample.presentationTimeStamp)
+      publisher.setMediaEpoch(picture.sample.presentationTimeStamp, includesAudio: wantsAudio)
     }
     if let range = picture.audioRange {
       // Preserve the sound of skipped pictures. A sleep or long scheduler stall can

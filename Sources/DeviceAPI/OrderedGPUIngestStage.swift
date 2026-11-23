@@ -32,20 +32,24 @@ final class OrderedGPUIngestStage<Input: Sendable, Output: Sendable>: @unchecked
        emit: @escaping @Sendable (Result<Output, Error>) -> Void) {
     precondition(capacity > 0 && minimumSlots >= 0 && minimumSlots <= capacity && maximumBytes >= 0 && maximumDuration > 0)
     self.minimumSlots = minimumSlots
-    self.maximumBytes = maximumBytes; self.maximumDuration = maximumDuration; self.weight = weight
+    self.maximumBytes = maximumBytes
+    // Match the capture admission budget's tolerance for sums of fractional frame durations.
+    self.maximumDuration = maximumDuration.isFinite ? maximumDuration + maximumDuration.ulp * 4 : .infinity
+    self.weight = weight
     self.capacity = capacity; self.transform = transform; self.emit = emit
     queue.setSpecific(key: key, value: 1)
   }
 
   @discardableResult func enqueue(_ input: Input) -> Bool {
     sync {
-      guard !closed, pending.count + (active == nil ? 0 : 1) < capacity else { return false }
+      let slots = pending.count + (active == nil ? 0 : 1)
+      guard !closed, slots < capacity else { return false }
       let value = weight(input)
       let bytes = retainedBytes.addingReportingOverflow(value.bytes)
       let duration = retainedDuration + value.duration
       guard value.bytes >= 0, value.duration >= 0, value.duration.isFinite,
         !bytes.overflow, bytes.partialValue <= maximumBytes,
-        duration.isFinite, (duration <= maximumDuration || pending.count + (active == nil ? 0 : 1) < minimumSlots) else { return false }
+        duration.isFinite, (value.duration == 0 || duration <= maximumDuration || slots < minimumSlots) else { return false }
       retainedBytes = bytes.partialValue; retainedDuration = duration
       pending.append((input, value))
       startNext()
@@ -80,9 +84,9 @@ final class OrderedGPUIngestStage<Input: Sendable, Output: Sendable>: @unchecked
         guard !closed, active == token else { return }
         active = nil
         retainedBytes -= weight.bytes
-        // Empty queues have no retained duration. Reset explicitly so a
-        // rounding residue cannot reject a later frame at the exact limit.
-        retainedDuration = pending.isEmpty ? 0 : max(0, retainedDuration - weight.duration)
+        // Summing the bounded backlog preserves small pending durations that
+        // may have rounded away while a much longer frame was active.
+        retainedDuration = pending.reduce(0) { $0 + $1.weight.duration }
         emit(result)
         startNext()
       }

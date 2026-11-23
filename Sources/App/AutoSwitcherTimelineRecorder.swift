@@ -444,8 +444,18 @@ final class AutoSwitcherTimelineRecorder {
 
   func recordControlEvent(_ input: AutoSwitcherControlEvent) {
     let event: AutoSwitcherTimelineEvent
-    let time: Double?
+    let timestamp: (seconds: Double, ticks: Int64)?
+    let checkpoint: Bool
     switch input {
+    case let .tick(seconds):
+      guard let time = Self.timestamp(seconds: seconds) else { return }
+      event = AutoSwitcherTimelineEvent(type: "tick", time: seconds, timeTicks: time.ticks)
+      if let last = lastDirectorMediaTime, seconds + 1e-6 < last {
+        sessionGeneration = sessionGeneration == .max ? .max : sessionGeneration + 1
+      }
+      lastDirectorMediaTime = seconds
+      timestamp = time
+      checkpoint = false
     case .reset:
       lastDirectorMediaTime = nil
       sessionGeneration = sessionGeneration == .max ? .max : sessionGeneration + 1
@@ -455,9 +465,10 @@ final class AutoSwitcherTimelineRecorder {
       pending.removeAll()
       currentCameraID = FeedID(rawValue: document.config.anchorCameraID)
       event = AutoSwitcherTimelineEvent(type: "reset")
-      time = nil
+      timestamp = nil
+      checkpoint = false
     case let .manualOverride(cameraID, seconds):
-      guard let timestamp = Self.timestamp(seconds: seconds) else { return }
+      guard let time = Self.timestamp(seconds: seconds) else { return }
       for index in pending.values where document.cuts.indices.contains(index) {
         document.cuts[index].status = "cancelled"
       }
@@ -465,31 +476,42 @@ final class AutoSwitcherTimelineRecorder {
       document.cuts.append(AutoSwitcherTimelineCut(decisionID: nil,
         sessionGeneration: sessionGeneration,
         fromCameraID: currentCameraID.rawValue, targetCameraID: cameraID,
-        requestedCutTime: timestamp.seconds, requestedCutTimeTicks: timestamp.ticks,
-        appliedSourceTime: timestamp.seconds, appliedSourceTimeTicks: timestamp.ticks,
-        appliedProgramTime: timestamp.seconds, appliedProgramTimeTicks: timestamp.ticks,
+        requestedCutTime: time.seconds, requestedCutTimeTicks: time.ticks,
+        appliedSourceTime: time.seconds, appliedSourceTimeTicks: time.ticks,
+        appliedProgramTime: time.seconds, appliedProgramTimeTicks: time.ticks,
         expiresAt: nil, expiresAtTicks: nil, confidence: nil, reason: "manualOverride",
         forced: false, status: "applied"))
       currentCameraID = FeedID(rawValue: cameraID)
       lastDirectorMediaTime = seconds
-      event = AutoSwitcherTimelineEvent(type: "manualOverride", time: seconds, cameraID: cameraID)
-      time = seconds
+      event = AutoSwitcherTimelineEvent(type: "manualOverride", time: seconds, timeTicks: time.ticks, cameraID: cameraID)
+      timestamp = time
+      checkpoint = false
     case let .health(cameraID, healthy, seconds):
+      guard let time = Self.timestamp(seconds: seconds) else { return }
+      if cameraID == document.config.anchorCameraID || cameraID == document.config.emphasisCameraID {
+        lastDirectorMediaTime = max(lastDirectorMediaTime ?? seconds, seconds)
+      }
       event = AutoSwitcherTimelineEvent(type: "video", observation:
         AutoSwitcherTimelineObservation(time: seconds, camera_id: cameraID, healthy: healthy))
-      time = seconds
+      timestamp = time
+      checkpoint = false
+    case let .acknowledge(decisionID, seconds):
+      timestamp = seconds.flatMap(Self.timestamp(seconds:))
+      event = AutoSwitcherTimelineEvent(type: "acknowledge",
+        time: timestamp?.seconds, timeTicks: timestamp?.ticks, decisionID: decisionID,
+        appliedAt: timestamp?.seconds, appliedAtTicks: timestamp?.ticks)
+      checkpoint = true
+    case let .reject(decisionID):
+      event = AutoSwitcherTimelineEvent(type: "reject", decisionID: decisionID)
+      timestamp = nil
+      checkpoint = true
     }
-    let timestamp = time.flatMap(Self.timestamp(seconds:))
-    append(event: event, mediaTime: timestamp, outputs: [])
+    append(event: event, mediaTime: timestamp, outputs: [], checkpoint: checkpoint)
   }
 
   func recordAudioCue(_ cue: AutoSwitcherAudioCue) {
     guard let timestamp = Self.timestamp(seconds: cue.time) else { return }
     append(event: AutoSwitcherTimelineEvent(type: "audio", cue: cue,
-      time: timestamp.seconds, timeTicks: timestamp.ticks, decisionID: nil,
-      appliedAt: nil, appliedAtTicks: nil, cameraID: nil), mediaTime: timestamp,
-      outputs: [])
-    append(event: AutoSwitcherTimelineEvent(type: "tick", cue: nil,
       time: timestamp.seconds, timeTicks: timestamp.ticks, decisionID: nil,
       appliedAt: nil, appliedAtTicks: nil, cameraID: nil), mediaTime: timestamp,
       outputs: [])
@@ -502,14 +524,6 @@ final class AutoSwitcherTimelineRecorder {
       cue.start.isFinite, cue.end.isFinite, cue.start >= 0 else { return }
     guard let timestamp = Self.timestamp(seconds: cue.end) else { return }
     append(event: AutoSwitcherTimelineEvent(type: "transcript", transcript: cue,
-      time: timestamp.seconds, timeTicks: timestamp.ticks, decisionID: nil,
-      appliedAt: nil, appliedAtTicks: nil, cameraID: nil), mediaTime: timestamp,
-      outputs: [])
-  }
-
-  func recordTick(time: CMTime) {
-    guard let timestamp = Self.timestamp(time) else { return }
-    append(event: AutoSwitcherTimelineEvent(type: "tick", cue: nil,
       time: timestamp.seconds, timeTicks: timestamp.ticks, decisionID: nil,
       appliedAt: nil, appliedAtTicks: nil, cameraID: nil), mediaTime: timestamp,
       outputs: [])
@@ -534,7 +548,7 @@ final class AutoSwitcherTimelineRecorder {
       mediaTime: Self.timestamp(instruction.cutTime), outputs: [output])
   }
 
-  func recordApplied(decisionID: UUID, target: FeedID, sourceTime: CMTime, programTime: CMTime, directorAppliedAt: CMTime? = nil) {
+  func markCutApplied(decisionID: UUID, target: FeedID, sourceTime: CMTime, programTime: CMTime) {
     guard let index = pending[decisionID], document.cuts.indices.contains(index),
       let source = Self.timestamp(sourceTime), let program = Self.timestamp(programTime) else { return }
     pending.removeValue(forKey: decisionID)
@@ -544,18 +558,11 @@ final class AutoSwitcherTimelineRecorder {
     document.cuts[index].appliedProgramTime = program.seconds
     document.cuts[index].appliedProgramTimeTicks = program.ticks
     currentCameraID = target
-    // Persist exactly the acknowledgement sent live, in the director clock.
-    let directorTime = directorAppliedAt.flatMap(Self.timestamp)
-    let event = AutoSwitcherTimelineEvent(type: "acknowledge", cue: nil,
-      time: directorTime?.seconds, timeTicks: directorTime?.ticks, decisionID: decisionID,
-      appliedAt: directorTime?.seconds, appliedAtTicks: directorTime?.ticks, cameraID: target.rawValue)
-    append(event: event, mediaTime: directorTime, outputs: [], checkpoint: true)
+    revision &+= 1
   }
 
   func recordExpired(decisionID: UUID) {
-    if let index = pending.removeValue(forKey: decisionID), document.cuts.indices.contains(index) {
-      document.cuts[index].status = "expired"
-    }
+    markCutRejected(decisionID: decisionID, expired: true)
     let output = AutoSwitcherTimelineOutput(type: "decisionExpired", instruction: nil,
       decisionID: decisionID, message: nil)
     append(event: AutoSwitcherTimelineEvent(type: "directorOutput", cue: nil,
@@ -563,12 +570,10 @@ final class AutoSwitcherTimelineRecorder {
       appliedAtTicks: nil, cameraID: nil), mediaTime: nil, outputs: [output], checkpoint: true)
   }
 
-  func recordRejected(decisionID: UUID) {
-    if let index = pending.removeValue(forKey: decisionID), document.cuts.indices.contains(index) {
-      document.cuts[index].status = "rejected"
-    }
-    append(event: AutoSwitcherTimelineEvent(type: "reject", decisionID: decisionID),
-      mediaTime: nil, outputs: [], checkpoint: true)
+  func markCutRejected(decisionID: UUID, expired: Bool = false) {
+    guard let index = pending.removeValue(forKey: decisionID) else { return }
+    document.cuts[index].status = expired ? "expired" : "rejected"
+    revision &+= 1
   }
 
   func recordError(_ message: String) {
@@ -628,14 +633,6 @@ final class AutoSwitcherTimelineRecorder {
 
   private func append(event: AutoSwitcherTimelineEvent, mediaTime: (seconds: Double, ticks: Int64)?,
                       outputs: [AutoSwitcherTimelineOutput], checkpoint: Bool = false) {
-    if event.type == "tick", let time = mediaTime?.seconds {
-      if let last = lastDirectorMediaTime, time + 1e-6 < last {
-        sessionGeneration = sessionGeneration == .max ? .max : sessionGeneration + 1
-      }
-      lastDirectorMediaTime = time
-    } else if event.type == "video", let time = mediaTime?.seconds {
-      lastDirectorMediaTime = max(lastDirectorMediaTime ?? time, time)
-    }
     document.duration = max(document.duration, mediaTime?.seconds ?? 0)
     unsubmittedEvents.append(AutoSwitcherTimelineEventRecord(sequence: nextSequence,
       mediaTime: mediaTime?.seconds, mediaTimeTicks: mediaTime?.ticks, event: event, outputs: outputs))

@@ -24,10 +24,28 @@ LAYOUT = {
 
 def _directory_path(path):
     """Check existing ancestors, including aliases, without writing probe files."""
-    for ancestor in (path, *path.parents):
+    if any(c in str(path) for c in ('\0', '\n', '\r')):
+        raise ValueError('Work paths must be single-line paths')
+    resolved = path.resolve()
+    if any(c in str(resolved) for c in ('\0', '\n', '\r')):
+        raise ValueError('Work paths must resolve to single-line paths')
+    for ancestor in (path, *path.parents, resolved, *resolved.parents):
         if ancestor.exists() and not ancestor.is_dir():
             raise ValueError(f'Work path has a non-directory ancestor: {ancestor}')
-    return path.resolve()
+    return resolved
+
+
+def _within(path, directory):
+    if path.is_relative_to(directory):
+        return True
+    # resolve() preserves alternate casing on case-insensitive macOS volumes.
+    return directory.exists() and any(
+        ancestor.exists() and ancestor.samefile(directory) for ancestor in (path, *path.parents)
+    )
+
+
+def _strictly_within(path, directory):
+    return _within(path, directory) and not _within(directory, path)
 
 
 def work_paths(checkout=ROOT, *, environ=None):
@@ -49,14 +67,24 @@ def work_paths(checkout=ROOT, *, environ=None):
     else:
         requested = checkout / '.build'
     root = _directory_path(requested)
-    if checkout.is_relative_to(root) or (root.is_relative_to(checkout) and not root.is_relative_to(checkout / '.build')):
+    checkout_build = checkout / '.build'
+    if _within(checkout, root) or (_within(root, checkout) and
+                                   (checkout_build.is_symlink() or not _within(root, checkout_build))):
         raise ValueError('Work root must be outside the source checkout or in its .build subtree')
     paths = {'work_root': root}
     for name, relative in LAYOUT.items():
         path = _directory_path(root / relative)
-        if not path.is_relative_to(root) or path == root:
+        if not _strictly_within(path, root):
             raise ValueError(f'Derived work path escapes work root: {name}')
         paths[name] = path
+    for child, parent in (('logs_root', 'artifact_root'), ('package_cache_root', 'build_root')):
+        if not _strictly_within(paths[child], paths[parent]):
+            raise ValueError(f'{child} must stay inside {parent}')
+    separate_roots = ('tmp_root', 'artifact_root', 'build_root')
+    for index, name in enumerate(separate_roots):
+        for other in separate_roots[index + 1:]:
+            if _within(paths[name], paths[other]) or _within(paths[other], paths[name]):
+                raise ValueError(f'Work paths must be separate: {name}, {other}')
     return paths
 
 
@@ -66,14 +94,17 @@ def work_root(checkout=ROOT, *, environ=None):
 
 def derived_data_path(value, checkout=ROOT, *, environ=None):
     """Permit reuse only in the build subtree, never source/artifact locations."""
+    if not str(value).strip():
+        raise ValueError('DerivedData must be a nonempty path')
     paths = work_paths(checkout, environ=environ)
     requested = Path(value).expanduser()
     if not requested.is_absolute():
         requested = paths['build_root'] / requested
     candidate = _directory_path(requested)
-    if candidate == paths['build_root'] or not candidate.is_relative_to(paths['build_root']):
+    if not _strictly_within(candidate, paths['build_root']):
         raise ValueError('DerivedData must stay inside the configured build root')
     return candidate
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)

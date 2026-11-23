@@ -320,8 +320,7 @@ public struct MonitorFrame: @unchecked Sendable {
     let sub: UInt32 = layout.subsampling == .s444 ? 0 : (layout.subsampling == .s422 ? 1 : 2)
     let depth = layout.bitDepth
     // Float RGB is already normalized: it has no code range.
-    let full = signal.range == .full || layout.isFloat
-    var codeDepth = depth
+    let range = layout.effectiveRange(signal.range)
     var lumaScale: Float = 1, chromaScale: Float = 1, rgbMax: Float = 1, isFloat: Float = 0
     switch layout {
     case .v210, .uyvy8, .yuyv8: break
@@ -333,14 +332,13 @@ public struct MonitorFrame: @unchecked Sendable {
     case .rgb(let d, let float):
       if float {
         isFloat = 1
-        codeDepth = 10
       } else {
         rgbMax = Float((1 << d) - 1)
       }
     }
     // Float RGB takes full 10-bit levels whatever its label: `mk_nativeLog` reads
     // a full container's maximum code from them.
-    let levels = (full ? CodeRange.full : .legal).levels(bitDepth: codeDepth)
+    let levels = range.levels(bitDepth: layout.codeBitDepth)
     let k = signal.matrix.coefficients
     // Every 10-bit integer layout carries exact codes the classifiers can restore.
     let integral10 = depth == 10 && !layout.isFloat
@@ -351,7 +349,7 @@ public struct MonitorFrame: @unchecked Sendable {
     return FrameParameters(
       shape: SIMD4(kind, UInt32(width), UInt32(height), sub),
       options: SIMD4(
-        signal.chromaSiting == .center ? 1 : 0, full ? 1 : 0, rescaled ? 1 : 0, integral10 ? 1 : 0),
+        signal.chromaSiting == .center ? 1 : 0, range == .full ? 1 : 0, rescaled ? 1 : 0, integral10 ? 1 : 0),
       matrix: SIMD4(Float(k.r), Float(k.g), Float(k.b), Float(signal.chromaVerticalSiting.offset)),
       levels: SIMD4(
         Float(levels.black), Float(levels.span), Float(levels.center), Float(levels.chromaSpan)),

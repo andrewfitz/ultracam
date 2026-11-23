@@ -60,6 +60,38 @@ import XCTest
     FakeCaptureSession(format: try SourceFormat(width: 3840, height: 2160, pixel: .v210,
       rate: .constant(CMTime(value: 1001, timescale: 60000))))
   }
+  func testInvalidTimescalesAreRejectedAtDeliveryConstruction() throws {
+    let epoch = CaptureEpochID(sessionID: UUID(), epoch: 0)
+    let duration = CMTime(value: 1, timescale: 30)
+    let audio = try SourceAudioFormat(sampleRate: 48_000, channels: 1, sample: .int16,
+      interleaved: true, layout: AudioChannelMap(), clock: .deviceClock)
+    for scale: Int32 in [0, -1] {
+      let invalid = CMTime(value: 1, timescale: scale, flags: .valid, epoch: 0)
+      XCTAssertThrowsError(try CaptureAudioPacket(planes: [Data(count: 2)], sampleFrameCount: 1,
+        format: audio, packetTime: invalid))
+      for (pts, frameDuration) in [(invalid, duration), (.zero, invalid)] {
+        let frame = CaptureFrameInfo(epochID: epoch, formatSignature: "fixture", presentationTime: pts,
+          duration: frameDuration, signalValid: true, timecode: nil)
+        XCTAssertThrowsError(try frame.validate())
+      }
+    }
+  }
+  func testPlanarPacketOwnsEveryByteAndAccountsForEveryChannel() throws {
+    let format = try SourceAudioFormat(sampleRate: 48_000, channels: 2, sample: .int16,
+      interleaved: false, layout: AudioChannelMap(), clock: .deviceClock)
+    let length = 32
+    let borrowed = UnsafeMutableRawPointer.allocate(byteCount: length, alignment: 1)
+    defer { borrowed.deallocate() }
+    borrowed.initializeMemory(as: UInt8.self, repeating: 0x31, count: length)
+    let planes = [Data(bytesNoCopy: borrowed, count: length, deallocator: .none), Data(repeating: 0x72, count: length)]
+    let packet = try CaptureAudioPacket(planes: planes, sampleFrameCount: length / 2, format: format, packetTime: .zero)
+    borrowed.storeBytes(of: UInt8(0xff), as: UInt8.self)
+    XCTAssertEqual(packet.planes[0], Data(repeating: 0x31, count: length))
+    XCTAssertEqual(packet.planes[1], planes[1])
+    XCTAssertEqual(packet.byteCount, 2 * length)
+    XCTAssertThrowsError(try CaptureAudioPacket(planes: planes, sampleFrameCount: Int.max / 2,
+      format: format, packetTime: .zero))
+  }
   func testCaptureHostTimeIsAnIndependentFrameValue() throws {
     let epoch = CaptureEpochID(sessionID: UUID(), epoch: 0)
     let original = CaptureFrameInfo(epochID: epoch, formatSignature: "fixture", presentationTime: .zero,
@@ -148,6 +180,47 @@ import XCTest
       XCTAssertNoThrow(try session.start(deviceID: id, timing: .automatic, handlers: CaptureHandlers(deliver: { _ in })))
     }
   }
+  @MainActor func testReentrantFakeInventoryChangesReachObserversInOrder() throws {
+    let format = try SourceFormat(width: 1920, height: 1080, pixel: .v210,
+      rate: .constant(CMTime(value: 1001, timescale: 30000)))
+    let plugin = FakeCapturePlugin(format: format, audio: .absent)
+    let first = plugin.observeDevices { snapshot in
+      if !snapshot.devices.isEmpty { plugin.setConnected(false) }
+    }
+    let received = DeviceSnapshotRecorder()
+    let second = plugin.observeDevices { received.values.append($0.devices.map(\.id)) }
+    plugin.setConnected(true)
+    XCTAssertEqual(received.values, [[], ["fake:fixture"], []])
+    withExtendedLifetime((first, second)) {}
+  }
+  func testFakeCaptureSettingsValidateAndAcknowledgeWrites() async throws {
+    let format = try SourceFormat(width: 1920, height: 1080, pixel: .v210,
+      rate: .constant(CMTime(value: 1001, timescale: 30000)))
+    let plugin = FakeCapturePlugin(format: format, audio: .absent)
+    let deviceID = "fake:fixture"
+    plugin.setSettings([
+      .init(id: "fake:exposure", labelKey: "Exposure", value: .signed(2), allowedValues: .signed(1...4),
+        mutable: true, availabilityReason: nil, interruptsCapture: false, applicationError: .failed("previous write")),
+      .init(id: "fake:connected", labelKey: "Connected", value: .boolean(true), allowedValues: .unrestricted,
+        mutable: false, availabilityReason: nil, interruptsCapture: false),
+    ], for: deviceID)
+    let invalidWrites: [(String, VendorSettingValue)] = [
+      ("fake:exposure", .signed(5)), ("fake:exposure", .unsigned(3)), ("fake:connected", .boolean(false)),
+    ]
+    for (setting, value) in invalidWrites {
+      do {
+        try await plugin.apply(value, to: setting, deviceID: deviceID)
+        XCTFail("Fixture accepted an invalid settings write")
+      } catch PluginError.unsupported {}
+    }
+    let rejected = try await plugin.settings(deviceID: deviceID)
+    XCTAssertEqual(rejected.map(\.value), [.signed(2), .boolean(true)])
+    XCTAssertNotNil(rejected.first?.applicationError)
+    try await plugin.apply(.signed(3), to: "fake:exposure", deviceID: deviceID)
+    let written = try await plugin.settings(deviceID: deviceID)
+    XCTAssertEqual(written.first?.value, .signed(3))
+    XCTAssertNil(written.first?.applicationError)
+  }
   func testCommandControlledPluginStartsWithoutADevice() throws {
     let format = try SourceFormat(width: 3840, height: 2160, pixel: .v210,
       rate: .constant(CMTime(value: 1001, timescale: 30000)))
@@ -231,6 +304,7 @@ import XCTest
       if case .event(.info("block")) = delivery.payload {
         entered.signal()
         _ = release.wait(timeout: .now() + 5)
+        XCTAssertEqual(source.deviceID, "fake:fixture")
       }
     }))
     XCTAssertTrue(source.submit(.event(.info("block"))))

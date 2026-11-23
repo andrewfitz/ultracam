@@ -12,7 +12,7 @@ import time
 
 # Keep imports from creating cache files beside the project scripts.
 sys.dont_write_bytecode = True
-from validate_bundle import RELOAD_HELPER, binary_uuids, validate
+from validate_bundle import RELOAD_HELPER, SWITCHER_WORKER, binary_uuids, validate
 
 ROOT = Path(__file__).resolve().parents[1]
 LOCAL_GROUP = "group.org.ultracam.local"
@@ -137,16 +137,23 @@ def publish_stage(source, source_symbols, destination, destination_symbols):
 
 def sign_and_validate(destination):
     extension = destination / "Contents/Library/SystemExtensions" / (EXTENSION_ID + ".systemextension")
+    info_paths = [bundle / "Contents/Info.plist" for bundle in (destination, extension)]
+    if any(path.resolve() != path for path in info_paths):
+        raise ValueError("Refusing symlinked local build metadata.")
     version = str(int(time.time()))
-    for bundle in (destination, extension):
-        info_path = bundle / "Contents/Info.plist"
+    for info_path in info_paths:
         info = read_plist(info_path)
         info[LOCAL_MARKER] = True
         info["CFBundleVersion"] = version
-        if bundle == extension:
+        if info_path.is_relative_to(extension):
             info["CMIOExtension"]["CMIOExtensionMachServiceName"] = LOCAL_GROUP + ".camera"
         write_plist(info_path, info)
     sign_staged_libraries(destination)
+    worker = destination / SWITCHER_WORKER
+    subprocess.run([
+        "/usr/bin/codesign", "--force", "--sign", "-", "--timestamp=none", "--options", "runtime",
+        "--entitlements", str(ROOT / "Config/AutoSwitcherWorker.entitlements"), str(worker),
+    ], check=True)
     reload_helper = destination / RELOAD_HELPER
     subprocess.run([
         "/usr/bin/codesign", "--force", "--sign", "-", "--timestamp=none",
@@ -170,7 +177,7 @@ def sign_and_validate(destination):
                 "/usr/bin/codesign", "--force", "--sign", "-", "--timestamp=none",
                 "--options", "runtime", "--entitlements", str(entitlements_path), str(bundle),
             ], check=True)
-    for bundle in (reload_helper, extension, destination):
+    for bundle in (worker, reload_helper, extension, destination):
         subprocess.run(["/usr/bin/codesign", "--verify", "--strict", "--verbose=2", str(bundle)], check=True)
     validate(destination)
 

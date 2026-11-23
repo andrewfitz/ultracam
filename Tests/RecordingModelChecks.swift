@@ -202,14 +202,35 @@ import XCTest
     XCTAssertFalse(next.recordingConstantFrameRate)
   }
 
-  func testFinishedArtifactLookupUsesOriginalTakeFolderGrant() throws {
-    final class ArtifactDriver: RecordingSessionDriver, RecordingSessionDriverArtifacts {
+  func testFinishedArtifactLookupUsesOriginalTakeFolderGrant() async throws {
+    final class ArtifactDriver: RecordingSessionDriver, RecordingSessionDriverArtifacts, RecordingSessionDriverStatistics {
       let url: URL
+      var delayStart = false
+      var stopBeforeStart = false
+      var snapshots: [FeedID: RecordingStatistics] = [:]
+      var pendingStart: NativeRecordingSessionDriver.StopCompletion?
       init(_ url: URL) { self.url = url }
       func startRecording(feedID: FeedID, configuration: RecordingConfiguration) throws {}
+      @MainActor func startRecording(feedID: FeedID, configuration: RecordingConfiguration,
+        completion: @escaping NativeRecordingSessionDriver.StopCompletion) {
+        if delayStart { pendingStart = completion } else { completion(.success(())) }
+      }
       func pauseRecording(feedID: FeedID) throws {}
       func resumeRecording(feedID: FeedID) throws {}
       func stopRecording(feedID: FeedID) throws {}
+      @MainActor func stopRecording(feedID: FeedID, completion: @escaping NativeRecordingSessionDriver.StopCompletion) {
+        if stopBeforeStart { completion(.success(())) }
+        else {
+          completeStart(with: .failure(TestError.failed))
+          completion(.success(()))
+        }
+      }
+      @MainActor func completeStart(with result: Result<Void, Error>) {
+        let complete = pendingStart
+        pendingStart = nil
+        complete?(result)
+      }
+      @MainActor func recordingStatistics() async -> [FeedID: RecordingStatistics] { snapshots }
       func recordingOutputURL(feedID: FeedID) -> URL? { url }
       func finishedOutputURL(feedID: FeedID) -> URL? { url }
     }
@@ -221,18 +242,57 @@ import XCTest
     let movie = original.appendingPathComponent("take.mov")
     try Data([1, 2, 3]).write(to: movie)
     var checkedScope: URL?
+    let driver = ArtifactDriver(movie)
     let model = RecordingModel(feeds: [RecordingFeedDescriptor(id: first, name: "Wide")],
-      driver: ArtifactDriver(movie), resolveFinishedFile: { url, scope in
+      driver: driver, resolveFinishedFile: { url, scope in
         checkedScope = scope
         guard scope == original, let url, FileManager.default.fileExists(atPath: url.path) else { return nil }
         return url
       })
     model.outputFolder = original
     model.record(feedID: first)
+    driver.snapshots = [first: RecordingStatistics(encodedFrames: 30)]
+    await model.refreshStatistics()
     model.setOutputFolder(next, for: first)
     model.stop(feedID: first)
     XCTAssertEqual(checkedScope, original)
     XCTAssertEqual(model.feeds.first?.savedURL, movie)
+
+    driver.delayStart = true
+    model.record(feedID: first)
+    model.stop(feedID: first)
+    XCTAssertEqual(model.feeds.first?.status, .idle)
+    XCTAssertNotNil(model.feeds.first?.error)
+    XCTAssertEqual(model.feeds.first?.savedURL, movie, "A failed preparation during Stop preserves the last saved movie")
+
+    driver.stopBeforeStart = true
+    var completionURLs: [URL?] = []
+    model.onRecordingFinished = { _, url in completionURLs.append(url) }
+    var allTakesFinished = false
+    model.record(feedID: first)
+    model.stopAll { allTakesFinished = true }
+    XCTAssertEqual(model.feeds.first?.status, .finishing)
+    XCTAssertFalse(allTakesFinished)
+    XCTAssertTrue(completionURLs.isEmpty)
+
+    driver.completeStart(with: .failure(TestError.failed))
+    XCTAssertEqual(model.feeds.first?.status, .idle)
+    XCTAssertNotNil(model.feeds.first?.error)
+    XCTAssertEqual(model.feeds.first?.failedToStart, true)
+    XCTAssertEqual(model.feeds.first?.savedURL, movie)
+    XCTAssertEqual(model.feeds.first?.statistics?.encodedFrames, 30)
+    XCTAssertEqual(completionURLs, [nil], "The failed attempt did not save a movie")
+    XCTAssertTrue(allTakesFinished)
+
+    model.setOutputFolder(original, for: first)
+    model.record(feedID: first)
+    model.stop(feedID: first)
+    XCTAssertEqual(model.feeds.first?.status, .finishing)
+    driver.completeStart(with: .success(()))
+    XCTAssertNil(model.feeds.first?.error)
+    XCTAssertEqual(model.feeds.first?.failedToStart, false)
+    XCTAssertEqual(model.feeds.first?.savedURL, movie)
+    XCTAssertEqual(completionURLs, [nil, movie])
   }
 
   func testFailedStartReleasesActiveRootForEmptyRecoveryPruning() throws {

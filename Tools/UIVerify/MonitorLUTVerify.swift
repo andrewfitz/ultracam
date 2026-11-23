@@ -80,7 +80,7 @@ import SystemExtensions
   /// AppModel offline: choose, persist (the selected camera's descriptor is
   /// rebuilt on every save), restore in a new model, hide, remove.
   private static func model(verifier: Verifier) throws {
-    let suiteName = "org.ultracam.ui-verify-monitor-lut.\(UUID().uuidString)"
+    let suiteName = verifier.makeDefaultsDomain()
     guard let defaults = UserDefaults(suiteName: suiteName) else {
       return verifier.check("monitor LUT: defaults suite", false)
     }

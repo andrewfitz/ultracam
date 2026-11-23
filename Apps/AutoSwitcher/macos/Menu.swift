@@ -130,7 +130,7 @@ final class SwitcherMenu: NSObject, NSApplicationDelegate {
         guard let route = row.representedObject as? String else { return }
         let take = Process()
         take.executableURL = Bundle.main.url(forAuxiliaryExecutable: "auto-switcher")
-        take.arguments = ["take", route]
+        take.arguments = ["take", "--", route]
         do { try take.run() } catch { status = error.localizedDescription; refresh() }
     }
 
@@ -162,9 +162,24 @@ final class SwitcherMenu: NSObject, NSApplicationDelegate {
                     DispatchQueue.main.async {
                         guard let self, self.service === owner else { return }
                         self.current = route
-                        if !ids.isEmpty { self.routes = ids }
+                        if !ids.isEmpty {
+                            self.routes = ids
+                            self.status = "Listening on 127.0.0.1:48765"
+                        }
                         self.refresh()
                     }
+                }
+            }
+            DispatchQueue.main.async {
+                guard let self, self.service === owner, owner.isRunning else { return }
+                self.observer = nil
+                self.current = nil
+                self.routes = []
+                self.status = "Reconnecting to server…"
+                self.refresh()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                    guard self.service === owner, owner.isRunning else { return }
+                    self.observe(owner)
                 }
             }
         }
@@ -201,7 +216,11 @@ final class SwitcherMenu: NSObject, NSApplicationDelegate {
                 let data = handle.availableData
                 guard !data.isEmpty else { handle.readabilityHandler = nil; return }
                 let message = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
-                DispatchQueue.main.async { self?.status = message; self?.refresh() }
+                DispatchQueue.main.async {
+                    guard let self, self.service === process else { return }
+                    self.status = message
+                    self.refresh()
+                }
             }
             process.terminationHandler = { [weak self] child in
                 DispatchQueue.main.async {
@@ -209,9 +228,12 @@ final class SwitcherMenu: NSObject, NSApplicationDelegate {
                     if self.observer?.isRunning == true { self.observer?.terminate() }
                     self.observer = nil
                     self.current = nil
+                    self.routes = []
                     self.service = nil
                     if child.terminationStatus == 0 || child.terminationReason == .uncaughtSignal { self.status = "Stopped" }
-                    else if self.status == "Listening on 127.0.0.1:48765" { self.status = "Server exited (\(child.terminationStatus))" }
+                    else if ["Starting server…", "Listening on 127.0.0.1:48765", "Reconnecting to server…"].contains(self.status) {
+                        self.status = "Server exited (\(child.terminationStatus))"
+                    }
                     self.refresh()
                 }
             }

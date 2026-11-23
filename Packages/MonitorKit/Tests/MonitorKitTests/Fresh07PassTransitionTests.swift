@@ -31,6 +31,39 @@ final class Fresh07PassTransitionTests: XCTestCase {
     XCTAssertEqual(MonitorPass.variant(p, state: state, layout: layout).luts, 3)
   }
 
+  func testPicturePrimariesFollowStageReadingWhenUnlabelled() throws {
+    let gpu = try requireGPU()
+    let reading = SignalReading(range: .legal, matrix: .bt2020)
+    var frame = try Fixtures.grey(width: 96, height: 48) { _, _ in 128 }.frame(
+      gpu, signal: SignalDescription(outputReading: reading))
+    let pass = gpu.engine.makePass(), feed = gpu.engine.makeFeed()
+    pass.outputColor = MonitorOutputColor(encoding: .sdr(.bt1886))
+    let target = MonitorRenderTargetFormat(colorPixelFormat: .rgba32Float)
+    let size = (width: frame.width, height: frame.height)
+    let placeholder = try gpu.engine.warmUpLUT()
+    var state = MonitorState()
+    func prepare(_ stage: SignalStage) throws {
+      state.pictureStage = stage
+      try pass.prepareState(
+        frame: frame, feed: feed, state: state, viewport: MonitorViewport(width: size.width, height: size.height),
+        target: target)
+      let surface = MonitorSurfaceConfiguration(
+        target: target, layout: frame.layout, state: state, signal: frame.signal, outputColor: pass.outputColor,
+        frameSize: size, viewportSize: size)
+      let keys = try MonitorEngine.pipelineKeys(for: surface, placeholder: placeholder)
+      XCTAssertEqual(keys.map(\.color), [MonitorPass.colorKey(pass.colorPipeline)])
+    }
+    try prepare(.source)
+    XCTAssertEqual(pass.colorPipeline.picture.primaries, .rec709)
+    try prepare(.output)
+    XCTAssertEqual(pass.colorPipeline.picture.primaries, .rec2020)
+    try prepare(.monitor)
+    XCTAssertEqual(pass.colorPipeline.picture.primaries, .rec2020)
+    frame.signal.primaries = .rec709
+    try prepare(.monitor)
+    XCTAssertEqual(pass.colorPipeline.picture.primaries, .rec709)
+  }
+
   func testGuideMatteDisappearsInCleanModeAndReturnsFromCache() throws {
     let gpu = try requireGPU()
     let frame = try Fixtures.grey(width: 96, height: 48) { _, _ in 128 }.frame(gpu, signal: .rec709)

@@ -250,6 +250,9 @@ import XCTest
     XCTAssertTrue(reloaded.notifies(.takeEndedEarly))
     XCTAssertEqual(reloaded.lowSpaceMinutes, 60)
     XCTAssertEqual(UIInterfaceState(defaults: defaults).lowSpaceSeconds, 3600, "The drive rows read the same level")
+    defaults.set(-1, forKey: UIAlertPreferences.lowSpaceMinutesKey)
+    XCTAssertEqual(UIAlertPreferences(defaults: defaults).lowSpaceMinutes, 30)
+    XCTAssertEqual(UIInterfaceState(defaults: defaults).lowSpaceSeconds, 1800, "Invalid saved thresholds use the same default")
     XCTAssertEqual(UIAlertPreferences.lowSpaceChoices.map(UISettingsAlertsPane.minutesTitle),
       ["15 minutes", "30 minutes", "1 hour", "2 hours"])
 

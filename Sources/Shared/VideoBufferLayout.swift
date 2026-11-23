@@ -99,7 +99,7 @@ enum VideoBufferLayout {
     switch type {
     case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
       componentBytes = 1; verticalSubsampling = 2
-    case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange:
+    case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange, kCVPixelFormatType_420YpCbCr10BiPlanarFullRange:
       componentBytes = 2; verticalSubsampling = 2
     case kCVPixelFormatType_422YpCbCr8BiPlanarVideoRange:
       componentBytes = 1; verticalSubsampling = 1

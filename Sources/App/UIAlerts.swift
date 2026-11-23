@@ -46,8 +46,13 @@ import SwiftUI
     promptDismissed = defaults.object(forKey: "ui.alerts.promptDismissed") as? Bool ?? false
     let off = Set((defaults.stringArray(forKey: "ui.alerts.eventsOff") ?? []).compactMap(UIAlertEvent.init(rawValue:)))
     events = Set(UIAlertEvent.allCases).subtracting(off)
-    let minutes = defaults.object(forKey: Self.lowSpaceMinutesKey) as? Int
-    lowSpaceMinutes = minutes.flatMap { Self.lowSpaceChoices.contains($0) ? $0 : nil } ?? 30
+    lowSpaceMinutes = Self.lowSpaceMinutes(in: defaults)
+  }
+
+  static func lowSpaceMinutes(in defaults: UserDefaults) -> Int {
+    guard let minutes = defaults.object(forKey: lowSpaceMinutesKey) as? Int,
+      lowSpaceChoices.contains(minutes) else { return 30 }
+    return minutes
   }
 
   func notifies(_ event: UIAlertEvent) -> Bool { events.contains(event) }
@@ -181,10 +186,12 @@ extension UIAlertDelivering {
     preferences.refreshPermission = { [weak self] in self?.readPermission() }
     readPermission()
     if !preferences.promptDismissed {
-      delivery.checkPermissionUndetermined { [weak self] undetermined in self?.interface.offerAlerts = undetermined }
+      delivery.checkPermissionUndetermined { [weak self] undetermined in
+        guard let self, !self.preferences.promptDismissed else { return }
+        self.interface.offerAlerts = undetermined
+      }
     }
-    track()
-    evaluate()
+    trackAndEvaluate()
   }
 
   private func bridge() -> UISessionBridge {
@@ -201,18 +208,19 @@ extension UIAlertDelivering {
       })
   }
 
-  private func track() {
-    withObservationTracking {
-      _ = bridge().presentation().problems.map(\.id)
+  private func trackAndEvaluate() {
+    let presentation = withObservationTracking {
       // Preferences can change while the problem list stays the same.
       _ = preferences.notificationsEnabled
       _ = preferences.panelEnabled
       _ = preferences.soundEnabled
       _ = preferences.events
       _ = preferences.lowSpaceMinutes
+      return bridge().presentation()
     } onChange: { [weak self] in
       Task { @MainActor [weak self] in self?.scheduleUpdate() }
     }
+    evaluate(presentation)
   }
 
   /// Coalesced: a burst of changes is one look at the list.
@@ -223,13 +231,11 @@ extension UIAlertDelivering {
       try? await Task.sleep(for: .milliseconds(250))
       guard let self else { return }
       self.updateScheduled = false
-      self.evaluate()
-      self.track()
+      self.trackAndEvaluate()
     }
   }
 
-  private func evaluate() {
-    let presentation = bridge().presentation()
+  private func evaluate(_ presentation: UISessionPresentation) {
     let plan = tracker.plan(problems: presentation.problems, live: presentation.isLive,
       notifications: preferences.notificationsEnabled, panel: preferences.panelEnabled,
       sound: preferences.soundEnabled, timeSensitiveEntitled: UIAlertPreferences.timeSensitiveEntitled,
@@ -252,17 +258,18 @@ extension UIAlertDelivering {
     driveWatch?.invalidate()
     driveWatch = nil
     guard rolling else { return }
-    let timer = Timer(timeInterval: Self.driveWatchInterval, repeats: true) { [weak self] _ in
-      MainActor.assumeIsolated { self?.evaluate() }
+    let timer = Timer(timeInterval: Self.driveWatchInterval, repeats: true) { [weak self] timer in
+      guard let self else { timer.invalidate(); return }
+      MainActor.assumeIsolated { self.evaluate(self.bridge().presentation()) }
     }
     RunLoop.main.add(timer, forMode: .common)
     driveWatch = timer
   }
 
   private func turnOn() {
-    interface.offerAlerts = false
     // Never while live: the prompt can't show then, and a menu can't reach this.
     guard !bridge().presentation().isLive else { return }
+    interface.offerAlerts = false
     delivery.requestPermission { [weak self] _ in self?.readPermission() }
   }
 

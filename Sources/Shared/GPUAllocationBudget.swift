@@ -52,6 +52,7 @@ public final class GPUAllocationBudget: @unchecked Sendable {
   public let policy: GPUAllocationBudgetPolicy
   private let lock = NSLock()
   private var entries: [UInt64: Entry] = [:]
+  private var bytesInUse = 0
   private var leaseCount = 0
   private var peak = 0
   public init(policy: GPUAllocationBudgetPolicy) { self.policy = policy }
@@ -68,24 +69,37 @@ public final class GPUAllocationBudget: @unchecked Sendable {
         if entry.owner == nil, let owner { entry.owner = owner }
         entries[backingID] = entry
       } else {
-        let (required, overflow) = currentBytes().addingReportingOverflow(bytes)
+        let (required, overflow) = bytesInUse.addingReportingOverflow(bytes)
         guard !overflow else { throw GPUAllocationBudgetFailure.overflow }
         guard required <= policy.maximumBytes else { throw GPUAllocationBudgetFailure.byteLimit(required: required, limit: policy.maximumBytes) }
         entries[backingID] = Entry(bytes: bytes, references: 1, generation: generation, owner: owner)
+        bytesInUse = required
         peak = max(peak, required)
       }
       leaseCount += 1
       return Lease(budget: self, key: backingID)
     }
   }
-  public func snapshot() -> Snapshot { lock.withLock { Snapshot(bytes: currentBytes(), allocations: entries.count, leases: leaseCount, peakBytes: peak) } }
-  private func currentBytes() -> Int {
-    entries.values.reduce(0) { partial, entry in
-      let (sum, overflow) = partial.addingReportingOverflow(entry.bytes)
-      return overflow ? Int.max : sum
-    }
+  public func snapshot() -> Snapshot {
+    lock.withLock { Snapshot(bytes: bytesInUse, allocations: entries.count, leases: leaseCount, peakBytes: peak) }
   }
-  private func release(key: UInt64) { lock.withLock { guard var e = entries[key] else { return }; e.references -= 1; leaseCount = max(0, leaseCount - 1); if e.references == 0 { entries.removeValue(forKey: key) } else { entries[key] = e } } }
+
+  private func release(key: UInt64) {
+    let retiredOwner: AnyObject? = lock.withLock {
+      guard var entry = entries[key] else { return nil }
+      leaseCount -= 1
+      entry.references -= 1
+      if entry.references > 0 {
+        entries[key] = entry
+        return nil
+      }
+      entries.removeValue(forKey: key)
+      bytesInUse -= entry.bytes
+      return entry.owner
+    }
+    // Releasing an external owner may call back into the budget.
+    withExtendedLifetime(retiredOwner) {}
+  }
 }
 
 public enum GPUCacheAge {

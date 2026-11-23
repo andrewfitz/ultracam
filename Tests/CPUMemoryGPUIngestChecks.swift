@@ -157,9 +157,13 @@ import XCTest
       let raw = UnsafeMutableRawPointer.allocate(byteCount: page, alignment: page)
       defer { raw.deallocate() }
       raw.initializeMemory(as: UInt8.self, repeating: 0, count: page)
-      let row = format == 0x72323130 ? 12 : 14, stride = row + 7
-      for y in 0..<3 { for x in 0..<row { raw.storeBytes(of: UInt8(y * 41 + x), toByteOffset: 17 + y * stride + x, as: UInt8.self) } }
-      let frame = CapturedCPUMemoryFrame(pointer: raw.advanced(by: 17), width: 3, height: 3, bytesPerRow: stride,
+      let row = format == 0x72323130 ? 12 : 14
+      let stride = row + 7, height = 4
+      let start = page - ((height - 1) * stride + row)
+      for y in 0..<height {
+        for x in 0..<row { raw.storeBytes(of: UInt8(y * 41 + x), toByteOffset: start + y * stride + x, as: UInt8.self) }
+      }
+      let frame = CapturedCPUMemoryFrame(pointer: raw.advanced(by: start), width: 3, height: height, bytesPerRow: stride,
         allocation: NoCopyIngestAllocation(baseAddress: raw, length: page, generation: 22),
         inspectVM: { base, length in NoCopyVMRange(baseAddress: base, length: length, generation: 22) }, frameOwner: NSObject(), pixelFormat: format)
       let done = expectation(description: "Odd native storage")
@@ -170,12 +174,14 @@ import XCTest
         case .failure(let error): XCTFail(String(describing: error))
         case .success(let output):
           XCTAssertEqual(CVPixelBufferGetWidth(output.value), 3)
-          XCTAssertEqual(CVPixelBufferGetHeight(output.value), 3)
+          XCTAssertEqual(CVPixelBufferGetHeight(output.value), height)
           XCTAssertEqual(CVPixelBufferGetPlaneCount(output.value), 0)
           CVPixelBufferLockBaseAddress(output.value, .readOnly)
           if let p = CVPixelBufferGetBaseAddress(output.value)?.assumingMemoryBound(to: UInt8.self) {
             let stride = CVPixelBufferGetBytesPerRow(output.value)
-            for y in 0..<3 { XCTAssertEqual(Array(UnsafeBufferPointer(start: p.advanced(by: y * stride), count: row)), (0..<row).map { UInt8(y * 41 + $0) }) }
+            for y in 0..<height {
+              XCTAssertEqual(Array(UnsafeBufferPointer(start: p.advanced(by: y * stride), count: row)), (0..<row).map { UInt8(y * 41 + $0) })
+            }
           } else { XCTFail("Missing packed storage") }
           CVPixelBufferUnlockBaseAddress(output.value, .readOnly)
         }

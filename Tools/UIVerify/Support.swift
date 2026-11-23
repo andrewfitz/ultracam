@@ -39,6 +39,11 @@ import Synchronization
   }
 
   func savedImage() { images += 1 }
+
+  /// Absolute suite names keep CFPreferences writes in this run, including on a crash.
+  func makeDefaultsDomain() -> String {
+    pngDirectory.deletingLastPathComponent().appendingPathComponent("preferences-\(UUID().uuidString)").path
+  }
 }
 
 @MainActor enum MainLoop {

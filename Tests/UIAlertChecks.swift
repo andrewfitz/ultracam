@@ -75,8 +75,14 @@ import XCTest
     session.programInUse = true
     let first = tracker.plan(problems: UIPresentationBuilder.problems(session), live: true, notifications: true, panel: true,
       sound: false, timeSensitiveEntitled: false)
-    XCTAssertEqual(first.post.map(\.id), ["onair.Camera 1"])
-    session.programMoved = UIProgramMove(from: "Camera 1", to: "Camera 2")
+    XCTAssertEqual(first.post.map(\.id), ["onair.a"])
+    session.cameras[0].name = "Renamed"
+    let renamed = tracker.plan(problems: UIPresentationBuilder.problems(session), live: true, notifications: true, panel: true,
+      sound: false, timeSensitiveEntitled: false)
+    XCTAssertTrue(renamed.post.isEmpty)
+    XCTAssertTrue(renamed.remove.isEmpty)
+    XCTAssertEqual(renamed.panel?.title, "Renamed signal lost")
+    session.programMoved = UIProgramMove(fromID: "a", from: "Renamed", to: "Camera 2")
     session.onAirID = "b"
     let second = tracker.plan(problems: UIPresentationBuilder.problems(session), live: true, notifications: true, panel: true,
       sound: false, timeSensitiveEntitled: false)
@@ -288,6 +294,7 @@ import XCTest
     XCTAssertFalse(bridge.presentation().offersAlerts, "Never offered while live")
     bridge.perform(.turnOnAlerts)
     XCTAssertEqual(delivery.requested, 0, "And never asked, even if something sends the action")
+    XCTAssertTrue(interface.offerAlerts, "The permission offer is still available when the session ends")
 
     var update = CaptureUpdate(message: "Stopped")
     update.stopped = true
@@ -321,6 +328,14 @@ import XCTest
     session.cameras[0].inUse = true
     session.cameras[0].sinkConnected = true
     XCTAssertFalse(UIPresentationBuilder.session(session).offersAlerts, "Never while on air")
+    session.cameras[0].signal = .noSignal
+    XCTAssertFalse(UIPresentationBuilder.session(session).offersAlerts, "Still in a meeting during an outage")
+    session.cameras[0].inUse = false
+    session.onAirID = camera.id
+    session.programInUse = true
+    let program = UIPresentationBuilder.session(session)
+    XCTAssertTrue(program.isLive, "Program is in use during an outage")
+    XCTAssertFalse(program.offersAlerts)
   }
 }
 

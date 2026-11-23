@@ -17,7 +17,7 @@ class CompleteGateTests(unittest.TestCase):
 
     def fixture(self, *, register_vendor=True, skipped=False, required=False,
                 missing_source=False, duplicate_registration=False, extension=False,
-                runtime_count=1, failed=False):
+                runtime_count=1, failed=False, extra_source='', extra_registration=''):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root / 'scripts').mkdir()
@@ -27,14 +27,15 @@ class CompleteGateTests(unittest.TestCase):
             shutil.copy(ROOT / 'scripts/check-test-coverage.py', root / 'scripts')
             vendor = root / 'VendorChecks.swift'
             vendor.write_text('' if missing_source else 'class VendorChecks: XCTestCase {\n func testProof() {}\n}\n')
+            (root / 'Tests/Comments.swift').write_text(extra_source)
             if extension:
                 (root / 'Tests/ExtensionChecks.swift').write_text(
                     'extension VendorChecks {\n func testExtension() {}\n}\n'
                     'extension VendorChecks {\n func testAnotherExtension() {}\n}\n')
             (root / 'scripts/vendors.py').write_text('print(' + repr(str(vendor)) + ')')
             (root / 'Tests/main.swift').write_text(
-                'suite.addTest(XCTestSuite(forTestCaseClass: VendorChecks.self))' *
-                (2 if duplicate_registration else 1) if register_vendor else '')
+                ('suite.addTest(XCTestSuite(forTestCaseClass: VendorChecks.self))' *
+                 (2 if duplicate_registration else 1) if register_vendor else '') + '\n' + extra_registration)
             log = root / 'runtime.log'
             log.write_text(("Test Case '-[main.VendorChecks testProof]' skipped (0.0 seconds).\n"
                             if skipped else '') +
@@ -63,6 +64,11 @@ class CompleteGateTests(unittest.TestCase):
         result = self.fixture(duplicate_registration=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('Duplicate XCTest suite registration', result.stderr)
+
+    def test_commented_examples_do_not_declare_or_register_suites(self):
+        result = self.fixture(extra_source='// class ExampleChecks: XCTestCase {}',
+                              extra_registration='// XCTestSuite(forTestCaseClass: VendorChecks.self)')
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_extensions_are_included_in_runtime_count(self):
         result = self.fixture(extension=True, runtime_count=3)

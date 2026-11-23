@@ -29,6 +29,27 @@ import Synchronization
     processor.releaseIdleResources()
   }
 
+  func testProcessorRejectsAValidPlaneStrideFromAnotherBuffer() throws {
+    let source = try SourceAdmissionSnapshot(format: SourceFormat(width: 96, height: 64, pixel: .video420,
+      rate: .constant(VideoContract.fastDuration)), epochID: CaptureEpochID(sessionID: UUID(), epoch: 0),
+      clockBindings: CaptureClockBindings(video: ClockInstanceID()), stage: .capture)
+    var made: CVPixelBuffer?
+    XCTAssertEqual(CVPixelBufferCreate(nil, 96, 64, kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+      [kCVPixelBufferIOSurfacePropertiesKey: [:], kCVPixelBufferBytesPerRowAlignmentKey: 256] as CFDictionary,
+      &made), kCVReturnSuccess)
+    let image = try XCTUnwrap(made)
+    var metadata = SourceAdmissionMetadata(pixelBuffer: image, presentationTime: .zero,
+      duration: VideoContract.fastDuration, epochID: source.epochID, formatSignature: source.formatSignature)
+    XCTAssertGreaterThan(metadata.planes[1].rowBytes, 96)
+    metadata.planes[1].rowBytes = 96
+    try source.validate(metadata, stage: .lut)
+    let processor = try LUTProcessor()
+    XCTAssertThrowsError(try processor.submitPassthrough(image, source: source, metadata: metadata) { _ in }) { error in
+      XCTAssertTrue(String(describing: error).contains("actual pixel buffer layout"))
+    }
+    XCTAssertEqual(processor.framesInFlight, 0)
+  }
+
   func testProcessorRejectsInvalidTimingBeforeProcessedSubmission() throws {
     let (processor, source, image, valid) = try fixture()
     var invalid = valid; invalid.duration = .invalid
@@ -37,6 +58,16 @@ import Synchronization
       XCTAssertTrue(String(describing: error).contains("duration"))
     }
     processor.releaseIdleResources()
+  }
+
+  func testStoppedCaptureReturnsTheAcquiredSlotWithoutSubmitting() throws {
+    let (processor, source, image, metadata) = try fixture()
+    XCTAssertThrowsError(try processor.submitPassthrough(image, source: source, metadata: metadata,
+      isCurrent: { false }) { _ in XCTFail("A cancelled frame must not complete") }) { error in
+      guard case VideoError.cancelled = error else { return XCTFail("Unexpected error: \(error)") }
+    }
+    XCTAssertEqual(processor.framesInFlight, 0)
+    XCTAssertTrue(processor.waitUntilIdle(timeout: 1))
   }
 
   func testDeclaredSourceCanProduceDerivedPlanarOutputAndIndependentPassthrough() throws {

@@ -4,12 +4,29 @@ import Foundation
 
 extension ProgramOutputFormat {
   func matchesColourAndAspect(_ image: CVPixelBuffer) -> Bool {
-    guard [kCVImageBufferColorPrimariesKey, kCVImageBufferTransferFunctionKey,
-      kCVImageBufferYCbCrMatrixKey].allSatisfy({ CVBufferCopyAttachment(image, $0, nil) != nil }),
+    // The typed declaration describes the pixels. External consumers read Core
+    // Video attachments, which a capture passthrough can preserve independently.
+    func publishes(_ key: CFString, _ expected: CFTypeRef) -> Bool {
+      guard let value = CVBufferCopyAttachment(image, key, nil) else { return false }
+      return CFEqual(value, expected)
+    }
+    guard let tags = try? colourTags(),
+      publishes(kCVImageBufferColorPrimariesKey, tags.primaries),
+      publishes(kCVImageBufferTransferFunctionKey, tags.transfer),
+      publishes(kCVImageBufferYCbCrMatrixKey, tags.matrix),
+      publishes(kCVImageBufferChromaLocationTopFieldKey, kCVImageBufferChromaLocation_Center),
+      [kCVImageBufferCGColorSpaceKey, kCVImageBufferICCProfileKey,
+       kCVImageBufferGammaLevelKey, kCVImageBufferLogTransferFunctionKey].allSatisfy({
+        CVBufferCopyAttachment(image, $0, nil) == nil
+      }),
       let actual = try? LUTProcessor.sourceColorimetry(image),
       actual.primaries == colour.primaries, actual.transfer == colour.transfer,
       actual.matrix == colour.matrix, actual.range == colour.range,
       actual.horizontalChromaSiting == .center, actual.verticalChromaSiting == .center else { return false }
+    if let range = CVBufferCopyAttachment(image, kCMFormatDescriptionExtension_FullRangeVideo, nil),
+      !CFEqual(range, kCFBooleanFalse) { return false }
+    if let bottom = CVBufferCopyAttachment(image, kCVImageBufferChromaLocationBottomFieldKey, nil),
+      !CFEqual(bottom, kCVImageBufferChromaLocation_Center) { return false }
     return (try? Self.pixelAspect(of: image)) == .one
   }
 
@@ -31,10 +48,7 @@ extension ProgramOutputFormat {
     LUTProcessor.stampDeclaredColorimetry(colour, on: image)
   }
 
-  /// Describes the GPU's declared target; never infer this from the arriving frame.
-  func formatDescription() throws -> CMVideoFormatDescription {
-    let base = try VideoContract.formatDescription(width: width, height: height, pixelFormat: pixelFormat)
-    var extensions = CMFormatDescriptionGetExtensions(base) as? [String: Any] ?? [:]
+  private func colourTags() throws -> (primaries: CFString, transfer: CFString, matrix: CFString) {
     let primaries: CFString
     switch colour.primaries {
     case .rec709: primaries = kCVImageBufferColorPrimaries_ITU_R_709_2
@@ -55,6 +69,14 @@ extension ProgramOutputFormat {
     default: throw VideoError.message("Unsupported Program matrix.")
     }
     guard colour.range == .video else { throw VideoError.message("Program target requires video range.") }
+    return (primaries, transfer, matrix)
+  }
+
+  /// Describes the GPU's declared target; never infer this from the arriving frame.
+  func formatDescription() throws -> CMVideoFormatDescription {
+    let base = try VideoContract.formatDescription(width: width, height: height, pixelFormat: pixelFormat)
+    var extensions = CMFormatDescriptionGetExtensions(base) as? [String: Any] ?? [:]
+    let (primaries, transfer, matrix) = try colourTags()
     extensions[kCMFormatDescriptionExtension_ColorPrimaries as String] = primaries
     extensions[kCMFormatDescriptionExtension_TransferFunction as String] = transfer
     extensions[kCMFormatDescriptionExtension_YCbCrMatrix as String] = matrix

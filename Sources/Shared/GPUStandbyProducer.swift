@@ -75,39 +75,39 @@ final class GPUStandbyProducer {
     let eight = ColorTarget.allCases.contains { $0.pixelFormat == type && $0.isEightBit }
     var textures: [MTLTexture] = []
     var tables: [MTL4ArgumentTable] = []
-    command.beginCommandBuffer(allocator: allocator)
-    for plane in 0..<(packed ? 1 : 2) {
-      let bytes = packed ? 4 : (eight ? 1 : 2)
-      let stride = packed ? CVPixelBufferGetBytesPerRow(image) : CVPixelBufferGetBytesPerRowOfPlane(image, plane)
-      let rows = packed ? CVPixelBufferGetHeight(image) : CVPixelBufferGetHeightOfPlane(image, plane)
-      let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: packed ? .r32Uint : (eight ? .r8Uint : .r16Uint),
-        width: stride / bytes, height: rows, mipmapped: false)
-      descriptor.storageMode = .shared
-      descriptor.usage = .shaderWrite
-      guard let texture = device.makeTexture(descriptor: descriptor, iosurface: surface, plane: plane) else {
-        command.endCommandBuffer()
-        throw VideoError.message("Metal 4 cannot map standby \(VideoContract.fourCC(type)) plane \(plane), including its row padding. This GPU/IOSurface layout is unsupported; do not activate GPU standby.")
+    do {
+      command.beginCommandBuffer(allocator: allocator)
+      defer { command.endCommandBuffer() }
+      for plane in 0..<(packed ? 1 : 2) {
+        let bytes = packed ? 4 : (eight ? 1 : 2)
+        let stride = packed ? CVPixelBufferGetBytesPerRow(image) : CVPixelBufferGetBytesPerRowOfPlane(image, plane)
+        let rows = packed ? CVPixelBufferGetHeight(image) : CVPixelBufferGetHeightOfPlane(image, plane)
+        let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: packed ? .r32Uint : (eight ? .r8Uint : .r16Uint),
+          width: stride / bytes, height: rows, mipmapped: false)
+        descriptor.storageMode = .shared
+        descriptor.usage = .shaderWrite
+        guard let texture = device.makeTexture(descriptor: descriptor, iosurface: surface, plane: plane) else {
+          throw VideoError.message("Metal 4 cannot map standby \(VideoContract.fourCC(type)) plane \(plane), including its row padding. This GPU/IOSurface layout is unsupported; do not activate GPU standby.")
+        }
+        textures.append(texture)
+        residency.addAllocation(texture)
+        let tableDescriptor = MTL4ArgumentTableDescriptor()
+        tableDescriptor.maxTextureBindCount = 1
+        let table = try device.makeArgumentTable(descriptor: tableDescriptor)
+        table.setTexture(texture.gpuResourceID, index: 0)
+        tables.append(table)
+        let name = packed ? "packed210" : (eight ? (plane == 0 ? "black8" : "neutral8") :
+          (plane == 1 ? "neutral10" : (type == kCVPixelFormatType_422YpCbCr10BiPlanarFullRange ? "zero10" : "black10")))
+        guard let pipeline = pipelines[name], let encoder = command.makeComputeCommandEncoder() else {
+          throw VideoError.message("Metal 4 standby encoder unavailable.")
+        }
+        encoder.setComputePipelineState(pipeline)
+        encoder.setArgumentTable(table)
+        encoder.dispatchThreads(threadsPerGrid: MTLSize(width: stride / bytes, height: rows, depth: 1),
+          threadsPerThreadgroup: MTLSize(width: min(32, pipeline.threadExecutionWidth), height: 1, depth: 1))
+        encoder.endEncoding()
       }
-      textures.append(texture)
-      residency.addAllocation(texture)
-      let tableDescriptor = MTL4ArgumentTableDescriptor()
-      tableDescriptor.maxTextureBindCount = 1
-      let table = try device.makeArgumentTable(descriptor: tableDescriptor)
-      table.setTexture(texture.gpuResourceID, index: 0)
-      tables.append(table)
-      let name = packed ? "packed210" : (eight ? (plane == 0 ? "black8" : "neutral8") :
-        (plane == 1 ? "neutral10" : (type == kCVPixelFormatType_422YpCbCr10BiPlanarFullRange ? "zero10" : "black10")))
-      guard let pipeline = pipelines[name], let encoder = command.makeComputeCommandEncoder() else {
-        command.endCommandBuffer()
-        throw VideoError.message("Metal 4 standby encoder unavailable.")
-      }
-      encoder.setComputePipelineState(pipeline)
-      encoder.setArgumentTable(table)
-      encoder.dispatchThreads(threadsPerGrid: MTLSize(width: stride / bytes, height: rows, depth: 1),
-        threadsPerThreadgroup: MTLSize(width: min(32, pipeline.threadExecutionWidth), height: 1, depth: 1))
-      encoder.endEncoding()
     }
-    command.endCommandBuffer()
     residency.commit()
     queue.addResidencySet(residency)
     let options = MTL4CommitOptions()

@@ -78,6 +78,10 @@ final class CameraDemandMonitor {
   func setRoutes(_ routes: [CameraDemandRoute]) {
     var next: [String: CameraDemandRoute] = [:]
     for route in routes where next[route.id] == nil { next[route.id] = route }
+    // Settings saves also arrive here for changes unrelated to topology.
+    // Installed listeners already keep healthy routes current.
+    if next == routesByID, appListeners.count == next.count,
+      states.count == next.count, states.values.allSatisfy({ $0.error == nil && $0.clientApps != nil }) { return }
     let removed = Set(routesByID.keys).subtracting(next.keys)
     for id in removed {
       appListeners[id] = nil
@@ -153,8 +157,8 @@ final class CameraDemandMonitor {
       guard let device else {
         throw VideoError.message("Install and enable the \(route.displayName) virtual camera to start cameras with meeting apps.")
       }
-      let streams = try ids(device, kCMIODevicePropertyStreams).map { ($0, try string($0, kCMIOObjectPropertyName)) }
-      guard let source = Self.sourceStream(streams, named: route.sourceStreamName) else {
+      let streams = CameraStreamNames.describe(try ids(device, kCMIODevicePropertyStreams))
+      guard let source = CameraStreamNames.source(streams, named: route.sourceStreamName) else {
         throw VideoError.message("The \(route.displayName) virtual camera does not publish its source stream.")
       }
       if demand[route.id]?.object != source {
@@ -184,16 +188,6 @@ final class CameraDemandMonitor {
       demand[route.id] = nil
       emitError(error.localizedDescription, for: route)
     }
-  }
-
-  /// The device's source stream. A running extension keeps the stream names it
-  /// published, so after a camera is renamed the expected name is missing; the
-  /// device UID already selected the camera, so take the stream that isn't its input.
-  static func sourceStream(_ streams: [(id: UInt32, name: String)], named name: String) -> UInt32? {
-    if let pair = CameraStreamNames.pair(streams.map { ($0.id, $0.name, nil) }, sinkName: name + " Input", sourceName: name) {
-      return pair.source
-    }
-    return streams.first(where: { $0.name == name })?.id
   }
 
   private func readDemand(routeID: String) {
@@ -245,12 +239,13 @@ final class CameraDemandMonitor {
     try check(CMIOObjectGetPropertyDataSize(object, &property, 0, nil, &size))
     guard size % 4 == 0, size <= 64 * 1024 else { throw VideoError.message("Invalid camera device list.") }
     var result = [UInt32](repeating: 0, count: Int(size) / 4)
-    if !result.isEmpty {
-      try result.withUnsafeMutableBytes {
-        try check(CMIOObjectGetPropertyData(object, &property, 0, nil, size, &size, $0.baseAddress!))
-      }
+    if result.isEmpty { return [] }
+    var used: UInt32 = 0
+    try result.withUnsafeMutableBytes {
+      try check(CMIOObjectGetPropertyData(object, &property, 0, nil, size, &used, $0.baseAddress!))
     }
-    return Array(result.prefix(Int(size) / MemoryLayout<UInt32>.size))
+    guard used <= size, used.isMultiple(of: 4) else { throw VideoError.message("Invalid camera device list.") }
+    return Array(result.prefix(Int(used) / 4))
   }
 
   private func string(_ object: CMIOObjectID, _ selector: Int) throws -> String {

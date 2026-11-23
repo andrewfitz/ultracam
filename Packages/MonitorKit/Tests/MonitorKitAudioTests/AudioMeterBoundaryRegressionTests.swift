@@ -43,6 +43,33 @@ final class AudioMeterBoundaryRegressionTests: XCTestCase {
     XCTAssertEqual(meter.snapshot()[0].samplePeakHold, -1, accuracy: 0.00001)
   }
 
+  func testPeakReturnAndHoldFollowSamplePositionsAcrossCallbackSplits() throws {
+    let fs = 48000.0
+    // The later, lower pulse catches the returning bar and the short hold.
+    var x = Array(repeating: Float(0), count: 256)
+    x[0] = -1
+    x[190] = 0.9
+    x[195] = -0.9
+    for hold in [0, 40, 500] {
+      var results: [AudioChannelLevels] = []
+      for partition in [256, 37, 1] {
+        let meter = try AudioMeter(configuration: .init(
+          sampleRate: fs, channelCount: 1, meters: [.samplePeak, .truePeak],
+          peakHoldTime: Double(hold) / fs, peakDecayRate: 480, publishInterval: 0))
+        meter.feed(Signal(sampleRate: fs, channels: [x]), blockSize: partition)
+        results.append(meter.snapshot()[0])
+      }
+      let reference = results.last!
+      XCTAssertEqual(reference.samplePeak, Float(dB(0.9) - 0.60), accuracy: 1e-5)
+      for result in results {
+        XCTAssertEqual(result.samplePeak, reference.samplePeak, accuracy: 1e-5)
+        XCTAssertEqual(result.samplePeakHold, reference.samplePeakHold, accuracy: 1e-5)
+        XCTAssertEqual(result.truePeak, reference.truePeak, accuracy: 1e-5)
+        XCTAssertEqual(result.truePeakHold, reference.truePeakHold, accuracy: 1e-5)
+      }
+    }
+  }
+
   func testUnrepresentableCalibrationsAreRejected() {
     var configuration = AudioMeterConfiguration(sampleRate: 48000, channelCount: 1)
     for value in [-Double.greatestFiniteMagnitude, Double.greatestFiniteMagnitude] {

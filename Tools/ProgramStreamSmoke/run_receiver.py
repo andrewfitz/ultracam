@@ -247,6 +247,7 @@ class TLSProxy:
         self.context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self.context.load_cert_chain(certificate, private_key)
         self.upstream = upstream
+        self.closed = threading.Event()
         self.attempted = threading.Event()
         self.negotiated = threading.Event()
         self.handshake_error = None
@@ -254,11 +255,12 @@ class TLSProxy:
         self.server.bind(("127.0.0.1", 0))
         self.port = self.server.getsockname()[1]
         self.server.listen(1)
-        self.server.settimeout(15)
+        self.server.settimeout(.25)
         self.worker = threading.Thread(target=self.handle, daemon=True)
         self.worker.start()
 
     def close(self):
+        self.closed.set()
         self.server.close()
         self.worker.join(timeout=3)
 
@@ -277,9 +279,20 @@ class TLSProxy:
 
     def handle(self):
         try:
-            conn, _ = self.server.accept()
-            self.attempted.set()
+            # Closing a listening socket on macOS does not wake a blocked accept.
+            deadline = time.monotonic() + 15
+            while True:
+                if self.closed.is_set() or time.monotonic() >= deadline:
+                    return
+                try:
+                    conn, _ = self.server.accept()
+                    break
+                except socket.timeout:
+                    continue
             with conn:
+                if self.closed.is_set():
+                    return
+                self.attempted.set()
                 conn.settimeout(10)
                 try:
                     tls = self.context.wrap_socket(conn, server_side=True)
@@ -303,11 +316,13 @@ def reject_untrusted(binary, directory):
     directory.mkdir()
     cert = directory / "test-cert.pem"
     key = directory / "test-key.pem"
-    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
-                    "-subj", "/CN=localhost", "-addext", "subjectAltName=IP:127.0.0.1,DNS:localhost",
-                    "-keyout", str(key), "-out", str(cert)], check=True, capture_output=True)
-    tls = TLSProxy(cert, key)
-    try:
+    with ExitStack() as stack:
+        stack.callback(key.unlink, missing_ok=True)
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                        "-subj", "/CN=localhost", "-addext", "subjectAltName=IP:127.0.0.1,DNS:localhost",
+                        "-keyout", str(key), "-out", str(cert)], check=True, capture_output=True)
+        tls = TLSProxy(cert, key)
+        stack.callback(tls.close)
         proc = subprocess.run([binary, f"rtmps://127.0.0.1:{tls.port}/live", "reject-tls", "1"],
                               capture_output=True, timeout=30)
         (directory / "publisher.log").write_bytes(proc.stdout + proc.stderr)
@@ -318,9 +333,6 @@ def reject_untrusted(binary, directory):
         require((tls.handshake_error or "").endswith(("BAD_CERTIFICATE", "CERTIFICATE_UNKNOWN", "UNKNOWN_CA")),
                 f"Handshake ended without a certificate rejection alert: {tls.handshake_error}")
         return {"tls_attempted": True, "untrusted_certificate_rejected": True, "tls_alert": tls.handshake_error}
-    finally:
-        tls.close()
-        key.unlink(missing_ok=True)
 
 
 def main():

@@ -162,11 +162,11 @@ extension AudioMeterTap {
     snapshot.programmeChannelMask = UInt16(truncatingIfNeeded: (1 << n) - 1)
     var sequence: UInt64 = 1
     for c in 0..<n {
-      let peak = peaks[c]
-      let level: Float = peak.isFinite && peak > 0 ? Float(20 * log10(min(peak, 1))) : -.infinity
+      let peak = peaks[c].isFinite ? min(max(peaks[c], 0), 1) : 0
+      let level: Float = peak > 0 ? Float(20 * log10(peak)) : -.infinity
       snapshot.channels[c] = AudioChannelLevels(
         samplePeak: level, samplePeakHold: level, truePeak: level, truePeakHold: level, truePeakMax: level)
-      sequence = sequence &* 31 &+ UInt64(bitPattern: Int64((peak.isFinite ? peak : 0) * 1e6))
+      sequence = sequence &* 31 &+ UInt64(peak * 1e6)
     }
     snapshot.sequence = sequence
     return snapshot

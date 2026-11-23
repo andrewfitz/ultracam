@@ -32,12 +32,6 @@ final class RecordingLUTRenderer: RecordingLUTBurnIn, @unchecked Sendable {
   /// The encoder layouts the LUT kernels write.
   private static let targets: [OSType: ColorTarget] = Dictionary(uniqueKeysWithValues:
     [ColorTarget.yuv42210, .yuv42010, .yuv4208].map { ($0.pixelFormat, $0) })
-  /// The source layouts `LUTProcessor` reads (its `validate`).
-  private static let sources: Set<OSType> = Set(VideoContract.tenBit422).union([
-    kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
-    kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange, kCVPixelFormatType_422YpCbCr8BiPlanarVideoRange,
-    0x50323136, 0x32767579, 0x79757673, kCVPixelFormatType_32BGRA, kCVPixelFormatType_32RGBA,
-    0x72323130, 0x5231324c, 0x49343230, 0x50413136])
 
   init(snapshot: RecordingLUTSnapshot, fileName: String? = nil) throws {
     let processor = try LUTProcessor(qos: .userInitiated)
@@ -55,17 +49,16 @@ final class RecordingLUTRenderer: RecordingLUTBurnIn, @unchecked Sendable {
   /// (`CameraSink.resolvedOutputColour`, `LUTProcessor.submit`): the LUT
   /// output's primaries and transfer, video range, centred chroma.
   static func recordedColour(_ snapshot: RecordingLUTSnapshot) -> Colorimetry {
-    let target = snapshot.lutOutputColorimetry ?? snapshot.colorSpace.output
-    return Colorimetry(primaries: target.primaries, transfer: target.transfer,
-      matrix: target.matrix == .identity ? .rec709 : target.matrix, range: .video,
-      horizontalChromaSiting: .center, verticalChromaSiting: .center)
+    (snapshot.lutOutputColorimetry ?? snapshot.colorSpace.output).centeredVideoOutput
   }
 
   func refusal(sourcePixelFormat: OSType, encoderPixelFormat: OSType) -> String? {
     guard Self.targets[encoderPixelFormat] != nil else {
       return "the encoder takes \(VideoContract.fourCC(encoderPixelFormat)), which the LUT pass doesn’t write."
     }
-    guard Self.sources.contains(sourcePixelFormat) else {
+    // Recording receives UYVA as raw storage. The processor's UYVA route
+    // requires the CVPixelBuffer representation used by live processing.
+    guard sourcePixelFormat != PixelFormatID.uyva.rawValue, LUTProcessor.supportsInputFormat(sourcePixelFormat) else {
       return "the LUT pass can’t read this camera’s \(VideoContract.fourCC(sourcePixelFormat)) picture."
     }
     return nil
@@ -84,7 +77,9 @@ final class RecordingLUTRenderer: RecordingLUTBurnIn, @unchecked Sendable {
     configuration.sourceWidth = CVPixelBufferGetWidth(source)
     configuration.sourceHeight = CVPixelBufferGetHeight(source)
     configuration.sourceColorimetryOverride = snapshot.sourceColorimetryOverride
-    configuration.lutOutputColorimetry = snapshot.lutOutputColorimetry
+    // The LUT produces normalized RGB. The encoder target writes that same
+    // RGB encoding as video-range Y′CbCr with centered chroma.
+    configuration.lutOutputColorimetry = outputColour
     return configuration
   }
 

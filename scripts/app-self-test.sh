@@ -10,6 +10,11 @@ if [[ $# -ne 0 ]]; then
   echo 'Usage: app-self-test.sh' >&2
   exit 2
 fi
+timeout=${SELF_TEST_TIMEOUT:-90}
+if [[ ! "$timeout" =~ ^[1-9][0-9]*$ ]] || ! [ "$timeout" -gt 0 ] 2>/dev/null; then
+  echo 'SELF_TEST_TIMEOUT must be a positive number of seconds.' >&2
+  exit 2
+fi
 task_root="$(cd "$(dirname "$0")/.." && pwd)"
 external_root="$(python3 "$task_root/scripts/work_paths.py" --path work_root)"
 if [[ "${SKIP_BUILD:-0}" != 1 ]]; then
@@ -32,12 +37,26 @@ else
   export CFFIXED_USER_HOME="$out/home"
   mkdir -p "$CFFIXED_USER_HOME/Library/Preferences"
 fi
+pid=''
+cleanup() {
+  [[ -n "$pid" ]] || return 0
+  if kill -TERM "$pid" 2>/dev/null; then
+    for _ in {1..10}; do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    kill -KILL "$pid" 2>/dev/null || true
+  fi
+  wait "$pid" 2>/dev/null || true
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 "$binary" --ui-self-test "$out" ${live_args[@]+"${live_args[@]}"} > "$out/app.log" 2>&1 &
 pid=$!
-deadline=$((SECONDS + ${SELF_TEST_TIMEOUT:-90}))
+started_at=$SECONDS
 while kill -0 "$pid" 2>/dev/null; do
-  if (( SECONDS >= deadline )); then
-    kill "$pid" 2>/dev/null || true
+  if (( SECONDS - started_at >= timeout )); then
     echo "Self-test timed out; app log: $out/app.log" >&2
     exit 1
   fi
@@ -45,6 +64,7 @@ while kill -0 "$pid" 2>/dev/null; do
 done
 app_status=0
 wait "$pid" || app_status=$?
+pid=''
 if [[ "$app_status" -ne 0 ]]; then
   echo "Self-test app exited with status $app_status; app log: $out/app.log" >&2
   tail -20 "$out/app.log" >&2 || true
@@ -59,10 +79,33 @@ fi
 printf 'App self-test artifacts: %s\n' "$out"
 /usr/bin/python3 -I - "$report" <<'PY'
 import json, sys
-report = json.load(open(sys.argv[1]))
-for check in report["checks"]:
+try:
+    with open(sys.argv[1], encoding="utf-8") as report_file:
+        report = json.load(report_file)
+except (OSError, ValueError) as error:
+    sys.exit(f"Cannot read app self-test report: {error}")
+checks = report.get("checks") if isinstance(report, dict) else None
+if not isinstance(checks, list) or not checks or any(
+    not isinstance(check, dict)
+    or type(check.get("pass")) is not bool
+    or not isinstance(check.get("name"), str)
+    or not isinstance(check.get("detail"), str)
+    for check in checks
+):
+    sys.exit("App self-test report has invalid check results")
+passed = sum(check["pass"] for check in checks)
+failed = len(checks) - passed
+if (
+    type(report.get("passed")) is not int
+    or type(report.get("failed")) is not int
+    or report["passed"] != passed
+    or report["failed"] != failed
+    or report.get("pass") is not (failed == 0)
+):
+    sys.exit("App self-test report summary disagrees with its check results")
+for check in checks:
     if not check["pass"]:
         print(f"FAIL {check['name']}: {check['detail']}")
-print(f"App self-test: {report['passed']} passed, {report['failed']} failed")
-sys.exit(0 if report["pass"] else 1)
+print(f"App self-test: {passed} passed, {failed} failed")
+sys.exit(1 if failed else 0)
 PY

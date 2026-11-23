@@ -337,6 +337,21 @@ import XCTest
     XCTAssertEqual(removed.takeAbandonedCut()?.0, "B", "A cut to a removed camera is reported")
   }
 
+  func testRebuildRetainingOnAirSourcePreservesItsTiming() {
+    var scheduler = ProgramCutScheduler<String>(selectedSource: "A")
+    _ = scheduler.ingest(frame("A", 100, duration: 10))
+    var rebuilt = ProgramCutScheduler<String>(selectedSource: "A")
+    rebuilt.carryTimeline(from: scheduler, keeping: ["A", "B"])
+    guard case .skipped(.invalidTimestamp(.sourceTimestampRegressed)) =
+      rebuilt.ingest(frame("A", 100, duration: 10)) else {
+      return XCTFail("Editing another feed must not publish a duplicate")
+    }
+    guard case let .accepted(mapped) = rebuilt.ingest(frame("A", 150, duration: 10)) else {
+      return XCTFail("The on-air source should continue")
+    }
+    XCTAssertEqual(mapped.programTime, time(50))
+  }
+
   func testCutToStartingSourceThatFailsIsAbandonedVisibly() {
     var scheduler = ProgramCutScheduler<String>(selectedSource: "A")
     scheduler.setSource("B", available: true)

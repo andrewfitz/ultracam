@@ -72,6 +72,8 @@ struct VariableFrameTimeline: Sendable {
     let d = try quantize(value: Int128(duration.value) * Int128(timescale), denominator: Int128(duration.timescale))
     guard d > 0, let durationValue = Int64(exactly: d) else { throw Failure.overflow }
     if let prior = lastSample, outputValue <= prior.presentationTime.value { throw Failure.timestampCollision }
+    let (_, endOverflow) = outputValue.addingReportingOverflow(durationValue)
+    guard !endOverflow else { throw Failure.overflow }
     let sample = Sample(presentationTime: CMTime(value: outputValue, timescale: timescale),
       duration: CMTime(value: durationValue, timescale: timescale),
       sourcePresentationTime: pts, sourceDuration: duration)

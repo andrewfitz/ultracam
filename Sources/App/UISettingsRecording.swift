@@ -121,7 +121,7 @@ struct UISettingsRecordingPane: View {
             folderErrors[id] = nil
           } catch { folderErrors[id] = "Could not save folder access for \(name): \(error.localizedDescription)" }
         }
-        if profile.wrappedValue.folderBookmark != nil {
+        if profile.wrappedValue.hasCustomFolder {
           Button("Use Default Folder") {
             var next = profile.wrappedValue
             next.folderBookmark = nil

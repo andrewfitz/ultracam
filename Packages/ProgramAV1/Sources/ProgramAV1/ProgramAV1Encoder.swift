@@ -52,11 +52,16 @@ public final class ProgramAV1Encoder {
   public func encode(_ sample: CMSampleBuffer) throws -> CMSampleBuffer {
     let pts = sample.presentationTimeStamp
     let duration = sample.duration
+    // External storage can describe planes smaller than the image dimensions.
     guard pts.isNumeric, pts.epoch == 0,
       duration.isNumeric, duration.epoch == 0, duration > .zero,
       let image = sample.imageBuffer, CVPixelBufferGetWidth(image) == width,
       CVPixelBufferGetHeight(image) == height, CVPixelBufferGetPixelFormatType(image) == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
-      CVPixelBufferGetPlaneCount(image) == 2 else { throw ProgramAV1Error.invalidInput }
+      CVPixelBufferGetPlaneCount(image) == 2,
+      CVPixelBufferGetWidthOfPlane(image, 0) == width, CVPixelBufferGetHeightOfPlane(image, 0) == height,
+      CVPixelBufferGetWidthOfPlane(image, 1) == width / 2, CVPixelBufferGetHeightOfPlane(image, 1) == height / 2 else {
+      throw ProgramAV1Error.invalidInput
+    }
     let offset = CMTimeSubtract(pts, origin ?? pts)
     let nominal = CMTimeMultiplyByRatio(offset, multiplier: frameDuration.timescale, divisor: Int32(frameDuration.value))
     let nativePTS = CMTimeConvertScale(nominal, timescale: 1, method: .roundHalfAwayFromZero)
@@ -68,7 +73,8 @@ public final class ProgramAV1Encoder {
       defer { CVPixelBufferUnlockBaseAddress(image, .readOnly) }
       guard let y = CVPixelBufferGetBaseAddressOfPlane(image, 0), let uv = CVPixelBufferGetBaseAddressOfPlane(image, 1),
         let yStride = Int32(exactly: CVPixelBufferGetBytesPerRowOfPlane(image, 0)),
-        let uvStride = Int32(exactly: CVPixelBufferGetBytesPerRowOfPlane(image, 1)) else { throw ProgramAV1Error.invalidInput }
+        let uvStride = Int32(exactly: CVPixelBufferGetBytesPerRowOfPlane(image, 1)),
+        yStride >= width, uvStride >= width else { throw ProgramAV1Error.invalidInput }
       var output = UCAV1Packet()
       guard uc_av1_encode(context, y.assumingMemoryBound(to: UInt8.self), yStride,
         uv.assumingMemoryBound(to: UInt8.self), uvStride, nativePTS.value, 1, &output) == 1 else {

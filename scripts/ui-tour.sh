@@ -5,9 +5,7 @@
 # screen. Every action targets the tour's own process, so an installed copy of
 # Ultracam can keep running (and serving a meeting) during the tour.
 # Needs Accessibility and Screen Recording permission for the terminal.
-# Saves the tour app's preferences first and restores them after the tour. The
-# Debug build isn't sandboxed, so these are its own preferences, separate from
-# the installed app's sandbox container.
+# Runs the Debug build with its own preferences and home directory.
 # APPEARANCE=Dark runs the tour in dark mode. LIVE=1 also starts and stops the
 # camera on the real UltraStudio input; it needs every other Ultracam quit.
 set -euo pipefail
@@ -28,8 +26,6 @@ if codesign -d --entitlements - "$app" 2>/dev/null | grep -q app-sandbox; then
   echo 'The tour needs the unsigned Debug build: a sandboxed build shares the installed app'"'"'s settings.' >&2
   exit 1
 fi
-# An explicit path: plain "org.ultracam.app" resolves to the installed app's sandbox container.
-preferences="$HOME/Library/Preferences/org.ultracam.app"
 appearance_arg="$(printf '%s' "${APPEARANCE:-Light}" | tr '[:upper:]' '[:lower:]')"
 case "$appearance_arg" in
   light) appearance=Light ;;
@@ -44,20 +40,19 @@ ln -sfn "$run_id-$appearance" "$out_root/latest-$appearance"
 
 xcrun swiftc -O "$task_root/Tools/UITour/windows.swift" -o "$out/windows" 2>"$out/windows-build.log"
 xcrun swiftc -O "$task_root/Tools/UITour/scroll.swift" -o "$out/scroll" 2>>"$out/windows-build.log"
-if [[ -f "$preferences.plist" ]] || defaults read "$preferences" >/dev/null 2>&1; then
-  defaults export "$preferences" "$out/preferences-before.plist"
-fi
+xcrun swiftc -O "$task_root/Tools/UITour/escape.swift" -o "$out/escape" 2>>"$out/windows-build.log"
 
 pid=""
 finish() {
-  if [[ -z "$pid" ]]; then return; fi
-  kill "$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
-  if [[ -f "$out/preferences-before.plist" ]]; then
-    defaults import "$preferences" "$out/preferences-before.plist"
-  elif defaults read "$preferences" >/dev/null 2>&1; then
-    defaults delete "$preferences"
+  [[ -n "$pid" ]] || return 0
+  if kill -TERM "$pid" 2>/dev/null; then
+    for _ in {1..10}; do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    kill -KILL "$pid" 2>/dev/null || true
   fi
+  wait "$pid" 2>/dev/null || true
 }
 trap finish EXIT
 trap 'exit 130' INT
@@ -67,16 +62,21 @@ trap 'exit 143' TERM
 main='(first window whose (name is "Ultracam" or name starts with "Ultracam –"))'
 # Retries: the app can be busy for a few seconds (adding a camera, building the Program
 # pipeline) and miss scripting requests meanwhile.
+ui_once() {
+  osascript -e 'with timeout of 5 seconds' \
+    -e "tell application \"System Events\" to tell (first process whose unix id is $pid) to $1" \
+    -e 'end timeout' 2>>"$out/osascript.log"
+}
 ui() {
   local attempt
   for attempt in 1 2 3 4; do
-    osascript -e "tell application \"System Events\" to tell (first process whose unix id is $pid) to $1" 2>>"$out/osascript.log" && return 0
+    ui_once "$1" && return 0
     sleep "$attempt"
   done
   return 1
 }
-# Opening a menu blocks the scripting call until the menu closes, so don't wait for it.
-open_menu() {
+# A menu or modal confirmation can block its caller until dismissed.
+click_without_wait() {
   osascript -e "ignoring application responses" \
     -e "tell application \"System Events\" to tell (first process whose unix id is $pid) to click $1" \
     -e "end ignoring" >/dev/null 2>>"$out/osascript.log"
@@ -89,38 +89,65 @@ close_window() {
     echo "could not close window: $1" | tee -a "$out/missing.txt"
 }
 
-# capture NAME [TITLE]: the tour app's windows whose title contains TITLE, or every
-# window and open menu when TITLE is empty.
-capture() {
-  local name="$1" title="${2:-}" n=0 menu_windows=0 windows
-  sleep "${SETTLE:-1.2}"
-  windows="$("$out/windows" "$pid")"
+# A title selects matching tour windows. Menu captures also require a menu layer.
+capture_windows() {
+  local name="$1" title="${2:-}" mode="${3:-window}" n=0 menu_windows=0 windows
+  local matched=() images=() id layer window_title suffix image
+  sleep "${SETTLE:-1.2}" || return 1
+  windows="$("$out/windows" "$pid")" || return 1
   while IFS=$'\t' read -r id layer window_title; do
     [[ -n "$id" ]] || continue
-    # A named window: just that window. No name: every window, including open menus.
     if [[ -n "$title" && ( "$window_title" != *"$title"* || "$layer" != 0 ) ]]; then continue; fi
     if [[ "$layer" != 0 ]]; then menu_windows=$((menu_windows + 1)); fi
-    n=$((n + 1))
-    local suffix=""; [[ $n -gt 1 ]] && suffix="-$n"
-    if ! screencapture -x -o -l "$id" "$out/$name$suffix.png" || [[ ! -s "$out/$name$suffix.png" ]]; then
-      echo "could not capture window: $name ($id)" | tee -a "$out/missing.txt"
-    fi
+    matched+=("$id")
   done <<< "$windows"
-  if [[ "$n" == 0 ]]; then
-    echo "no matching window: $name" | tee -a "$out/missing.txt"
-    return
-  fi
-  if [[ -z "$title" && "$menu_windows" == 0 ]]; then
-    echo "no open menu window: $name" | tee -a "$out/missing.txt"
-    return
-  fi
+  [[ ${#matched[@]} -gt 0 && ( "$mode" != menu || "$menu_windows" -gt 0 ) ]] || return 1
+
+  for id in "${matched[@]}"; do
+    n=$((n + 1))
+    suffix=""; [[ $n -gt 1 ]] && suffix="-$n"
+    image="$out/$name$suffix.png"
+    images+=("$image")
+    if ! screencapture -x -o -l "$id" "$image" || [[ ! -s "$image" ]]; then
+      echo "could not capture window: $name ($id)" >&2
+      rm -f -- "${images[@]}"
+      return 1
+    fi
+  done
   printf '%s\n' "$name" >> "$out/steps.txt"
 }
+capture() {
+  capture_windows "$@" || echo "missing window capture: $1" | tee -a "$out/missing.txt"
+}
+capture_menu() {
+  local name="$1" item="$2" attempt
+  for attempt in 1 2 3; do
+    if [[ "$item" == *"of menu bar 1" && "$(ui_once 'get frontmost')" == false ]]; then
+      echo "menu capture unavailable while Ultracam is in the background: $name" | tee -a "$out/missing.txt"
+      return 0
+    fi
+    click_without_wait "$item"
+    if capture_windows "$name" "" menu; then
+      "$out/escape" "$pid"
+      return 0
+    fi
+    "$out/escape" "$pid"
+    sleep 0.3
+  done
+  echo "missing menu capture: $name" | tee -a "$out/missing.txt"
+}
 
-"$binary" --ui-appearance "$appearance_arg" > "$out/app.log" 2>&1 &
+tour_args=(--ui-tour --ui-appearance "$appearance_arg")
+if [[ "${LIVE:-0}" == 1 ]]; then tour_args+=(--live); fi
+mkdir -p "$out/home/Library/Preferences"
+CFFIXED_USER_HOME="$out/home" "$binary" "${tour_args[@]}" > "$out/app.log" 2>&1 &
 pid=$!
-for _ in $(seq 1 30); do
-  ui "get name of menu bar 1" >/dev/null 2>&1 && break
+deadline=$((SECONDS + 30))
+until ui_once "get name of menu bar 1" >/dev/null; do
+  if ! kill -0 "$pid" 2>/dev/null || (( SECONDS >= deadline )); then
+    echo "Tour app's menu bar is unavailable. See $out/osascript.log and $out/app.log." >&2
+    exit 1
+  fi
   sleep 0.5
 done
 sleep 1
@@ -167,20 +194,40 @@ for layout in "Four Up" "Side by Side"; do
 done
 # Program exists whenever there are two or more cameras: nothing to switch on.
 capture 15-program-mode Ultracam
-open_menu "menu bar item \"Program\" of menu bar 1"
-capture 15-program-menu
-ui "key code 53" >/dev/null; ui "key code 53" >/dev/null
+capture_menu 15-program-menu 'menu bar item "Program" of menu bar 1'
 menu View "Program View"
 capture 15-program-view Ultracam
 menu View "Side by Side"
-ui "click (first menu item of menu \"Camera\" of menu bar 1 whose name starts with \"Remove\")" >/dev/null ||
-  echo "missing menu item: Camera › Remove…" | tee -a "$out/missing.txt"
-capture 16-confirm-remove-camera Ultracam
-# A sheet on the main window while Ultracam is active, otherwise a standalone alert.
-ui "tell $main to click button \"Remove Camera\" of sheet 1" >/dev/null ||
-  ui "tell $main to click (first button of sheet 1 whose description starts with \"Remove\")" >/dev/null ||
-  ui "tell (first window whose subrole is \"AXDialog\") to click (first button whose name starts with \"Remove\")" >/dev/null ||
-  echo "missing confirmation button: Remove Camera" | tee -a "$out/missing.txt"
+click_without_wait '(first menu item of menu "Camera" of menu bar 1 whose name starts with "Remove")'
+dialog=''
+for _ in {1..10}; do
+  if [[ "$(ui_once "exists sheet 1 of $main")" == true ]]; then
+    dialog="(sheet 1 of $main)"
+    capture 16-confirm-remove-camera Ultracam
+    break
+  elif [[ "$(ui_once 'exists (first window whose subrole is "AXDialog")')" == true ]]; then
+    dialog='(first window whose subrole is "AXDialog")'
+    capture 16-confirm-remove-camera
+    break
+  fi
+  sleep 0.2
+done
+removed=false
+if [[ -n "$dialog" ]]; then
+  # The alert can close before Accessibility replies. Check the resulting layout availability.
+  click_without_wait "(first button of $dialog whose name starts with \"Remove\" or description starts with \"Remove\")"
+  for _ in {1..12}; do
+    if [[ "$(ui_once "exists $dialog")" == false &&
+          "$(ui_once 'get enabled of menu item "Program View" of menu "View" of menu bar 1')" == false ]]; then
+      removed=true
+      break
+    fi
+    sleep 0.3
+  done
+fi
+if [[ "$removed" == false ]]; then
+  echo "could not confirm camera removal" | tee -a "$out/missing.txt"
+fi
 capture 16-after-remove Ultracam
 
 if [[ "${LIVE:-0}" == 1 ]]; then
@@ -197,18 +244,14 @@ fi
 
 # Menus from the menu bar.
 for name in Camera Record Program View; do
-  open_menu "menu bar item \"$name\" of menu bar 1"
-  capture "09-menu-$name"
-  ui "key code 53" >/dev/null; ui "key code 53" >/dev/null
+  capture_menu "09-menu-$name" "menu bar item \"$name\" of menu bar 1"
 done
-open_menu "menu bar item 1 of menu bar 2"
-SETTLE=2 capture 10-menu-bar-extra
-ui "key code 53" >/dev/null
+SETTLE=2 capture_menu 10-menu-bar-extra 'menu bar item 1 of menu bar 2'
 
 # Settings, every pane.
-ui "keystroke \",\" using command down" >/dev/null
+ui 'click menu item "Settings…" of menu "Ultracam" of menu bar 1' >/dev/null
 sleep 1
-for pane in General Hardware "Virtual Cameras" Recording Audio Switching Alerts Advanced; do
+for pane in General Hardware "Virtual Cameras" Recording Streaming Audio Switching Alerts Advanced; do
   ui "click button \"$pane\" of toolbar 1 of window 1" >/dev/null || echo "missing settings pane: $pane" | tee -a "$out/missing.txt"
   capture "11-settings-$pane" "$pane"
 done

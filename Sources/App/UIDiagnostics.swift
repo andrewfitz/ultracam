@@ -14,7 +14,15 @@ enum UIDiagnosticsSection: Hashable, Sendable {
 struct UIDiagnosticsView: View {
   let model: AppModel
   let interface: UIInterfaceState
-  @State private var copied = false
+  @State private var copySucceeded: Bool?
+
+  private var copyTitle: String {
+    switch copySucceeded {
+    case true?: return "Copied"
+    case false?: return "Copy Failed"
+    case nil: return "Copy Diagnostics"
+    }
+  }
 
   private var tabs: [(id: UIDiagnosticsSection, title: String)] {
     model.feedDescriptors.map { (.camera($0.id.rawValue), $0.name) }
@@ -52,19 +60,17 @@ struct UIDiagnosticsView: View {
         }
       }
       ToolbarItem(placement: .primaryAction) {
-        Button(copied ? "Copied" : "Copy Diagnostics", systemImage: copied ? "checkmark" : "doc.on.doc") {
-          UIDiagnosticsText.copy(model: model)
-          copied = true
+        Button(copyTitle, systemImage: copySucceeded == true ? "checkmark" : "doc.on.doc") {
+          copySucceeded = UIDiagnosticsText.copy(model: model)
         }
         .labelStyle(.titleAndIcon)
         .help("Copy a plain-text summary of these diagnostics")
       }
     }
-    // "Copied" confirms the copy briefly, then the button reads Copy Diagnostics again.
-    .task(id: copied) {
-      guard copied else { return }
-      try? await Task.sleep(for: .seconds(2))
-      copied = false
+    .task(id: copySucceeded) {
+      guard copySucceeded != nil else { return }
+      do { try await Task.sleep(for: .seconds(2)) } catch { return }
+      copySucceeded = nil
     }
   }
 
@@ -604,8 +610,10 @@ enum UIDiagnosticsText {
     return lines.joined(separator: "\n")
   }
 
-  static func copy(model: AppModel) {
-    NSPasteboard.general.clearContents()
-    NSPasteboard.general.setString(summary(model: model), forType: .string)
+  static func copy(model: AppModel) -> Bool {
+    let text = summary(model: model)
+    let pasteboard = NSPasteboard.general
+    pasteboard.clearContents()
+    return pasteboard.setString(text, forType: .string)
   }
 }

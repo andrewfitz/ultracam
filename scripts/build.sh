@@ -97,44 +97,58 @@ if [[ "$local_development" == true ]]; then
 fi
 build_log="$logs_root/build-$run_id.log"
 ln -sfn "logs/$(basename "$build_log")" "$artifact_root/build.log"
-xcodebuild "${args[@]}" build > "$build_log" 2>&1 || {
+build_product="$build_root/Build/Products/$configuration/Ultracam.app"
+product="$build_product"
+if [[ -n "${ULTRACAM_DERIVED_DATA_PATH:-}" ]]; then
+  # Keep validation and the published aliases on a private product even when
+  # later builds reuse this build's Xcode intermediates and products directory.
+  run_root="$(python3 "$task_root/scripts/work_paths.py" --derived-data "runs/$run_id")"
+  product="$run_root/Build/Products/$configuration/Ultracam.app"
+fi
+run_build() {
+  if [[ "$product" == "$build_product" ]]; then
+    xcodebuild "${args[@]}" build
+    return
+  fi
+  python3 - "$build_root" "$build_product" "$product" "${args[@]}" <<'PY'
+import fcntl
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+build_root, source, product = map(Path, sys.argv[1:4])
+directory = os.open(build_root, os.O_RDONLY)
+try:
+    fcntl.flock(directory, fcntl.LOCK_EX)
+    subprocess.run(['xcodebuild', *sys.argv[4:], 'build'], check=True)
+    product.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(['/usr/bin/ditto', source, product], check=True)
+    symbols = source.with_name(source.name + '.dSYM')
+    if symbols.is_dir():
+        subprocess.run(['/usr/bin/ditto', symbols, product.with_name(symbols.name)], check=True)
+except (OSError, subprocess.CalledProcessError) as error:
+    sys.exit(f'error: {error}')
+finally:
+    os.close(directory)
+PY
+}
+run_build > "$build_log" 2>&1 || {
   /usr/bin/grep -E 'error:|warning:|BUILD FAILED' "$build_log" || true
   exit 1
 }
-product="$build_root/Build/Products/$configuration/Ultracam.app"
 validation_args=("$product")
 if [[ "$signed" == true ]]; then validation_args+=(--signed); fi
 if [[ "$official_release" == true ]]; then validation_args+=(--official-release); fi
 if [[ -n "$release_evidence" ]]; then validation_args+=(--release-evidence "$release_evidence"); fi
 python3 "$task_root/scripts/validate_bundle.py" "${validation_args[@]}"
-stable_product="$artifact_root/Ultracam.app"
-dsym="$build_root/Build/Products/$configuration/Ultracam.app.dSYM"
-stable_dsym="$artifact_root/Ultracam.app.dSYM"
-# Both checks before either link moves, so a refusal leaves the install link as it was.
-if [[ -e "$stable_product" && ! -L "$stable_product" ]]; then
-  echo "Refusing to replace existing non-symlink bundle: $stable_product" >&2
-  exit 1
-fi
-if [[ -e "$stable_dsym" && ! -L "$stable_dsym" ]]; then
-  echo "Refusing to replace existing non-symlink dSYM: $stable_dsym" >&2
-  exit 1
-fi
-ln -sfn "$product" "$stable_product"
-# Release keeps its symbols only in the dSYM beside the stripped product: link it
-# beside the stable product, and keep a copy per build (the newest 20, found by
-# UUID), so a crash report of an earlier build still symbolicates after its run
-# directory is pruned. Best effort: the product is linked, so a failure only warns.
-if [[ ! -d "$dsym" ]]; then
-  # A Debug product carries its symbols; never leave another build's dSYM beside it.
-  rm -f "$stable_dsym"
-else
-  ln -sfn "$dsym" "$stable_dsym"
+dsym="$product.dSYM"
+# Publish each validated app and its matching dSYM under one writer lock.
+publish_args=("$product" "$artifact_root")
+if [[ "$local_development" == true ]]; then publish_args+=(--local-development); fi
+python3 "$task_root/scripts/publish_build.py" "${publish_args[@]}"
+# Keep UUID-addressable Release symbols after the build directory is pruned.
+if [[ -d "$dsym" ]]; then
   /bin/bash "$task_root/scripts/archive-dsym.sh" "$dsym" "$artifact_root/symbols" "$run_id" 20 ||
     echo "warning: the dSYM was not archived under $artifact_root/symbols" >&2
-fi
-if [[ "$local_development" == true ]]; then
-  python3 "$task_root/scripts/prepare_local_build.py" "$product" \
-    "$artifact_root/local-development/Ultracam.app"
-else
-  echo "Built: $stable_product"
 fi

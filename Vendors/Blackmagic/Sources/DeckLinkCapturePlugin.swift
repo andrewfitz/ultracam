@@ -13,9 +13,8 @@ final class DeckLinkCaptureSession: CaptureSession, @unchecked Sendable {
   private var state: State = .fresh // control queue only
   private struct NativeCleanup: @unchecked Sendable { let backend: DeckLinkBackend }
   deinit { let cleanup = NativeCleanup(backend: backend); control.async { cleanup.backend.stop() } }
-  private var deviceID: String?
-  private var timing: CaptureTiming?
   private var accepting = false // delivery lock
+  private var runningConfiguration: (deviceID: String, timing: CaptureTiming)? // delivery lock
   private var handlers: CaptureHandlers?
   private var epoch = CaptureEpochID(sessionID: UUID(), epoch: 0)
   private static func pairedBindings() -> CaptureClockBindings {
@@ -52,9 +51,16 @@ final class DeckLinkCaptureSession: CaptureSession, @unchecked Sendable {
       currentBacklog: Int(backend.availableFrameBacklog), maximumBacklog: Int(backend.maximumFrameBacklog))
   }
   func start(deviceID: String, timing: CaptureTiming, handlers: CaptureHandlers) throws {
+    // Native start may deliver synchronously, and stop waits for delivery to
+    // finish. A callback can check a running configuration without waiting on
+    // the control queue in either case.
+    if Thread.current.threadDictionary[callbackKey] != nil {
+      try checkRunningConfiguration(deviceID: deviceID, timing: timing)
+      return
+    }
     try control.sync {
       if state == .running {
-        guard self.deviceID == deviceID, self.timing == timing else { throw PluginError.invalidState("Session already running with another configuration") }
+        try checkRunningConfiguration(deviceID: deviceID, timing: timing)
         return
       }
       guard state == .fresh else { throw PluginError.invalidState("Create a new capture session after stop or failure") }
@@ -64,7 +70,6 @@ final class DeckLinkCaptureSession: CaptureSession, @unchecked Sendable {
         backend.setRequestedFormat(width: requested.width, height: requested.height, duration: requested.rate.nominal)
         fast = requested == Self.expectedFormat(fast: true)
       }
-      self.deviceID = deviceID; self.timing = timing
       installHandlers(handlers)
       backend.setCallbackGroupHandlers(begin: { [weak self] in self?.beginGroup() }, end: { [weak self] in self?.endGroup() })
       backend.setCallbackTimecodeHandler { [weak self] in self?.receiveTimecode($0) }
@@ -98,7 +103,7 @@ final class DeckLinkCaptureSession: CaptureSession, @unchecked Sendable {
             self?.receiveFrame(buffer, pts, duration, valid)
           }, mediaHandler: media, rawAudioHandler: audio, eventHandler: { [weak self] in self?.receiveEvent($0) })
         }
-        state = .running
+        markRunning(deviceID: deviceID, timing: timing)
       } catch {
         delivery.lock(); accepting = false; delivery.unlock()
         backend.stop()
@@ -108,6 +113,18 @@ final class DeckLinkCaptureSession: CaptureSession, @unchecked Sendable {
       }
     }
   }
+  private func checkRunningConfiguration(deviceID: String, timing: CaptureTiming) throws {
+    try delivery.withLock {
+      guard let runningConfiguration else { throw PluginError.invalidState("Capture startup is still in progress") }
+      guard runningConfiguration.deviceID == deviceID, runningConfiguration.timing == timing else {
+        throw PluginError.invalidState("Session already running with another configuration")
+      }
+    }
+  }
+  private func markRunning(deviceID: String, timing: CaptureTiming) {
+    delivery.withLock { runningConfiguration = (deviceID, timing) }
+    state = .running
+  }
   private func installHandlers(_ handlers: CaptureHandlers) {
     delivery.lock(); defer { delivery.unlock() }
     self.handlers = handlers; accepting = true
@@ -116,12 +133,12 @@ final class DeckLinkCaptureSession: CaptureSession, @unchecked Sendable {
   #if CAPTURE_LIFECYCLE_TESTS
   // Hardware-free injection uses the production admission, group and frame
   // handlers. It neither reads nor changes pixel storage.
-  func startFixture(handlers: CaptureHandlers) {
+  func startFixture(deviceID: String = "fixture:decklink", handlers: CaptureHandlers) {
     control.sync {
       installHandlers(handlers)
       delivery.lock(); sessionAudioDeclaration = .present(sessionAudioFormat)
       emit(.event(.audioFormatChanged(sessionAudioDeclaration))); delivery.unlock()
-      state = .running
+      markRunning(deviceID: deviceID, timing: .automatic)
     }
   }
   func deliverFixtureFrame(_ buffer: CVPixelBuffer, at time: CMTime, timecode: String? = nil) {
@@ -133,7 +150,7 @@ final class DeckLinkCaptureSession: CaptureSession, @unchecked Sendable {
     beginGroup(); defer { endGroup() }
     receiveFrame(buffer, videoTime, VideoContract.slowDuration, true)
     receiveMedia(audioTime, 2, 0, 0, 0, 0, samples.count, true)
-    // Match the ownership guarantee provided by native reportRawAudio.
+    // Match the ownership guarantee provided by native audio delivery.
     receiveAudio(samples.withUnsafeBytes { Data($0) }, audioTime, 2, 2, 4)
   }
   func deliverFixtureMediaWithoutAudio(_ buffer: CVPixelBuffer, at time: CMTime, timecode: String? = nil) {
@@ -151,7 +168,10 @@ final class DeckLinkCaptureSession: CaptureSession, @unchecked Sendable {
     precondition(Thread.current.threadDictionary[callbackKey] == nil, "Never stop synchronously from capture delivery")
     control.sync {
       guard state != .stopped else { return }
-      delivery.lock(); accepting = false; delivery.unlock()
+      delivery.withLock {
+        accepting = false
+        runningConfiguration = nil
+      }
       backend.stop()
       delivery.lock(); handlers = nil; delivery.unlock()
       state = .stopped
@@ -178,6 +198,11 @@ final class DeckLinkCaptureSession: CaptureSession, @unchecked Sendable {
     handlers?.deliver(CaptureDelivery(sequence: sequence, epochID: epoch, formatSignature: format?.signature ?? "",
       clockBindings: bindings, mappingRevision: 0, payload: payload))
   }
+  private func refuseDelivery(_ error: Error) {
+    failures += 1
+    let message = (error as? SourceAdmissionRefusal)?.description ?? error.localizedDescription
+    emit(.event(.fatal(message)))
+  }
   private func receiveFrame(_ buffer: CVPixelBuffer, _ pts: CMTime, _ duration: CMTime, _ valid: Bool) {
     guard accepting else { return }
     do {
@@ -201,12 +226,11 @@ final class DeckLinkCaptureSession: CaptureSession, @unchecked Sendable {
         planeCount: CVPixelBufferGetPlaneCount(buffer), rowBytes: CVPixelBufferGetBytesPerRow(buffer),
         dataSize: CVPixelBufferGetDataSize(buffer), presentationTime: pts, duration: duration,
         epochID: nextEpoch, formatSignature: next.signature), stage: .capture)
-      epoch = nextEpoch; bindings = nextBindings; admission = snapshot
+      epoch = nextEpoch; bindings = nextBindings; admission = snapshot; format = next
       if boundary {
         emit(.event(.discontinuity))
       }
       if formatChanged || clockReset {
-        format = next
         emit(.event(.formatChanged(next)))
         emit(.event(.audioFormatChanged(sessionAudioDeclaration)))
       }
@@ -217,7 +241,7 @@ final class DeckLinkCaptureSession: CaptureSession, @unchecked Sendable {
       lastFrameTime = pts
       pairedFrame = sequence + 1
       emit(.frame(CapturedPixelBuffer(immutable: buffer), info))
-    } catch { failures += 1; emit(.event(.fatal(error.localizedDescription))) }
+    } catch { refuseDelivery(error) }
   }
   private func receiveMedia(_ pts: CMTime, _ frames: Int,
     _ lp: Double, _ rp: Double, _ lr: Double, _ rr: Double, _ bytes: Int, _ present: Bool) {
@@ -257,10 +281,10 @@ final class DeckLinkCaptureSession: CaptureSession, @unchecked Sendable {
         rowBytes: owner.rowBytes, dataSize: allocationLength, presentationTime: pts, duration: duration,
         epochID: nextEpoch, formatSignature: next.signature), stage: .capture)
       let memory = try Self.ownedMemoryFrame(owner)
-      epoch = nextEpoch; bindings = nextBindings; admission = snapshot
+      epoch = nextEpoch; bindings = nextBindings; admission = snapshot; format = next
       if boundary { emit(.event(.discontinuity)) }
       if formatChanged || clockReset {
-        format = next; emit(.event(.formatChanged(next))); emit(.event(.audioFormatChanged(sessionAudioDeclaration)))
+        emit(.event(.formatChanged(next))); emit(.event(.audioFormatChanged(sessionAudioDeclaration)))
       }
       let info = CaptureFrameInfo(epochID: epoch, formatSignature: next.signature, presentationTime: pts,
         duration: duration, signalValid: true, timecode: frameTimecode, hostTimeReference: .presentationEnd,
@@ -268,7 +292,7 @@ final class DeckLinkCaptureSession: CaptureSession, @unchecked Sendable {
       try info.validate()
       lastFrameTime = pts; pairedFrame = sequence + 1
       emit(.cpuMemory(memory, info))
-    } catch { failures += 1; emit(.event(.fatal(error.localizedDescription))) }
+    } catch { refuseDelivery(error) }
   }
   static func ownedMemoryFrame(_ owner: UCDeckLinkOwnedMemoryFrame) throws -> CapturedCPUMemoryFrame {
     guard let allocationLength = Int(exactly: owner.allocationLength) else { throw PluginError.unsupported("Owned allocation length overflows") }
@@ -294,10 +318,10 @@ final class DeckLinkCaptureSession: CaptureSession, @unchecked Sendable {
     guard accepting, let data else { return }
     do {
       guard channels == sessionAudioFormat.channels, bytes == 4 else { throw PluginError.unsupported("Unexpected DeckLink PCM layout") }
-      // Native reportRawAudio owns an immutable NSData copy before it calls Swift.
+      // Native audio delivery owns an immutable NSData copy before it calls Swift.
       emit(.rawAudio(try CaptureAudioPacket(ownedInterleavedPCM: data, sampleFrameCount: frames, format: sessionAudioFormat,
         packetTime: pts, pairedFrameSequence: pairedFrame)))
-    } catch { failures += 1; emit(.event(.fatal(error.localizedDescription))) }
+    } catch { refuseDelivery(error) }
   }
   private func receiveEvent(_ text: String) {
     delivery.lock(); defer { delivery.unlock() }
@@ -458,10 +482,21 @@ struct DeckLinkCapturePlugin: CaptureSourcePlugin {
   @MainActor func observeDevices(_ handler: @escaping @MainActor @Sendable (CaptureDeviceSnapshot) -> Void) -> DeviceObservation {
     let observation = DeviceObservation(handler)
     let token = DeckLinkBackend.addDeviceListObserver { [weak observation] values in
-      observation?.deliver(CaptureDeviceSnapshot(status: driverStatus(), devices: values.map(Self.device), error: nil))
+      observation?.deliver(Self.observedDeviceSnapshot(status: driverStatus(), discovered: values.map(Self.device),
+        discoveryActive: DeckLinkBackend.deviceListDiscoveryActive(), enumerate: devices))
     }
     observation.onCancel { DeckLinkBackend.removeDeviceListObserver(token) }
     return observation
+  }
+  static func observedDeviceSnapshot(status: DriverStatus, discovered: [CaptureDeviceInfo], discoveryActive: Bool,
+    enumerate: () throws -> [CaptureDeviceInfo]) -> CaptureDeviceSnapshot {
+    if discoveryActive { return CaptureDeviceSnapshot(status: status, devices: discovered, error: nil) }
+    do {
+      return CaptureDeviceSnapshot(status: status, devices: try enumerate(), error: nil)
+    } catch {
+      return CaptureDeviceSnapshot(status: status, devices: [],
+        error: (error as? PluginError) ?? .failed(error.localizedDescription))
+    }
   }
   func expectedFormat(deviceID: String, timing: CaptureTiming) -> SourceFormat? {
     if case .fixed(let format) = timing, let device = try? DeckLinkBackend.devices().first(where: { $0.identifier == deviceID }),

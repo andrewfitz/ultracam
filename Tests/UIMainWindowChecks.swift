@@ -90,6 +90,33 @@ import XCTest
 
   // MARK: Toolbar and switching
 
+  @MainActor func testPendingCaptureAccessKeepsTheStopCommandAvailable() throws {
+    var awaitingAccess = camera(1)
+    awaitingAccess.running = false
+    awaitingAccess.deviceAvailable = false
+    awaitingAccess.captureAuthorizationPending = true
+    awaitingAccess.signal = .deviceMissing
+    var disconnected = camera(2)
+    disconnected.running = false
+    disconnected.deviceAvailable = false
+    disconnected.signal = .deviceMissing
+    let state = session([awaitingAccess, disconnected])
+    let presentation = UIPresentationBuilder.session(state)
+    let pending = try XCTUnwrap(presentation.cameras.first)
+    XCTAssertFalse(presentation.camerasRunning)
+    XCTAssertEqual(pending.tileState, .connecting)
+    XCTAssertEqual(pending.statusBadge, "Waiting for capture access")
+    XCTAssertEqual(UIInspectorViewContent.signalText(awaitingAccess), pending.statusBadge)
+    XCTAssertTrue(pending.canStop)
+    XCTAssertFalse(pending.canStart)
+    XCTAssertEqual(presentation.startControl?.enabled, false)
+
+    let items = UIMenuBarController.buildItems(presentation: presentation, session: state, target: nil, previewItem: nil)
+    let stop = try XCTUnwrap(items.first { $0.title == "Stop All Capture" })
+    XCTAssertTrue(stop.isEnabled)
+    XCTAssertEqual(UIMenuBarController.commands(for: stop), [.action(.stopAllCameras)])
+  }
+
   func testHoldWorksWithEveryAutomaticStrategy() {
     var state = session([camera(1), camera(2)])
     state.autoSwitching = true
@@ -326,6 +353,33 @@ import XCTest
   }
 
   // MARK: Menu bar
+
+  @MainActor func testWaitingMenuPreviewFindsAnAvailableCameraBeyondTheFirstPair() throws {
+    var state = session([camera(1), camera(2), camera(3)])
+    for index in state.cameras.indices {
+      state.cameras[index].automaticStart = true
+      state.cameras[index].running = false
+    }
+    state.cameras[0].previewEnabled = false
+    state.cameras[1].captureManuallyStopped = true
+    func previewRow() throws -> NSMenuItem {
+      let items = UIMenuBarController.buildItems(presentation: UIPresentationBuilder.session(state), session: state,
+        target: nil, previewItem: nil)
+      return try XCTUnwrap(items.first { $0.title == "Show Live Preview" })
+    }
+    XCTAssertEqual(state.menuPreviewCandidate?.id, "camera-3")
+    XCTAssertTrue(try previewRow().isEnabled)
+    state.cameras[2].running = true
+    XCTAssertEqual(state.menuPreviewCandidate?.id, "camera-3", "Starting capture must keep demand on this preview")
+    state.cameras[2].running = false
+    state.cameras[2].deviceAvailable = false
+    XCTAssertNil(state.menuPreviewCandidate)
+    XCTAssertFalse(try previewRow().isEnabled)
+    state.cameras[0].captureManuallyStopped = true
+    let stopped = UIMenuBarController.buildItems(presentation: UIPresentationBuilder.session(state), session: state,
+      target: nil, previewItem: nil)
+    XCTAssertFalse(stopped.contains { $0.title == "Show Live Preview" })
+  }
 
   @MainActor func testMenuBarHasNoSelectionRowsAndALUTRowPerCamera() {
     var state = session([camera(1, recording: .recording), camera(2, recording: .recording)])

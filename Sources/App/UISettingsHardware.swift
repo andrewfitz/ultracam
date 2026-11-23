@@ -11,8 +11,13 @@ struct UISettingsHardwarePane: View {
   /// Rows open when the pane appears, besides any `openHardware` link asks for.
   var initiallyExpanded: Set<String> = []
   @State private var expanded: Set<String> = []
-  /// Bodies being paired: body ID → the camera chosen in its pop-up.
-  @State private var pairing: [String: String] = [:]
+  /// Body IDs are scoped to the control plugin that supplies them.
+  private struct BodyID: Hashable {
+    let vendor: String
+    let id: String
+    init(_ camera: ControlCamera) { vendor = camera.pluginID; id = camera.id }
+  }
+  @State private var pairing: [BodyID: String] = [:]
   /// Control vendors whose Add by Address form is open.
   @State private var addingByAddress: Set<String> = []
   @State private var controlSheet: ControlSheet?
@@ -109,7 +114,8 @@ struct UISettingsHardwarePane: View {
   }
 
   private func deviceRow(_ device: UIHardwareDevice) -> some View {
-    HStack(alignment: .center, spacing: 8) {
+    let summary = device.summary
+    return HStack(alignment: .center, spacing: 8) {
       UIHardwareHealthGlyph(health: device.health)
       Image(systemName: UISymbol.input).foregroundStyle(.secondary).accessibilityHidden(true)
       VStack(alignment: .leading, spacing: 3) {
@@ -122,11 +128,11 @@ struct UISettingsHardwarePane: View {
         } else if let problem = device.status?.problems.first {
           Text([problem.localizedTitle(), problem.localizedDetail()].compactMap { $0 }.joined(separator: ". "))
             .font(.uiMeta).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-        } else if !device.summary.isEmpty {
+        } else if !summary.isEmpty {
           HStack(spacing: 6) {
-            ForEach(Array(device.summary.enumerated()), id: \.offset) { index, piece in
+            ForEach(Array(summary.enumerated()), id: \.offset) { index, piece in
               // The link is the last piece and plain; connector and signal are chips.
-              if index == device.summary.count - 1, device.status.flatMap({ UIHardwareText.link($0.link) }) == piece {
+              if index == summary.count - 1, device.status.flatMap({ UIHardwareText.link($0.link) }) == piece {
                 Text(piece).font(.uiMeta).foregroundStyle(.secondary)
               } else { UIHardwareChip(text: piece) }
             }
@@ -227,12 +233,13 @@ struct UISettingsHardwarePane: View {
   private func bodySection(_ group: UISettingsHardwareGroups.Bodies, groups: UISettingsHardwareGroups) -> some View {
     let store = model.cameraControls
     let scanning = store.scanning.contains(group.vendor.id)
+    let unpairedFeeds = feeds.filter { store.assignment(for: $0.id) == nil }
     return Section {
       if group.available, addingByAddress.contains(group.vendor.id) {
         DisclosureGroup("Add camera by address", isExpanded: Binding(get: { addingByAddress.contains(group.vendor.id) },
           set: { if !$0 { addingByAddress.remove(group.vendor.id) } })) {
-          UICameraBodyAddByAddress(pluginID: group.vendor.id, store: store, cameras: feeds) { camera, feedID in
-            pairing[camera.id] = feedID
+          UICameraBodyAddByAddress(pluginID: group.vendor.id, store: store, cameras: unpairedFeeds) { camera, feedID in
+            pairing[BodyID(camera)] = feedID
             expanded.insert(camera.id)
             addingByAddress.remove(group.vendor.id)
           }
@@ -249,7 +256,7 @@ struct UISettingsHardwarePane: View {
           UIHardwareDisclosure(isExpanded: isExpanded(body.id), name: body.camera.name) {
             bodyRow(body, available: true, groups: groups)
               // Paired by whichever path: the pending choice is done, so a later unassign starts clean.
-              .onChange(of: body.feedID) { _, feedID in if feedID != nil { pairing[body.id] = nil } }
+              .onChange(of: body.feedID) { _, feedID in if feedID != nil { pairing[BodyID(body.camera)] = nil } }
           } content: {
             bodyDetails(body, vendor: group.vendor, groups: groups)
           }
@@ -272,7 +279,8 @@ struct UISettingsHardwarePane: View {
           .disabled(scanning)
           .help("Looks for camera bodies on this Mac’s network. Opening Settings never does.")
           Button("Add by Address…") { addingByAddress.insert(group.vendor.id) }
-            .disabled(addingByAddress.contains(group.vendor.id))
+            .disabled(addingByAddress.contains(group.vendor.id) || unpairedFeeds.isEmpty)
+            .help(unpairedFeeds.isEmpty ? "Unpair a camera body or add a camera first." : "Find a camera body by its network address.")
         }
       }
       .controlSize(.small)
@@ -345,11 +353,12 @@ struct UISettingsHardwarePane: View {
   /// body names it and can't be chosen.
   private func bodyPicker(_ body: UIHardwareBody) -> some View {
     let store = model.cameraControls
-    return Picker("Camera", selection: Binding(get: { body.feedID ?? pairing[body.id] ?? "" }, set: { choose(body, $0) })) {
+    let id = BodyID(body.camera)
+    return Picker("Camera", selection: Binding(get: { body.feedID ?? pairing[id] ?? "" }, set: { choose(body, $0) })) {
       Text("None").tag("")
       Divider()
       ForEach(feeds, id: \.id) { feed in
-        let holder = store.assignment(for: feed.id).flatMap { $0.camera.id == body.id ? nil : $0.camera.name }
+        let holder = store.assignment(for: feed.id).flatMap { BodyID($0.camera) == id ? nil : $0.camera.name }
         Text(holder.map { "\(feed.name) (has \($0))" } ?? feed.name).tag(feed.id).selectionDisabled(holder != nil)
       }
     }
@@ -363,7 +372,7 @@ struct UISettingsHardwarePane: View {
     let previous = body.feedID
     guard previous != feedID else { return }
     confirmingUnpair(body, actionTitle: feedID.isEmpty ? "Unassign" : "Change Camera") {
-      pairing[body.id] = feedID.isEmpty ? nil : feedID
+      pairing[BodyID(body.camera)] = feedID.isEmpty ? nil : feedID
       if !feedID.isEmpty { expanded.insert(body.id) }
       Task {
         if let previous { await store.disconnect(previous, forget: true) }
@@ -388,7 +397,7 @@ struct UISettingsHardwarePane: View {
 
   @ViewBuilder private func bodyDetails(_ body: UIHardwareBody, vendor: VendorDescriptor, groups: UISettingsHardwareGroups) -> some View {
     let store = model.cameraControls
-    if body.feedID == nil, let pending = pairing[body.id] {
+    if body.feedID == nil, let pending = pairing[BodyID(body.camera)] {
       UICameraBodySignIn(camera: body.camera, feedID: pending,
         cameraName: feeds.first { $0.id == pending }?.name ?? "Camera", store: store,
         captureName: groups.device(forCamera: pending)?.name)
@@ -453,10 +462,7 @@ struct UISettingsHardwarePane: View {
         } else if let message = state.message {
           Label { Text(message) } icon: { Image(systemName: UISymbol.warning).foregroundStyle(.orange) }.fixedSize(horizontal: false, vertical: true)
         }
-        DisclosureGroup("Add camera by address") {
-          UICameraBodyAddByAddress(pluginID: vendor.id, store: store, cameras: feeds,
-            initialAddress: body.camera.address, initialFeedID: feedID)
-        }
+        UIHardwareBodyReconnect(camera: body.camera, feedID: feedID, cameraName: body.cameraName ?? "Camera", store: store)
       }
       HStack(spacing: 8) {
         Button("Camera Control…") { controlSheet = ControlSheet(id: feedID, name: body.cameraName ?? "Camera") }
@@ -466,7 +472,7 @@ struct UISettingsHardwarePane: View {
         }
         Button("Unassign") {
           confirmingUnpair(body, actionTitle: "Unassign") {
-            pairing[body.id] = nil
+            pairing[BodyID(body.camera)] = nil
             Task { await store.disconnect(feedID, forget: true) }
           }
         }.disabled(state.busy)
@@ -500,6 +506,33 @@ struct UISettingsHardwarePane: View {
   }
 }
 
+/// A paired body can need new credentials or move to a different address between sessions.
+private struct UIHardwareBodyReconnect: View {
+  let camera: ControlCamera
+  let feedID: String
+  let cameraName: String
+  let store: CameraControlStore
+  @State private var checkedCamera: ControlCamera?
+  @State private var showAddress = false
+
+  var body: some View {
+    let candidate = checkedCamera ?? camera
+    if checkedCamera != nil || candidate.authenticationMode == .usernamePassword {
+      UICameraBodySignIn(camera: candidate, feedID: feedID, cameraName: cameraName, store: store,
+        alreadyAssigned: true, offersSavedSignIn: checkedCamera != nil)
+    }
+    Button(showAddress ? "Cancel Address Change" : "Change Camera Address…") { showAddress.toggle() }
+    if showAddress {
+      UICameraBodyAddByAddress(pluginID: camera.pluginID, store: store, cameras: [(id: feedID, name: cameraName)],
+        initialAddress: candidate.address, initialFeedID: feedID,
+        initialAuthentication: candidate.authenticationMode == .usernamePassword) { prepared, _ in
+          checkedCamera = prepared
+          showAddress = false
+        }
+    }
+  }
+}
+
 /// An expanding row: a chevron, the row itself, and its details below, indented. Built by hand
 /// because a form's DisclosureGroup hides its label from accessibility on macOS, and the label
 /// holds the row's name and its camera pop-up.
@@ -508,7 +541,7 @@ struct UIHardwareDisclosure<Label: View, Content: View>: View {
   @Binding var isExpanded: Bool
   let name: String
   @ViewBuilder let label: Label
-  @ViewBuilder let content: Content
+  @ViewBuilder let content: () -> Content
   var body: some View {
     HStack(spacing: 6) {
       Button { isExpanded.toggle() } label: {
@@ -523,7 +556,7 @@ struct UIHardwareDisclosure<Label: View, Content: View>: View {
       label
     }
     if isExpanded {
-      Group { content }.padding(.leading, Self.indent)
+      Group { content() }.padding(.leading, Self.indent)
     }
   }
 }

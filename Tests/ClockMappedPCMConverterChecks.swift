@@ -42,6 +42,24 @@ import XCTest
     let right = all.samples.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
     for (a, b) in zip(left, right) { XCTAssertEqual(a, b, accuracy: 1e-6) }
   }
+
+  func testExactResamplingIntervalHasSameLengthAcrossPacketSizes() throws {
+    let source = try format(.float32, rate: 44_100)
+    let clock = try mapping()
+    for packetSize in [1, 147, 441] {
+      var converter = try ClockMappedPCMConverter(format: source, outputSampleRate: 48_000)
+      let packet = [Float](repeating: 0.5, count: packetSize).withUnsafeBytes { Data($0) }
+      var outputFrames = 0
+      for offset in stride(from: 0, to: 441, by: packetSize) {
+        let time = CMTime(value: 4_410_000 + Int64(offset), timescale: 44_100)
+        let chunk = try converter.convert(planes: [packet], sampleFrameCount: packetSize,
+          audioTime: time, mapping: clock)
+        outputFrames += chunk.sampleFrameCount
+      }
+      outputFrames += converter.finish()?.sampleFrameCount ?? 0
+      XCTAssertEqual(outputFrames, 480, "packet size \(packetSize)")
+    }
+  }
   func testAudioSegmentRestartReanchorsFractionalPhaseAndRejectsClockRegression() throws {
     let mic = try format(.float32, rate: 44100)
     var converter = try ClockMappedPCMConverter(format: mic, outputSampleRate: 48000)
@@ -67,6 +85,41 @@ import XCTest
       [Float](repeating: -0.5, count: 3).withUnsafeBytes { Data($0) }], sampleFrameCount: 3,
       audioTime: CMTime(value: 100, timescale: 1), mapping: mapping())
     XCTAssertEqual(chunk.samples.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }, [0.25, -0.5, 0.25, -0.5])
+  }
+
+  func testLowAligned24BitConversionIgnoresPaddingAndExtendsSign() throws {
+    let source = try format(.int24in32)
+    let start = CMTime(value: 100, timescale: 1)
+    let words: [UInt32] = [0x88400000, 0x00C00000, 0xFFC00000, 0xAB000000]
+    let sample = try makeSourceSample(planes: [words.withUnsafeBytes { Data($0) }],
+      sampleFrameCount: words.count, format: source, presentationTime: start)
+    var bridge = try ClockMappedPCMBridge(format: source, outputSampleRate: 48_000)
+    let converted = try XCTUnwrap(bridge.convert(sample, mapping: mapping()))
+    let tail = try XCTUnwrap(bridge.finish())
+    var expected: [[Float]] = [[0.5, -0.5, -0.5], [0]]
+    for output in [converted, tail] {
+      let block = try XCTUnwrap(CMSampleBufferGetDataBuffer(output))
+      let frames = CMSampleBufferGetNumSamples(output)
+      var values = [Float](repeating: 0, count: frames)
+      XCTAssertEqual(CMBlockBufferCopyDataBytes(block, atOffset: 0,
+        dataLength: frames * MemoryLayout<Float>.stride, destination: &values), noErr)
+      XCTAssertEqual(values, expected.removeFirst())
+    }
+  }
+
+  func testContiguousIntegralRatePacketsPassZeroSourceClockTolerance() throws {
+    let rate: CMTimeScale = 48_000
+    var converter = try ClockMappedPCMConverter(format: format(.float32), outputSampleRate: Double(rate),
+      maximumAVErrorSeconds: 0)
+    let clock = try mapping()
+    let pcm = [Float(0.25), 0.5].withUnsafeBytes { Data($0) }
+    for offset in stride(from: 0, to: 6, by: 2) {
+      let chunk = try converter.convert(planes: [pcm], sampleFrameCount: 2,
+        audioTime: CMTime(value: 100 * Int64(rate) + Int64(offset), timescale: rate),
+        mapping: clock)
+      XCTAssertEqual(chunk.sampleFrameCount, offset == 0 ? 1 : 2)
+    }
+    XCTAssertEqual(converter.finish()?.sampleFrameCount, 1)
   }
 
   func testSelectedStereoMatchesFullConversionAcrossPacketsAndFinish() throws {

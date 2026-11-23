@@ -41,15 +41,28 @@ final class SignalLogFile: @unchecked Sendable {
   private func append(_ line: String) {
     let manager = FileManager.default
     try? manager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-    if let size = (try? manager.attributesOfItem(atPath: url.path))?[.size] as? NSNumber, size.uint64Value >= limit {
-      let older = url.deletingLastPathComponent().appendingPathComponent("signal.1.log")
-      try? manager.removeItem(at: older)
-      try? manager.moveItem(at: url, to: older)
+    var info = stat()
+    if lstat(url.path, &info) == 0 {
+      guard info.st_mode & S_IFMT == S_IFREG else { return }
+      if UInt64(clamping: info.st_size) >= limit {
+        let older = url.deletingLastPathComponent().appendingPathComponent("signal.1.log")
+        _ = rename(url.path, older.path)
+      }
     }
-    let descriptor = open(url.path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0o644)
+    let descriptor = open(url.path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK, 0o644)
     guard descriptor >= 0 else { return }
     defer { close(descriptor) }
-    let bytes = Array(line.utf8)
-    _ = bytes.withUnsafeBytes { write(descriptor, $0.baseAddress, $0.count) }
+    guard fstat(descriptor, &info) == 0, info.st_mode & S_IFMT == S_IFREG else { return }
+    var line = line
+    line.withUTF8 { bytes in
+      guard let base = bytes.baseAddress else { return }
+      var offset = 0
+      while offset < bytes.count {
+        let count = write(descriptor, base + offset, bytes.count - offset)
+        if count < 0 && errno == EINTR { continue }
+        guard count > 0 else { return }
+        offset += count
+      }
+    }
   }
 }

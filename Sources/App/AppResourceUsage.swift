@@ -7,19 +7,25 @@ final class AppGPUActivity: @unchecked Sendable {
   static let shared = AppGPUActivity()
   private let lock = NSLock()
   private var intervals: [(Double, Double)] = []
+  private var nextSlot = 0
   func record(start: Double, end: Double) {
     guard start.isFinite, end.isFinite, start > 0, end > start else { return }
     lock.withLock {
-      if intervals.count >= 2048 { intervals.removeAll { $0.1 < end - 4 } }
-      if intervals.count >= 2048 { intervals.removeFirst() }
-      intervals.append((start, end))
+      if intervals.count < 2048 {
+        intervals.append((start, end))
+      } else {
+        intervals[nextSlot] = (start, end)
+        nextSlot = (nextSlot + 1) % intervals.count
+      }
     }
   }
   func percent(now: Double, window: Double = 1) -> Double {
-    lock.withLock { Self.busyPercent(intervals, from: now - window, to: now) }
+    let completed = lock.withLock { intervals }
+    return Self.busyPercent(completed, from: now - window, to: now)
   }
   static func busyPercent(_ intervals: [(Double, Double)], from lower: Double, to upper: Double) -> Double {
-    guard upper > lower else { return 0 }
+    let duration = upper - lower
+    guard duration.isFinite, duration > 0 else { return 0 }
     let clipped = intervals.compactMap { start, end -> (Double, Double)? in
       guard start.isFinite, end.isFinite else { return nil }
       let a = max(lower, start), b = min(upper, end)
@@ -30,7 +36,7 @@ final class AppGPUActivity: @unchecked Sendable {
       busy += max(0, end - max(start, lastEnd))
       lastEnd = max(lastEnd, end)
     }
-    return min(100, max(0, busy / (upper - lower) * 100))
+    return min(100, max(0, busy / duration * 100))
   }
 }
 

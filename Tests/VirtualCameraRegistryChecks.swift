@@ -100,7 +100,11 @@ import XCTest
     XCTAssertEqual(store.load(), second)
     XCTAssertNotNil(defaults.data(forKey: VirtualCameraRegistryStore.backupKey))
 
-    defaults.set(Data("truncated".utf8), forKey: VirtualCameraRegistryStore.key)
+    let truncated = Data("truncated".utf8)
+    defaults.set(truncated, forKey: VirtualCameraRegistryStore.key)
+    XCTAssertEqual(store.load(repairPrimary: false), first)
+    XCTAssertEqual(defaults.data(forKey: VirtualCameraRegistryStore.key), truncated,
+      "An extension or capture reader must not overwrite host publication")
     XCTAssertEqual(store.load(), first)
     XCTAssertEqual(store.load(), first, "Rollback repairs the primary slot")
   }

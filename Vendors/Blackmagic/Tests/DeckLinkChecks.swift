@@ -8,7 +8,7 @@ final class DeckLinkChecks: XCTestCase {
   }
   func testNativeSDKCallbacksAndLifecycle() {
     var error: NSError?
-    XCTAssertTrue(UltracamRunOwnershipSyntheticChecks(&error),
+    XCTAssertTrue(UltracamRunSyntheticChecks(&error),
       error?.localizedDescription ?? "Native lifecycle checks failed")
   }
 

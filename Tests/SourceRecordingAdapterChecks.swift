@@ -262,6 +262,144 @@ private final class AsynchronouslyFailedWriter: SourceRecordingWriter, @unchecke
     }
   }
 
+  func testStopDuringWriterStartupClosesTheTake() throws {
+    final class StartupWriter: SourceRecordingWriter {
+      let entered = DispatchSemaphore(value: 0)
+      let release = DispatchSemaphore(value: 0)
+      func start() throws {
+        entered.signal()
+        guard release.wait(timeout: .now() + 3) == .success else {
+          throw SourceRecordingError.writerFailure("Timed out waiting for startup release.")
+        }
+      }
+      func appendVideo(_ sample: CMSampleBuffer) throws {}
+      func appendAudio(_ sample: CMSampleBuffer) throws {}
+      func finish() throws {}
+    }
+    let writer = StartupWriter()
+    let config = try SourceRecordingConfiguration(feedID: SourceRecordingFeedID("startup-stop"),
+      outputURL: URL(fileURLWithPath: "/tmp/startup-stop.mov"), width: 32, height: 32)
+    let recorder = try SourceRecorderCore(configuration: config, writerFactory: { writer })
+    let started = expectation(description: "Writer start returned")
+    let stopped = expectation(description: "Recorder stop returned")
+    let stopEntered = DispatchSemaphore(value: 0)
+    let stopReturned = DispatchSemaphore(value: 0)
+    DispatchQueue.global().async {
+      do { try recorder.start() } catch { XCTFail("Startup failed: \(error)") }
+      started.fulfill()
+    }
+    XCTAssertEqual(writer.entered.wait(timeout: .now() + 1), .success)
+    DispatchQueue.global().async {
+      stopEntered.signal()
+      do { try recorder.stop() } catch { XCTFail("Stop failed: \(error)") }
+      stopReturned.signal()
+      stopped.fulfill()
+    }
+    XCTAssertEqual(stopEntered.wait(timeout: .now() + 1), .success)
+    XCTAssertEqual(stopReturned.wait(timeout: .now() + 0.05), .timedOut)
+    writer.release.signal()
+    wait(for: [started, stopped], timeout: 3)
+    XCTAssertEqual(recorder.state, .finished)
+  }
+
+  func testDiskCheckFromBeforePauseCannotFailResumedTake() throws {
+    final class Probe: @unchecked Sendable {
+      let entered = DispatchSemaphore(value: 0)
+      let release = DispatchSemaphore(value: 0)
+      let checkedAgain = DispatchSemaphore(value: 0)
+      private let lock = NSLock()
+      private var calls = 0
+      func check(_ bytes: UInt64) throws {
+        let count = lock.withLock {
+          calls += 1
+          return calls
+        }
+        if count == 2 {
+          entered.signal()
+          _ = release.wait(timeout: .now() + 3)
+          throw SourceRecordingError.writerFailure("Simulated stale disk probe")
+        }
+        if count == 3 { checkedAgain.signal() }
+      }
+    }
+    let probe = Probe()
+    let writer = AdapterRecordingWriter()
+    let config = try SourceRecordingConfiguration(feedID: SourceRecordingFeedID("stale-space-check"),
+      outputURL: URL(fileURLWithPath: "/tmp/stale-space-check.mov"), width: 32, height: 32,
+      spaceCheckInterval: 0.02, checkAvailableSpace: probe.check)
+    let recorder = try SourceRecorderCore(configuration: config, writerFactory: { writer })
+    try recorder.start()
+    XCTAssertEqual(probe.entered.wait(timeout: .now() + 1), .success)
+    try recorder.pause()
+    try recorder.resume()
+    probe.release.signal()
+    XCTAssertEqual(probe.checkedAgain.wait(timeout: .now() + 1), .success)
+    XCTAssertEqual(recorder.state, .recording)
+    XCTAssertEqual(recorder.telemetry.writerErrors, 0)
+    try recorder.stop()
+  }
+
+  func testLateMetadataCannotFailFinishedTake() throws {
+    let writer = AdapterRecordingWriter()
+    let config = try SourceRecordingConfiguration(feedID: SourceRecordingFeedID("late-metadata"),
+      outputURL: URL(fileURLWithPath: "/tmp/late-metadata.mov"), width: 32, height: 32)
+    let adapter = try SourceRecordingCallbackAdapter(configuration: config, writerFactory: { writer })
+    try adapter.start()
+    try adapter.stop()
+    adapter.callbacks.metadataFailure?("Callback was in flight during Stop")
+    XCTAssertEqual(adapter.telemetry.state, .finished)
+    XCTAssertNil(adapter.telemetry.lastError)
+  }
+
+  func testSourceBindingIsOrderedBeforeMedia() throws {
+    final class BindingWriter: SourceRecordingWriter {
+      let entered = DispatchSemaphore(value: 0)
+      let release = DispatchSemaphore(value: 0)
+      let audio = DispatchSemaphore(value: 0)
+      private let lock = NSLock()
+      private var bound = false
+      func start() throws {}
+      func bindSourceAdmission(_ snapshot: SourceAdmissionSnapshot) throws {
+        entered.signal()
+        guard release.wait(timeout: .now() + 3) == .success else {
+          throw SourceRecordingError.writerFailure("Timed out waiting for binding release.")
+        }
+        lock.withLock { bound = true }
+      }
+      func appendVideo(_ sample: CMSampleBuffer) throws {}
+      func appendAudio(_ sample: CMSampleBuffer) throws {
+        audio.signal()
+        guard lock.withLock({ bound }) else {
+          throw SourceRecordingError.writerFailure("Media overtook the source declaration.")
+        }
+      }
+      func finish() throws {}
+    }
+    let writer = BindingWriter()
+    let format = try SourceFormat(width: 1920, height: 1080, pixel: .v210,
+      rate: .constant(RecordingFrameRate.fps5994.frameDuration))
+    let source = try SourceAdmissionSnapshot(format: format, epochID: CaptureEpochID(sessionID: UUID(), epoch: 0),
+      clockBindings: CaptureClockBindings(video: ClockInstanceID(), audio: nil), stage: .recordingSource)
+    let config = try SourceRecordingConfiguration(feedID: SourceRecordingFeedID("binding-order"),
+      outputURL: URL(fileURLWithPath: "/tmp/binding-order.mov"), width: format.width, height: format.height)
+    let recorder = try SourceRecorderCore(configuration: config, writerFactory: { writer })
+    try recorder.start()
+    let bindingReturned = expectation(description: "Source declaration callback returned")
+    DispatchQueue.global().async {
+      do { try recorder.bindSourceAdmission(source) } catch { XCTFail("Source declaration failed: \(error)") }
+      bindingReturned.fulfill()
+    }
+    XCTAssertEqual(writer.entered.wait(timeout: .now() + 1), .success)
+    let sample = try audioSample(payload: Data(repeating: 0, count: 8), presentationTime: .zero)
+    XCTAssertTrue(recorder.appendAudio(sample))
+    XCTAssertEqual(writer.audio.wait(timeout: .now() + 0.05), .timedOut)
+    writer.release.signal()
+    wait(for: [bindingReturned], timeout: 3)
+    try recorder.stop()
+    XCTAssertEqual(recorder.state, .finished)
+    XCTAssertEqual(recorder.telemetry.appendedAudio, 1)
+  }
+
   func testWriterFailureClosesAdmissionAndMatchesTelemetry() throws {
     for readTelemetryFirst in [true, false] {
       let writer = AsynchronouslyFailedWriter()
@@ -294,6 +432,28 @@ private final class AsynchronouslyFailedWriter: SourceRecordingWriter, @unchecke
     XCTAssertEqual(adapter.telemetry.droppedVideo, 0)
     XCTAssertEqual(adapter.telemetry.enqueuedAudio, 0)
     try adapter.stop()
+  }
+
+  func testMalformedPacketLeavesVideoPairForValidAudio() throws {
+    let (writer, adapter) = try rawAudioAdapter("invalid-paired-audio")
+    let callbacks = adapter.callbacks
+    let time = CMTime(value: 1_600, timescale: 48_000)
+    let duration = CMTime(value: 800, timescale: 48_000)
+    callbacks.audioPair?(time, duration)
+    XCTAssertFalse(callbacks.rawAudio(Data(), 800, time, 2, 4))
+    let packet = Data(repeating: 0, count: 800 * 2 * 4)
+    XCTAssertTrue(callbacks.rawAudio(packet, 800, CMTime(value: 5_000, timescale: 48_000), 2, 4))
+    try adapter.stop()
+    XCTAssertEqual(writer.audioSnapshot.count, 1)
+    XCTAssertEqual(CMSampleBufferGetPresentationTimeStamp(try XCTUnwrap(writer.audioSnapshot.first)), time)
+    XCTAssertEqual(adapter.telemetry.audioSilenceFilledFrames, 0)
+  }
+
+  func testPacketEndMustFitOnTheAudioClock() {
+    var clock = EmbeddedAudioClockAnchor()
+    XCTAssertNil(clock.place(CMTime(value: .max, timescale: 48_000), sampleFrameCount: 1))
+    XCTAssertNil(clock.nextStart)
+    XCTAssertEqual(clock.place(CMTime(value: 12, timescale: 48_000), sampleFrameCount: 1)?.start.value, 12)
   }
 
   /// The 2026-10-24 take: each DeckLink callback's audio packet time ran

@@ -33,39 +33,33 @@ final class ResetRequests: Sendable {
   private let loudness = Atomic<UInt64>(0)
   private let all = Atomic<UInt64>(0)
   private let discontinuities = Atomic<UInt64>(0)
-  // `requestRestart` updates two generations that must be observed together.
-  // This seqlock prevents a reader from publishing the discontinuity without
-  // the corresponding full reset (or vice versa).
-  private let restartSequence = Atomic<UInt64>(0)
-  private let restartLock = Atomic<Bool>(false)
+  // A restart is one indivisible request. Read once and project that generation
+  // onto both effects below: no reader may wait for a preempted control thread.
+  private let restarts = Atomic<UInt64>(0)
 
   func requestPeaks() { peaks.add(1, ordering: .releasing) }
   func requestLoudness() { loudness.add(1, ordering: .releasing) }
   func requestAll() { all.add(1, ordering: .releasing) }
   func requestDiscontinuity() { discontinuities.add(1, ordering: .releasing) }
 
-  /// A full reset and a discontinuity. The discontinuity is counted first, so a
-  /// producer that sees the reset also sees it (each load acquires).
-  func requestRestart() {
-    while restartLock.exchange(true, ordering: .acquiringAndReleasing) { }
-    restartSequence.add(1, ordering: .acquiringAndReleasing)
-    requestDiscontinuity()
-    requestAll()
-    restartSequence.add(1, ordering: .releasing)
-    restartLock.store(false, ordering: .releasing)
+  /// A full reset and a discontinuity with a single atomic commit. The internal
+  /// hook allows a deterministic held-writer regression test before the commit;
+  /// a paused caller holds no lock and leaves the previous generation readable.
+  func requestRestart(beforeCommit: () -> Void = {}) {
+    beforeCommit()
+    restarts.add(1, ordering: .releasing)
   }
 
-  /// Any thread. Generations only grow, so after reading a publish this is
-  /// never behind the generations that publish carries.
+  /// A fixed number of atomic loads, including on the realtime producer. The
+  /// same captured restart generation contributes to both full resets and input
+  /// breaks, so consumers cannot apply one half of a restart independently.
+  /// Other request counters remain independent, monotonically growing streams.
   func load() -> ResetGenerations {
-    while true {
-      let before = restartSequence.load(ordering: .acquiring)
-      if before & 1 != 0 { continue }
-      let value = ResetGenerations(
-        peaks: peaks.load(ordering: .acquiring), loudness: loudness.load(ordering: .acquiring),
-        all: all.load(ordering: .acquiring), discontinuities: discontinuities.load(ordering: .acquiring))
-      if restartSequence.load(ordering: .acquiring) == before { return value }
-    }
+    let restart = restarts.load(ordering: .acquiring)
+    return ResetGenerations(
+      peaks: peaks.load(ordering: .acquiring), loudness: loudness.load(ordering: .acquiring),
+      all: all.load(ordering: .acquiring) &+ restart,
+      discontinuities: discontinuities.load(ordering: .acquiring) &+ restart)
   }
 }
 

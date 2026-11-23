@@ -40,6 +40,14 @@ import AppKit
     checks.append(Check(name: name, pass: pass, detail: detail))
   }
 
+  private static func write(_ data: Data, named name: String) {
+    do {
+      try data.write(to: output.appendingPathComponent(name), options: .atomic)
+    } catch {
+      record("write \(name)", false, error.localizedDescription)
+    }
+  }
+
   /// Opt-in (`--live`): starts the selected camera through the same action the
   /// interface sends, reads the state the interface shows, then stops it.
   /// Reads HDMI only; never records.
@@ -60,7 +68,7 @@ import AppKit
       let now = bridge.snapshot().cameras.first { $0.id == camera.id }
       timeline.append("\(second)s running=\(now?.running == true) signal=\(String(describing: now?.signal)) message=\(now?.message ?? "")")
     }
-    try? timeline.joined(separator: "\n").write(to: output.appendingPathComponent("live-timeline.txt"), atomically: true, encoding: .utf8)
+    write(Data(timeline.joined(separator: "\n").utf8), named: "live-timeline.txt")
     let started = bridge.snapshot().cameras.first { $0.id == camera.id }
     record("live: Start Capture starts capture", started?.running == true, "")
     let tile = started.map { UIPresentationBuilder.tileState(for: $0) }
@@ -68,7 +76,7 @@ import AppKit
       "signal \(String(describing: started?.signal)), tile \(String(describing: tile))")
     let liveLabels = appWindows().filter { identifier(of: $0).hasPrefix("main") }
       .flatMap { window in window.contentView.map { accessibilityLabels(in: $0) } ?? [] }
-    try? liveLabels.joined(separator: "\n").write(to: output.appendingPathComponent("accessibility-live.txt"), atomically: true, encoding: .utf8)
+    write(Data(liveLabels.joined(separator: "\n").utf8), named: "accessibility-live.txt")
     // The picture's own label carries the camera state ("Camera 1, No signal"); the
     // inspector column's accessibility values can lag behind what it draws.
     record("live: the window shows the running camera",
@@ -102,7 +110,7 @@ import AppKit
     await wait(0.5)
     let mainLabels = appWindows().filter { identifier(of: $0).hasPrefix("main") }
       .flatMap { window in window.contentView.map { accessibilityLabels(in: $0) } ?? [] }
-    try? mainLabels.joined(separator: "\n").write(to: output.appendingPathComponent("accessibility-main.txt"), atomically: true, encoding: .utf8)
+    write(Data(mainLabels.joined(separator: "\n").utf8), named: "accessibility-main.txt")
     record("inspector shows the selected camera's settings", mainLabels.contains("Refresh capture devices"),
       "\(mainLabels.count) labels")
     for label in ["Effects", "Start Capture", "Hide Preview"] {
@@ -176,7 +184,7 @@ import AppKit
     record("no duplicate key equivalents", grouped.isEmpty,
       grouped.map { "\($0.key): \($0.value.map(\.path).joined(separator: " | "))" }.sorted().joined(separator: "; "))
     let dump = all.map { "\($0.path)\t\($0.shortcut)\t\($0.enabled ? "enabled" : "disabled")" }.joined(separator: "\n")
-    try? dump.write(to: output.appendingPathComponent("menus.tsv"), atomically: true, encoding: .utf8)
+    write(Data(dump.utf8), named: "menus.tsv")
   }
 
   // MARK: Windows
@@ -266,7 +274,10 @@ import AppKit
       await wait(0.6)
       for (index, window) in windows.enumerated() {
         let name = sanitized(titles[index]) + "-\(suffix)" + extra
-        guard let frameView = window.contentView?.superview ?? window.contentView else { continue }
+        guard let frameView = window.contentView?.superview ?? window.contentView else {
+          record("render \(name)", false, "no window content")
+          continue
+        }
         frameView.layoutSubtreeIfNeeded()
         guard let rep = frameView.bitmapImageRepForCachingDisplay(in: frameView.bounds) else {
           record("render \(name)", false, "no bitmap")
@@ -274,9 +285,11 @@ import AppKit
         }
         frameView.cacheDisplay(in: frameView.bounds, to: rep)
         let colors = distinctColors(rep)
-        if let data = rep.representation(using: .png, properties: [:]) {
-          try? data.write(to: output.appendingPathComponent("\(name).png"))
+        guard let data = rep.representation(using: .png, properties: [:]) else {
+          record("render \(name)", false, "PNG encoding failed")
+          continue
         }
+        write(data, named: "\(name).png")
         record("render \(name)", colors > 16, "\(rep.pixelsWide)×\(rep.pixelsHigh), \(colors) sampled colors")
       }
     }

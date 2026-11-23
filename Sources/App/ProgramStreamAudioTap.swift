@@ -1,4 +1,5 @@
 import AVFAudio
+import Accelerate
 import CoreMedia
 import Foundation
 
@@ -8,7 +9,6 @@ final class ProgramStreamAudioTap: @unchecked Sendable {
   struct Statistics: Sendable {
     var packets: UInt64 = 0
     var dropped: UInt64 = 0
-    var peak: Float = 0
     var lastHostTime: CMTime?
   }
 
@@ -59,6 +59,7 @@ final class ProgramStreamAudioTap: @unchecked Sendable {
                        pairedHostTime: CMTime?, audioMapping: ClockMapping?) {
     guard !lock.withLock({ stopped }) else { return }
     do {
+      guard packet.sampleFrameCount > 0 else { throw ClockMappedPCMError.invalidPacket }
       if self.epoch != epoch || converter?.format != packet.format {
         converter = try makeConverter(for: packet.format)
         self.epoch = epoch
@@ -71,12 +72,12 @@ final class ProgramStreamAudioTap: @unchecked Sendable {
       }
       // Duplicate or late input cannot move the resampler back to an old grid.
       if let lastPacketTime, packet.packetTime <= lastPacketTime { throw ClockMappedPCMError.invalidPacket }
-      let transform = try hostTransform(packet, pairedHostTime: pairedHostTime, audioMapping: audioMapping)
       // PCM timestamps identify samples, so detect even a single missed frame.
-      if let expected = nextPacketTime,
-        abs(CMTimeSubtract(packet.packetTime, expected).seconds) > 0.5 / packet.format.sampleRate {
-        converter = try makeConverter(for: packet.format)
-      }
+      let offset = nextPacketTime.map { CMTimeSubtract(packet.packetTime, $0).seconds } ?? 0
+      let halfSample = 0.5 / packet.format.sampleRate
+      guard offset >= -halfSample else { throw ClockMappedPCMError.invalidPacket }
+      let transform = try hostTransform(packet, pairedHostTime: pairedHostTime, audioMapping: audioMapping)
+      if offset > halfSample { converter = try makeConverter(for: packet.format) }
       let chunk: ClockMappedPCMChunk
       do {
         chunk = try convert(packet, transform: transform)
@@ -155,21 +156,21 @@ final class ProgramStreamAudioTap: @unchecked Sendable {
     guard let output = AVAudioPCMBuffer(pcmFormat: outputFormat, frameCapacity: count),
       let planes = output.floatChannelData else { throw ClockMappedPCMError.workspaceLimit }
     output.frameLength = count
-    let right = chunk.channels - 1
-    var peak: Float = 0
     chunk.samples.withUnsafeBytes { bytes in
-      let samples = bytes.bindMemory(to: Float.self)
-      for frame in 0..<chunk.sampleFrameCount {
-        let start = frame * chunk.channels
-        let l = samples[start], r = samples[start + right]
-        planes[0][frame] = l
-        planes[1][frame] = r
-        peak = max(peak, abs(l), abs(r))
+      let frames = chunk.sampleFrameCount
+      if chunk.channels == 1 {
+        let samples = bytes.bindMemory(to: Float.self).baseAddress!
+        planes[0].update(from: samples, count: frames)
+        planes[1].update(from: samples, count: frames)
+      } else {
+        // The converter selected one stereo pair. Split its interleaved
+        // Float32 samples directly into the publisher's two output planes.
+        var stereo = DSPSplitComplex(realp: planes[0], imagp: planes[1])
+        vDSP_ctoz(bytes.bindMemory(to: DSPComplex.self).baseAddress!, 2, &stereo, 1, vDSP_Length(frames))
       }
     }
     let accepted = lock.withLock {
       guard !stopped else { return false }
-      counters.peak = peak
       counters.packets &+= 1
       counters.lastHostTime = chunk.presentationTime
       return true

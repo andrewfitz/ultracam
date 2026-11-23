@@ -144,7 +144,7 @@ public final class MonitorTextureCache: @unchecked Sendable {
   /// `makeTexture`'s texture and its entry's release token.
   private func entry(
     iosurface: IOSurfaceRef, plane: Int, format: MTLPixelFormat, width: Int, height: Int, owner: UInt64,
-    now: Double?
+    now: Double?, sweeps: Bool = true
   ) throws -> (texture: MTLTexture, token: FrozenPlanes) {
     guard width > 0, height > 0, format != .invalid,
       plane >= 0, plane < max(1, IOSurfaceGetPlaneCount(iosurface))
@@ -154,7 +154,7 @@ public final class MonitorTextureCache: @unchecked Sendable {
     let t = now.flatMap { $0.isFinite ? $0 : nil } ?? Self.uptime()
     let key = Key(
       surface: IOSurfaceGetID(iosurface), plane: plane, format: format.rawValue, width: width, height: height)
-    if let hit = lookup(key, iosurface, owner: owner, now: t) { return hit }
+    if let hit = lookup(key, iosurface, owner: owner, now: t, sweeps: sweeps) { return hit }
     let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: format, width: width, height: height, mipmapped: false)
     d.usage = .shaderRead
     d.storageMode = .shared
@@ -171,7 +171,7 @@ public final class MonitorTextureCache: @unchecked Sendable {
     let (kept, replaced) = locked { s -> ((MTLTexture, FrozenPlanes), MTLTexture?) in
       if let i = Self.index(of: key, in: s.entries) {
         if Self.same(s.entries[i].surface, iosurface) {
-          s.entries[i].lastUse = t
+          s.entries[i].lastUse = max(s.entries[i].lastUse, t)
           s.entries[i].owner = owner
           return ((s.entries[i].texture, s.entries[i].token), nil)
         }
@@ -256,10 +256,11 @@ public final class MonitorTextureCache: @unchecked Sendable {
       (packed, first) = try entry(
         iosurface: surface, plane: 0, format: .rgba8Uint, width: (width + 1) / 2, height: height, owner: owner, now: t)
     case .biplanar(_, let depth):
+      // Let the chroma lookup trigger any due sweep after both planes have been touched.
       (luma, first) = try entry(
         iosurface: surface, plane: 0, format: depth == 8 ? .r8Unorm : .r16Unorm,
         width: CVPixelBufferGetWidthOfPlane(pixelBuffer, 0), height: CVPixelBufferGetHeightOfPlane(pixelBuffer, 0),
-        owner: owner, now: t)
+        owner: owner, now: t, sweeps: false)
       (chroma, second) = try entry(
         iosurface: surface, plane: 1, format: depth == 8 ? .rg8Unorm : .rg16Unorm,
         width: CVPixelBufferGetWidthOfPlane(pixelBuffer, 1), height: CVPixelBufferGetHeightOfPlane(pixelBuffer, 1),
@@ -325,16 +326,19 @@ public final class MonitorTextureCache: @unchecked Sendable {
 
   /// The cached texture for `key` over `surface`, touched; sweeps when due. The
   /// steady-state path: one lock, a scan of a few entries, no allocation.
-  private func lookup(_ key: Key, _ surface: IOSurfaceRef, owner: UInt64, now: Double)
+  private func lookup(_ key: Key, _ surface: IOSurfaceRef, owner: UInt64, now: Double, sweeps: Bool)
     -> (texture: MTLTexture, token: FrozenPlanes)?
   {
     let interval = sweepInterval, life = idleLifetime
     var due = false
     let hit = locked { s -> (texture: MTLTexture, token: FrozenPlanes)? in
-      due = now - s.lastSweep >= interval && Self.hasIdle(s, now: now, life: life)
-      if !due && now - s.lastSweep >= interval { s.lastSweep = now }
+      if sweeps && now - s.lastSweep >= interval {
+        due = Self.hasIdle(s, now: now, life: life)
+        if !due { s.lastSweep = now }
+      }
       guard let i = Self.index(of: key, in: s.entries), Self.same(s.entries[i].surface, surface) else { return nil }
-      s.entries[i].lastUse = now
+      // A lookup with an earlier timestamp can acquire the lock after a newer lookup.
+      s.entries[i].lastUse = max(s.entries[i].lastUse, now)
       if s.entries[i].owner != owner { s.entries[i].owner = owner }
       return (s.entries[i].texture, s.entries[i].token)
     }

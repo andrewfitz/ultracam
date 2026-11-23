@@ -365,7 +365,13 @@ public struct ProgramCutScheduler<SourceID: Hashable> {
   /// cut whose target is gone, unavailable or now selected is abandoned.
   public mutating func carryTimeline(from other: ProgramCutScheduler<SourceID>,
                                      keeping sources: Set<SourceID>? = nil) {
-    mapper.carryTimeline(from: other.mapper)
+    // Editing an unrelated feed leaves the on-air source on the same clock.
+    // Keep its source origin and duplicate boundary along with Program time.
+    if selectedSource == other.selectedSource, mapper.programTimescale == other.mapper.programTimescale {
+      mapper = other.mapper
+    } else {
+      mapper.carryTimeline(from: other.mapper)
+    }
     clock = other.clock
     pendingCutTimeout = other.pendingCutTimeout
     startingCutTimeout = other.startingCutTimeout

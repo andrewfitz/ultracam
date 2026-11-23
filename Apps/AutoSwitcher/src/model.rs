@@ -31,6 +31,20 @@ fn default_audio_duration() -> f64 {
     0.02
 }
 
+impl AudioCue {
+    pub(crate) fn has_valid_values(&self) -> bool {
+        self.time.is_finite()
+            && self.time >= 0.0
+            && self.duration.is_finite()
+            && self.duration >= 0.0
+            && self.pause_duration.is_finite()
+            && self.speech_energy.is_finite()
+            && self.features.values().all(|v| v.is_finite())
+            && self.emphasis.is_finite()
+            && self.laughter.is_finite()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum CueKind {
@@ -57,6 +71,16 @@ pub struct TranscriptCue {
     pub session_generation: u64,
 }
 
+impl TranscriptCue {
+    pub(crate) fn has_valid_values(&self) -> bool {
+        self.start.is_finite()
+            && self.start >= 0.0
+            && self.end.is_finite()
+            && self.end >= self.start
+            && self.confidence.is_finite()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VideoObservation {
     pub time: MediaTime,
@@ -77,6 +101,17 @@ pub struct VideoObservation {
 
 fn default_true() -> bool {
     true
+}
+
+impl VideoObservation {
+    pub(crate) fn has_valid_values(&self) -> bool {
+        self.time.is_finite()
+            && self.time >= 0.0
+            && self.motion.is_finite()
+            && self.scene_change.is_finite()
+            && self.eye_contact.is_none_or(f32::is_finite)
+            && self.provider_score.is_none_or(f32::is_finite)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -121,30 +156,9 @@ impl StreamEvent {
     // turn into a different or unreadable cue when saved to the replay ledger.
     pub fn has_valid_cue_values(&self) -> bool {
         match self {
-            Self::Audio { cue } => {
-                cue.time.is_finite()
-                    && cue.time >= 0.0
-                    && cue.duration.is_finite()
-                    && cue.duration >= 0.0
-                    && cue.pause_duration.is_finite()
-                    && cue.speech_energy.is_finite()
-                    && cue.features.values().all(|v| v.is_finite())
-                    && cue.emphasis.is_finite()
-                    && cue.laughter.is_finite()
-            }
-            Self::Transcript { cue } => {
-                cue.start.is_finite()
-                    && cue.start >= 0.0
-                    && cue.end.is_finite()
-                    && cue.end >= cue.start
-                    && cue.confidence.is_finite()
-            }
-            Self::Video { observation } => {
-                observation.time.is_finite()
-                    && observation.time >= 0.0
-                    && observation.motion.is_finite()
-                    && observation.scene_change.is_finite()
-            }
+            Self::Audio { cue } => cue.has_valid_values(),
+            Self::Transcript { cue } => cue.has_valid_values(),
+            Self::Video { observation } => observation.has_valid_values(),
             _ => true,
         }
     }

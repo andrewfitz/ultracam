@@ -2,7 +2,7 @@
 # Link receiver fixtures to the exact package products used by the Xcode app build.
 program_stream_link_args() {
   local products module_map product
-  products="$(cd "$1" && pwd)" || return 1
+  products="$(CDPATH= cd -- "$1" && pwd -P)" || return 1
   module_map="$products/../../Intermediates.noindex/GeneratedModuleMaps/CProgramAV1.modulemap"
   if [[ ! -f "$module_map" ]]; then
     echo "Missing $module_map. Supply the Xcode products directory with its sibling build intermediates." >&2

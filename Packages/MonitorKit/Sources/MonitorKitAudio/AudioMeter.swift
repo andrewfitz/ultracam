@@ -135,7 +135,6 @@ public final class AudioMeter: @unchecked Sendable {
   private let runsFIR: Bool
   private let runsSamplePeak: Bool
   private let runsTruePeak: Bool
-  private let runsPeakBallistics: Bool
   private let runsPPMFromPhases: Bool
   private let runsVU: Bool
   private let runsPPM: Bool
@@ -153,11 +152,10 @@ public final class AudioMeter: @unchecked Sendable {
   private let publishFrames: Int
   private let rmsTicks: Int
   private let rmsGain: Double
-  private let vuGain: Double
+  private let vuGainDB: Double
   private let ppm: PPMCoefficients
-  private let ppmGain: Double
-  private let decayPerFrame: Double
-  private let holdFrames: Int
+  private let ppmGainDB: Double
+  private let peakBallistics: PeakBallistics
   private let clipLevel: Float
 
   /// A meter for `configuration`, with every buffer it will use allocated here.
@@ -170,7 +168,6 @@ public final class AudioMeter: @unchecked Sendable {
     channelCount = configuration.channelCount
     runsSamplePeak = kinds.contains(.samplePeak)
     runsTruePeak = kinds.contains(.truePeak)
-    runsPeakBallistics = runsSamplePeak || runsTruePeak
     runsVU = kinds.contains(.vu)
     runsPPM = kinds.contains(.ppm)
     runsRMS = kinds.contains(.rms)
@@ -262,14 +259,12 @@ public final class AudioMeter: @unchecked Sendable {
     scalars.initialize(to: Scalars(primed: stage.history == 0))
 
     // A sine's rectified mean is 2/pi of its peak; 0 VU is a sine peaking at the reference.
-    vuGain = Double.pi / 2 / pow(10, configuration.vuReference.dBFS / 20)
+    vuGainDB = 20 * log10(Double.pi / 2) - configuration.vuReference.dBFS
 
     ppm = validatedPPM
-    ppmGain = ppm.calibration / pow(10, configuration.ppmAlignment.dBFS / 20)
+    ppmGainDB = 20 * log10(ppm.calibration) - configuration.ppmAlignment.dBFS
 
-    decayPerFrame = -configuration.peakDecayRate * log(10) / (20 * fs)
-    let hold = configuration.peakHoldTime * fs
-    holdFrames = hold >= Double(Int.max / 2) ? Int.max : Int(hold.rounded())
+    peakBallistics = PeakBallistics(configuration: configuration, capacity: Self.chunkFrames)
     clipLevel = Float(pow(10, configuration.clipLevelDBFS / 20))
   }
 
@@ -292,6 +287,7 @@ public final class AudioMeter: @unchecked Sendable {
     stage.deallocate()
     interpolator.deallocate()
     ppm.deallocate()
+    peakBallistics.deallocate()
     staging.deallocate()
     channelState.deallocate()
     ppmStates.deallocate()
@@ -323,52 +319,69 @@ public final class AudioMeter: @unchecked Sendable {
   // MARK: Input
 
   /// Deinterleaved Float32, e.g. `AVAudioPCMBuffer.floatChannelData`.
+  /// Zero-frame calls do not read input pointers and still apply pending resets.
   public func process(planar channels: UnsafePointer<UnsafeMutablePointer<Float>>, frameCount: Int) {
-    forEachIndex(channelCount) { stage.bindPlanar($0, channels[$0]) }
+    if frameCount > 0 {
+      forEachIndex(channelCount) { stage.bindPlanar($0, channels[$0]) }
+    }
     run(frameCount, .float32)
   }
 
   /// Deinterleaved Float32 from read-only channel pointers.
   public func process(planar channels: UnsafePointer<UnsafePointer<Float>>, frameCount: Int) {
-    forEachIndex(channelCount) { stage.bindPlanar($0, channels[$0]) }
+    if frameCount > 0 {
+      forEachIndex(channelCount) { stage.bindPlanar($0, channels[$0]) }
+    }
     run(frameCount, .float32)
   }
 
   /// Deinterleaved Int16, full scale 32768, e.g. `AVAudioPCMBuffer.int16ChannelData`.
   public func process(planar channels: UnsafePointer<UnsafeMutablePointer<Int16>>, frameCount: Int) {
-    forEachIndex(channelCount) { stage.bindPlanar($0, channels[$0]) }
+    if frameCount > 0 {
+      forEachIndex(channelCount) { stage.bindPlanar($0, channels[$0]) }
+    }
     run(frameCount, .int16)
   }
 
   /// Deinterleaved Int32, full scale 2^31, e.g. `AVAudioPCMBuffer.int32ChannelData`.
   public func process(planar channels: UnsafePointer<UnsafeMutablePointer<Int32>>, frameCount: Int) {
-    forEachIndex(channelCount) { stage.bindPlanar($0, channels[$0]) }
+    if frameCount > 0 {
+      forEachIndex(channelCount) { stage.bindPlanar($0, channels[$0]) }
+    }
     run(frameCount, .int32)
   }
 
   /// Interleaved samples; `frameStride` (default: the channel count) is the
   /// number of samples per frame, so the first channels of a wider stream can be metered.
   public func process(interleaved samples: UnsafePointer<Float>, frameCount: Int, frameStride: Int? = nil) {
-    stage.bindInterleaved(samples, format: .float32, frameStride: checkedStride(frameStride))
+    if frameCount > 0 {
+      stage.bindInterleaved(samples, format: .float32, frameStride: checkedStride(frameStride))
+    }
     run(frameCount, .float32)
   }
 
   /// Interleaved Int16 (full scale 32768); `frameStride` as for Float32.
   public func process(interleaved samples: UnsafePointer<Int16>, frameCount: Int, frameStride: Int? = nil) {
-    stage.bindInterleaved(samples, format: .int16, frameStride: checkedStride(frameStride))
+    if frameCount > 0 {
+      stage.bindInterleaved(samples, format: .int16, frameStride: checkedStride(frameStride))
+    }
     run(frameCount, .int16)
   }
 
   /// Interleaved Int32 (full scale 2^31); `frameStride` as for Float32.
   public func process(interleaved samples: UnsafePointer<Int32>, frameCount: Int, frameStride: Int? = nil) {
-    stage.bindInterleaved(samples, format: .int32, frameStride: checkedStride(frameStride))
+    if frameCount > 0 {
+      stage.bindInterleaved(samples, format: .int32, frameStride: checkedStride(frameStride))
+    }
     run(frameCount, .int32)
   }
 
   /// Core Audio buffers, planar or interleaved; channels are taken in order
   /// and channels the list does not carry read as silence.
   public func process(bufferList: UnsafePointer<AudioBufferList>, frameCount: Int, format: AudioSampleFormat) {
-    stage.bindBufferList(bufferList, frameCount: frameCount, format: format)
+    if frameCount > 0 {
+      stage.bindBufferList(bufferList, frameCount: frameCount, format: format)
+    }
     run(frameCount, format)
   }
 
@@ -489,15 +502,12 @@ public final class AudioMeter: @unchecked Sendable {
     var offset = 0
     while offset < frameCount {
       let n = min(frameCount - offset, Self.chunkFrames)
-      // The decay factor depends only on this chunk's length. Compute it once
-      // instead of paying for the same exp() once per channel group member.
-      let decay = runsPeakBallistics ? exp(decayPerFrame * Double(n)) : 0
       stage.load(offset: offset, frames: n, format: format)
       if !scalars.pointee.primed {
         forEachIndex(channelCount) { stage.primeHistory($0) }
         scalars.pointee.primed = true
       }
-      forEachIndex(groupCount) { measure(group: $0, frames: n, decay: decay) }
+      forEachIndex(groupCount) { measure(group: $0, frames: n) }
       if let pair = correlationPair { correlate(pair, frames: n) }
       advanceRMSTicks(n)
       scalars.pointee.ppmCarry = (scalars.pointee.ppmCarry + n) % ppmInput.fold
@@ -515,7 +525,7 @@ public final class AudioMeter: @unchecked Sendable {
   }
 
   /// Every meter of four channels over the current chunk.
-  private func measure(group g: Int, frames n: Int, decay: Double) {
+  private func measure(group g: Int, frames n: Int) {
     let first = g * 4
     let width = min(4, channelCount - first)
     forEachIndex(width) { measurePeaks(channel: first + $0, slot: $0, frames: n) }
@@ -524,7 +534,7 @@ public final class AudioMeter: @unchecked Sendable {
         ppmStates + first, channels: width, lanes: UnsafePointer(ppmLanes), envelopes: UnsafePointer(ppmEnvelopes),
         offset: 0, count: (scalars.pointee.ppmCarry + n) / ppmInput.fold)
     }
-    forEachIndex(width) { measureLevels(channel: first + $0, slot: $0, frames: n, decay: decay) }
+    forEachIndex(width) { measureLevels(channel: first + $0, slot: $0, frames: n) }
   }
 
   /// The sample peak and, through the group's scratch slot, the interpolated
@@ -570,29 +580,28 @@ public final class AudioMeter: @unchecked Sendable {
   }
 
   /// VU, RMS, peak ballistics and clip count.
-  private func measureLevels(channel c: Int, slot: Int, frames n: Int, decay: Double) {
+  private func measureLevels(channel c: Int, slot: Int, frames n: Int) {
     let x = UnsafePointer(stage.samples(c))
     let length = vDSP_Length(n)
     let s = channelState + c
     if runsRMS { accumulateRMS(channel: c, frames: n) }
+    let peak = s.pointee.chunkPeak
+    let truePeak = s.pointee.chunkTruePeak
+    if runsSamplePeak {
+      peakBallistics.advance(x, count: n, maximum: peak,
+        bar: &s.pointee.sampleBar, hold: &s.pointee.sampleHold, age: &s.pointee.sampleHoldAge)
+    }
+    if runsTruePeak {
+      let envelope = envelopes[slot]
+      vDSP_vmaxmg(x, 1, envelope, 1, envelope, 1, length)
+      peakBallistics.advance(envelope, count: n, maximum: truePeak,
+        bar: &s.pointee.trueBar, hold: &s.pointee.trueHold, age: &s.pointee.trueHoldAge)
+      if Double(truePeak) > s.pointee.trueMax { s.pointee.trueMax = Double(truePeak) }
+    }
     if runsVU {
       // The envelope slot is free once the true peak and PPM have run.
       vDSP_vabs(x, 1, envelopes[slot], 1, length)
       vu.advance(vuStates + 2 * c, rectified: envelopes[slot], count: n)
-    }
-
-    let peak = s.pointee.chunkPeak
-    let truePeak = s.pointee.chunkTruePeak
-    if runsSamplePeak {
-      Self.ballistics(
-        bar: &s.pointee.sampleBar, hold: &s.pointee.sampleHold, age: &s.pointee.sampleHoldAge,
-        peak: Double(peak), decay: decay, decayPerFrame: decayPerFrame, frames: n, holdFrames: holdFrames)
-    }
-    if runsTruePeak {
-      Self.ballistics(
-        bar: &s.pointee.trueBar, hold: &s.pointee.trueHold, age: &s.pointee.trueHoldAge,
-        peak: Double(truePeak), decay: decay, decayPerFrame: decayPerFrame, frames: n, holdFrames: holdFrames)
-      if Double(truePeak) > s.pointee.trueMax { s.pointee.trueMax = Double(truePeak) }
     }
     if peak >= clipLevel {
       // vclipc counts strictly outside its bounds, so these count |x| >= clipLevel.
@@ -606,29 +615,6 @@ public final class AudioMeter: @unchecked Sendable {
       let clipped = UInt32(truncatingIfNeeded: min(below + above, vDSP_Length(UInt32.max)))
       let count = s.pointee.clipCount
       s.pointee.clipCount = clipped > UInt32.max - count ? UInt32.max : count + clipped
-    }
-  }
-
-  /// Instant attack; after `holdFrames` the hold marker falls with the bar.
-  @inline(__always) private static func ballistics(
-    bar: inout Double, hold: inout Double, age: inout Int,
-    peak: Double, decay: Double, decayPerFrame: Double, frames: Int, holdFrames: Int
-  ) {
-    let decayed = bar * decay
-    bar = peak > decayed ? peak : decayed
-    if peak >= hold {
-      hold = peak
-      age = 0
-    } else {
-      let remainingHold = holdFrames - age
-      let releasedFrames = max(0, frames - remainingHold)
-      age = frames >= remainingHold ? holdFrames : age + frames
-      if releasedFrames > 0 {
-        // Only audio after the hold expires contributes to its fall. Using
-        // the whole chunk releases early, including at the exact boundary.
-        let released = hold * (releasedFrames == frames ? decay : exp(decayPerFrame * Double(releasedFrames)))
-        hold = bar > released ? bar : released
-      }
     }
   }
 
@@ -746,9 +732,9 @@ public final class AudioMeter: @unchecked Sendable {
         levels.truePeakMax = amplitudeDB(s.pointee.trueMax)
       }
       if runsRMS { levels.rms = amplitudeDB((rmsWindows[c].energy / window).squareRoot() * rmsGain) }
-      if runsVU { levels.vu = amplitudeDB(max(vuStates[2 * c], 0) * vuGain) }
+      if runsVU { levels.vu = amplitudeDB(max(vuStates[2 * c], 0), offset: vuGainDB) }
       if runsPPM {
-        levels.ppm = amplitudeDB(ppmStates[c].top * ppmGain)
+        levels.ppm = amplitudeDB(ppmStates[c].top, offset: ppmGainDB)
         ppm.restart(&ppmStates[c])
       }
       staging.pointee.readings.channels[c] = levels

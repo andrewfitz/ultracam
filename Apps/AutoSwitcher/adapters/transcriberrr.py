@@ -2,15 +2,38 @@
 import argparse
 import asyncio
 import base64
+from contextlib import aclosing
 import json
 import os
+import stat
 import sys
 from websockets.asyncio.client import connect
 from client import Client
 
 
+async def pcm_packets(source, size=4800):
+    mode = os.fstat(source.fileno()).st_mode
+    if os.name != "posix" or not (stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode)):
+        while packet := await asyncio.to_thread(source.read, size):
+            yield packet
+        return
+
+    loop = asyncio.get_running_loop()
+    reader = asyncio.StreamReader(limit=size)
+    transport, _ = await loop.connect_read_pipe(lambda: asyncio.StreamReaderProtocol(reader), source)
+    try:
+        while True:
+            yield await reader.readexactly(size)
+    except asyncio.IncompleteReadError as error:
+        if error.partial:
+            yield error.partial
+    finally:
+        transport.close()
+
+
 async def run(args):
     client = Client(args.port)
+    generation = client.request("state").get("session_generation", 0)
     headers = {}
     if key := os.getenv("TRANSCRIBERRR_API_KEY"):
         headers["Authorization"] = "Bearer " + key
@@ -36,8 +59,9 @@ async def run(args):
                            end=args.origin + msg["end_frame"] / 24000,
                            kind="question" if text.endswith("?") else
                            "sentenceEnd" if text.endswith((".", "!")) else "phraseEnd",
-                           confidence=args.confidence, is_final=True)
+                           confidence=args.confidence, is_final=True, session_generation=generation)
                 await asyncio.to_thread(client.event, "transcript", cue=cue)
+            raise ConnectionError("Transcriberrr disconnected before ending the session")
 
         while True:
             async with asyncio.timeout(10):
@@ -50,12 +74,13 @@ async def run(args):
         frame = 0
         async with asyncio.TaskGroup() as tasks:
             receiver = tasks.create_task(receive())
-            while packet := await asyncio.to_thread(sys.stdin.buffer.read, 4800):
-                if len(packet) % 2:
-                    raise ValueError("partial PCM sample")
-                await send("track.append", track_id="program", start_frame=frame,
-                           audio=base64.b64encode(packet).decode())
-                frame += len(packet) // 2
+            async with aclosing(pcm_packets(sys.stdin.buffer)) as packets:
+                async for packet in packets:
+                    if len(packet) % 2:
+                        raise ValueError("partial PCM sample")
+                    await send("track.append", track_id="program", start_frame=frame,
+                               audio=base64.b64encode(packet).decode())
+                    frame += len(packet) // 2
             await send("session.end")
             async with asyncio.timeout(60):
                 await receiver

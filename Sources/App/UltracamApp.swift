@@ -29,7 +29,7 @@ import SwiftUI
       }
     }
     menuBar = UIMenuBarController(model: model, interface: UIAppEnvironment.interface)
-    if !CommandLine.arguments.contains("--ui-self-test") {
+    if !CommandLine.arguments.contains("--ui-self-test"), !CommandLine.arguments.contains("--ui-tour") {
       Task { @MainActor in await model.cameraControls.restoreConnections() }
       cameraControlRetries = CameraControlRetryTriggers(store: model.cameraControls)
       // Here, before launch finishes: the system asks for the delegate that early.
@@ -160,6 +160,7 @@ struct UltracamApp: App {
         UIMainWindowView(context: context)
           .toolbar { UIToolbarContent(context: context) }
           .uiWatchesHardware(model.hardwareInventory)
+          .defaultAppStorage(UIAppEnvironment.defaults)
       }
     }
     // The Window menu's Show Main Window (⌘0) and Diagnostics (⌃⌥D) items are UICommands', so

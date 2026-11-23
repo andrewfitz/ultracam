@@ -127,7 +127,7 @@ struct UIBodySetup: Equatable {
       rows.append(row)
     }
     if let display = properties.first(where: { $0.role == .cameraDisplay }) {
-      rows.append(Row(label: "Camera display", pieces: [display.value == .boolean(true) ? "On" : "Off"]))
+      rows.append(Row(label: "Camera display", pieces: [UIControlPresentation.value(display)]))
     }
     let timecode = properties.first { $0.role == .timecodeOutput }
     if let timecode { rows.append(Row(label: "Timecode out", pieces: [UIControlPresentation.value(timecode)])) }
@@ -149,11 +149,21 @@ struct UIBodySetup: Equatable {
           : "\(cameraName) is declared \(UIHardwareText.profileShort(declaredProfileID))",
         detail: "The body reports \(picture.joined(separator: " "))",
         actionTitle: "Use \(UIHardwareText.profileShort(suggested))", action: .useSourceProfile(suggested))
-    } else if timecodeMode == .source, let timecode, UIControlPresentation.value(timecode) == "Off",
-      timecode.writable, let on = timecode.options.first(where: { $0.label == "On" }) {
+    } else if timecodeMode == .source, let timecode, let enabled = Self.enableTimecode(timecode) {
       advisory = Advisory(title: "\(cameraName) records the source’s timecode", detail: "The body sends none on HDMI",
-        actionTitle: "Turn On", action: .setProperty(timecode.id, on.value))
+        actionTitle: "Turn On", action: .setProperty(timecode.id, enabled))
     }
+  }
+
+  private static func enableTimecode(_ property: ControlProperty) -> ControlValue? {
+    guard property.writable else { return nil }
+    if case .boolean(let enabled) = property.value {
+      guard !enabled, property.options.isEmpty || property.options.contains(where: { $0.value == .boolean(true) }) else { return nil }
+      return .boolean(true)
+    }
+    let fallback = property.currentValueLabel ?? property.options.first { $0.value == property.value }?.label
+    guard fallback == "Off" else { return nil }
+    return property.options.first { $0.label == "On" }?.value
   }
 
   /// No declaration reads as Rec.709, which is what an undeclared camera is treated as.

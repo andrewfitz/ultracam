@@ -48,4 +48,15 @@ import XCTest
     XCTAssertEqual(second.presentationTime.value, 40)
   }
 
+  func testUnrepresentableEndDoesNotPoisonResumeBoundary() throws {
+    var timeline = try VariableFrameTimeline(timescale: 1)
+    let first = try timeline.append(pts: t(0, 1), duration: t(1, 1))
+    XCTAssertThrowsError(try timeline.append(pts: t(Int64.max, 1), duration: t(1, 1))) {
+      XCTAssertEqual($0 as? VariableFrameTimeline.Failure, .overflow)
+    }
+    XCTAssertEqual(timeline.lastSample, first)
+    timeline.pause()
+    let resumed = try timeline.append(pts: t(0, 1), duration: t(1, 1))
+    XCTAssertEqual(resumed.presentationTime.value, 1)
+  }
 }

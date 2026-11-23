@@ -31,10 +31,12 @@ if [[ "$full_proof" == true ]]; then
   rust_inputs_hash="$(cd "$auto_switcher_source" && find . \
     -type d \( -name target -o -name build -o -name __pycache__ -o -name .git \) -prune -o -type f -print0 | \
     sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -d' ' -f1)"
-  inputs_hash="$(cd "$task_root" && find Sources Tools/UIVerify ../MonitorKit/Sources ../MonitorKit/Package.swift \
+  compile_inputs_hash="$(cd "$task_root" && find Sources Tools/UIVerify ../MonitorKit/Sources ../MonitorKit/Package.swift \
     Vendors Config/Assets.xcassets scripts/ui-verify.sh scripts/monitor-kit-package.sh scripts/vendor-build.sh scripts/vendors.py scripts/auto_switcher_source.py \
     -type f \( -name '*.swift' -o -name '*.metal' -o -name '*.msl' -o -name '*.mm' -o -name '*.h' -o -name '*.inc' -o -name '*.cpp' -o -name '*.txt' -o -name '*.sh' -o -name '*.py' -o -name '*.json' -o -name '*.svg' -o -name '*.png' \) \
-    -print0 | sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -d' ' -f1)-rust${rust_inputs_hash}-strict${STRICT:-1}-vendors$(python3 "$task_root/scripts/vendors.py" digest)"
+    -print0 | sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -d' ' -f1)"
+  vendor_inputs_hash="$(python3 "$task_root/scripts/vendors.py" digest)"
+  inputs_hash="$compile_inputs_hash-rust$rust_inputs_hash-strict${STRICT:-1}-vendors$vendor_inputs_hash"
   if [[ "${FORCE:-0}" != 1 && -f "$build_root/last-pass" ]]; then
     passed_hash="$(sed -n '1p' "$build_root/last-pass")"
     passed_run="$(sed -n '2p' "$build_root/last-pass")"
@@ -60,15 +62,19 @@ command -v rustup >/dev/null || export PATH="$HOME/.cargo/bin:$PATH"
 rustc_path="$(rustup which --toolchain stable rustc)"
 rustdoc_path="$(rustup which --toolchain stable rustdoc)"
 RUSTC="$rustc_path" RUSTDOC="$rustdoc_path" rustup run stable cargo build \
-  --manifest-path "$rust_manifest" --release --locked > "$test_root/rust-build.log" 2>&1
+  --manifest-path "$rust_manifest" --release --locked > "$test_root/rust-build.log" 2>&1 || {
+  rust_status=$?
+  cat "$test_root/rust-build.log" >&2
+  exit "$rust_status"
+}
 auto_switcher_lib="$CARGO_TARGET_DIR/release"
 source "$task_root/scripts/vendor-build.sh"
 vendor_configure test "" "" app
 vendor_compile_native "$test_root/compile.log"
 app_sources=()
-while IFS= read -r source_file; do
+for source_file in "$task_root"/Sources/App/*.swift; do
   if [[ "$source_file" != */UltracamApp.swift ]]; then app_sources+=("$source_file"); fi
-done < <(find "$task_root/Sources/App" -maxdepth 1 -name '*.swift' | sort)
+done
 # Check the whole module in one frontend invocation while keeping the measured code unoptimized.
 xcrun swiftc -Onone -whole-module-optimization -num-threads 4 \
   -swift-version 5 -strict-concurrency=complete -warnings-as-errors -D ULTRACAM_TEST_SUPPORT -D UI_VERIFY \
@@ -88,7 +94,9 @@ xcrun swiftc -Onone -whole-module-optimization -num-threads 4 \
 ln -sfn "$run_id" "$build_root/latest"
 printf 'UI verify artifacts: %s\n' "$test_root"
 status=0
-"$test_root/ui-verify" "$test_root" > "$test_root/ui-verify.log" 2>&1 || status=$?
+# AppKit window restoration and views using @AppStorage can consult standard defaults.
+mkdir -p "$test_root/home/Library/Preferences"
+CFFIXED_USER_HOME="$test_root/home" "$test_root/ui-verify" "$test_root" > "$test_root/ui-verify.log" 2>&1 || status=$?
 grep -E '^(FAIL|PENDING)' "$test_root/ui-verify.log" | head -80 || true
 tail -4 "$test_root/ui-verify.log"
 if [[ "$status" == 0 && "$full_proof" == true ]]; then

@@ -211,6 +211,17 @@ import XCTest
       "An overflowing timestamp delta must not bypass cadence validation")
   }
 
+  func testCadenceRejectsMalformedNumericTimescalesBeforeAnchoring() {
+    var gate = FrameRateGate()
+    for timescale: Int32 in [0, -1] {
+      let malformed = CMTime(value: 1, timescale: timescale, flags: .valid, epoch: 0)
+      XCTAssertFalse(gate.shouldDeliver(malformed, duration: VideoContract.slowDuration))
+    }
+    let malformedDuration = CMTime(value: -1, timescale: -30, flags: .valid, epoch: 0)
+    XCTAssertFalse(gate.shouldDeliver(.zero, duration: malformedDuration))
+    XCTAssertTrue(gate.shouldDeliver(.zero, duration: VideoContract.slowDuration))
+  }
+
   func testCadenceRestartsImmediatelyWhenDurationChanges() {
     var gate = FrameRateGate()
     XCTAssertTrue(gate.shouldDeliver(.zero, duration: VideoContract.fastDuration))

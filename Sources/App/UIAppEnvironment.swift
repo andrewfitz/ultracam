@@ -6,8 +6,14 @@ import AppKit
 @MainActor enum UIAppEnvironment {
   private static let selfTestDomain: String? = {
     let args = CommandLine.arguments
-    return args.contains("--ui-self-test") && !args.contains("--live")
-      ? "org.ultracam.ui-self-test.\(UUID().uuidString)" : nil
+    guard args.contains("--ui-tour") || (args.contains("--ui-self-test") && !args.contains("--live")) else { return nil }
+    let domain = "org.ultracam.ui-self-test.\(UUID().uuidString)"
+    // cfprefsd still writes named suites to the user's real preferences directory
+    // under CFFIXED_USER_HOME. An absolute suite lives inside the run itself.
+    if let home = ProcessInfo.processInfo.environment["CFFIXED_USER_HOME"], home.hasPrefix("/") {
+      return URL(fileURLWithPath: home).appendingPathComponent("Library/Preferences/\(domain)").path
+    }
+    return domain
   }()
   static let defaults = selfTestDomain.flatMap(UserDefaults.init(suiteName:)) ?? .standard
   static func clearSelfTestPreferences() {
@@ -18,7 +24,8 @@ import AppKit
     return AppModel(settingsStore: AppSettingsStore(defaults: defaults),
       registryStore: VirtualCameraRegistryStore(defaults: defaults),
       registryPublisher: VirtualCameraRegistryPublisher(observeTopology: false, apply: { _ in }),
-      recordingFolderStore: RecordingFolderStore(defaults: defaults), hardware: .offline)
+      recordingFolderStore: RecordingFolderStore(defaults: defaults),
+      hardware: CommandLine.arguments.contains("--live") ? .live : .offline)
   }()
   static let interface = UIInterfaceState(defaults: defaults)
   static let alertPreferences = UIAlertPreferences(defaults: defaults)

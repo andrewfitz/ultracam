@@ -73,7 +73,7 @@ struct UIScopeSettingsView: View {
       } trailing: {
         UIToolGroup("Display") {
           kindControls(d)
-          UIScopeSlider(title: "Trace gain", value: settings.display.gain, range: 0.25...4, format: "%.2f×")
+          traceGain
           Toggle("Graticule", isOn: settings.display.showsGraticule)
         }
         UIToolGroup("Clip readout") { clipControls }
@@ -211,16 +211,26 @@ struct UIScopeSettingsView: View {
 
   /// Trace gain, graticule and the clip readout's levels, as stacked.
   @ViewBuilder private var traceControls: some View {
-    UIScopeSlider(title: "Trace gain", value: settings.display.gain, range: 0.25...4, format: "%.2f×")
+    traceGain
     Toggle("Graticule", isOn: settings.display.showsGraticule)
     clipControls
   }
 
+  private var traceGain: some View {
+    UIMonitorSlider("Trace gain", value: settings.display.gain, in: 0.25...4, minimumTrackWidth: 110) {
+      String(format: "%.2f×", $0)
+    }
+  }
+
   @ViewBuilder private var clipControls: some View {
-    UIScopeSlider(title: "Clip above", value: settings.clipHighPercent, range: 90...109, format: "%.0f%%", step: 1)
-      .help("The clip readout counts pixels at or above this level, per R, G, B and luma.")
-    UIScopeSlider(title: "Clip below", value: settings.clipLowPercent, range: -7...10, format: "%.0f%%", step: 1)
-      .help("The clip readout counts pixels at or below this level, per R, G, B and luma.")
+    UIMonitorSlider("Clip above", value: settings.clipHighPercent, in: 90...109, step: 1, minimumTrackWidth: 110) {
+      String(format: "%.0f%%", $0)
+    }
+    .help("The clip readout counts pixels at or above this level, per R, G, B and luma.")
+    UIMonitorSlider("Clip below", value: settings.clipLowPercent, in: -7...10, step: 1, minimumTrackWidth: 110) {
+      String(format: "%.0f%%", $0)
+    }
+    .help("The clip readout counts pixels at or below this level, per R, G, B and luma.")
   }
 
   private func caption(_ d: UIScopeDescription) -> some View {
@@ -248,44 +258,5 @@ struct UIScopeSettingsView: View {
         guard let look else { return }
         settings.wrappedValue = look.applied(to: scopes.settings)
       })
-  }
-}
-
-/// A labelled slider with its value, in the monitor settings' style.
-private struct UIScopeSlider: View {
-  let title: String
-  @Binding var value: Double
-  let range: ClosedRange<Double>
-  let format: String
-  var step: Double?
-
-  init(title: String, value: Binding<Double>, range: ClosedRange<Double>, format: String, step: Double? = nil) {
-    self.title = title
-    _value = value
-    self.range = range
-    self.format = format
-    self.step = step
-  }
-
-  var body: some View {
-    LabeledContent {
-      HStack {
-        if let step {
-          Slider(value: clamped, in: range, step: step).frame(minWidth: 110)
-        } else {
-          Slider(value: clamped, in: range).frame(minWidth: 110)
-        }
-        Text(String(format: format, value))
-          .font(.uiMeta.monospacedDigit()).foregroundStyle(.secondary).frame(width: 56, alignment: .trailing)
-      }
-    } label: {
-      Text(title)
-    }
-    .accessibilityElement(children: .combine)
-  }
-
-  /// A saved value outside the slider's range shows at its end and stays as saved until moved.
-  private var clamped: Binding<Double> {
-    Binding(get: { min(range.upperBound, max(range.lowerBound, value)) }, set: { value = $0 })
   }
 }

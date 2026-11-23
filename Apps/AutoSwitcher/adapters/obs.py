@@ -4,8 +4,8 @@ import base64
 import hashlib
 import json
 import os
-from queue import Queue
-from threading import Thread
+from queue import Full, Queue
+from threading import Lock, Thread
 from websockets.sync.client import connect
 from client import Client
 
@@ -19,6 +19,8 @@ def run(args):
     state = control.request("state")
     if state["hotkeys"]:
         raise ValueError("disable hotkeys before selecting OBS as output")
+    cfg = state["config"]
+    routes = {cfg["anchor_camera_id"], cfg["emphasis_camera_id"], *cfg["additional_targets"]}
     with connect(args.url, open_timeout=5) as ws:
         def send(op, **fields):
             ws.send(json.dumps({"op": op, "d": fields}))
@@ -38,7 +40,17 @@ def run(args):
         receive(2)
         replies = Queue(maxsize=1)
         telemetry = Client(args.port)
+        scene_lock = Lock()
+        changing_to = None
+        observation_failure = None
+
+        # Subscribe before synchronizing, then skip any events predating sync.
+        watcher = Client(args.port)
+        updates = watcher.watch()
+        next(updates)
+
         def observe():
+            nonlocal observation_failure
             try:
                 for raw in ws:
                     message = json.loads(raw)
@@ -46,14 +58,24 @@ def run(args):
                         replies.put(message["d"])
                     elif message["op"] == 5 and message["d"]["eventType"] == "CurrentProgramSceneChanged":
                         route = message["d"]["eventData"]["sceneName"]
-                        snapshot = telemetry.request("state")
-                        status = snapshot["status"]
-                        # The matching request response owns the acknowledgement.
-                        if route == status["current_camera_id"] or route == (snapshot.get("pending") or {}).get("target_camera_id"):
+                        with scene_lock:
+                            expected = changing_to
+                        # A proposal alone does not change OBS. Suppress only the
+                        # event expected from a scene change we actually sent.
+                        if route not in routes or route == expected:
+                            continue
+                        status = telemetry.request("state")["status"]
+                        if route == status["current_camera_id"] and expected is None:
                             continue
                         telemetry.event("manualOverride", camera_id=route, time=status["time"])
+                raise ConnectionError("OBS disconnected")
             except Exception as error:
-                replies.put(error)
+                observation_failure = error
+                try:
+                    replies.put_nowait(error)
+                except Full:
+                    pass
+                watcher.shutdown()
         Thread(target=observe, daemon=True).start()
 
         def call(kind, request_id, **data):
@@ -65,34 +87,49 @@ def run(args):
                 raise ValueError(str(result["requestStatus"]))
             return result.get("responseData", {})
 
-        # Subscribe before synchronizing, then skip any events predating sync.
-        updates = Client(args.port).watch()
-        next(updates)
+        def live_updates():
+            try:
+                yield from updates
+            except ConnectionError:
+                if observation_failure is not None:
+                    raise observation_failure from None
+                raise
+
         scene = call("GetCurrentProgramScene", "initial")["currentProgramSceneName"]
-        cfg = state["config"]
-        if scene not in [cfg["anchor_camera_id"], cfg["emphasis_camera_id"], *cfg["additional_targets"]]:
+        if scene not in routes:
             raise ValueError("current OBS scene must be a configured route")
         synced = control.event("manualOverride", camera_id=scene, time=control.request("state")["status"]["time"])
-        for update in updates:
+        for update in live_updates():
             if update["seq"] <= synced["seq"]:
                 continue
-            for output in update["outputs"]:
-                if output["type"] != "cut":
-                    continue
-                cut = output["instruction"]
-                decision = cut["decision_id"]
-                latest = control.request("state")["status"]
-                if latest["pending_decision_id"] != decision or latest["time"] > cut["expires_at"]:
-                    continue
+            # A boundary may be proposed ahead of the clock. Each update includes
+            # the pending cut until it lands, expires, or is replaced.
+            cut = update.get("pending")
+            if not cut or update["status"]["time"] < cut["cut_time"]:
+                continue
+            decision = cut["decision_id"]
+            latest = control.request("state")["status"]
+            if latest["pending_decision_id"] != decision or not cut["cut_time"] <= latest["time"] <= cut["expires_at"]:
+                continue
+            target = cut["target_camera_id"]
+            with scene_lock:
+                changing_to = target
+            try:
                 try:
-                    call("SetCurrentProgramScene", decision, sceneName=cut["target_camera_id"])
+                    call("SetCurrentProgramScene", decision, sceneName=target)
                 except ValueError:
                     control.event("reject", decision_id=decision)
                     raise
                 now = control.request("state")["status"]["time"]
-                result = control.event("acknowledge", decision_id=decision, applied_at=max(now, cut["cut_time"]))
-                if result["status"]["current_camera_id"] != cut["target_camera_id"]:
-                    control.event("manualOverride", camera_id=cut["target_camera_id"], time=now)
+                result = control.event("acknowledge", decision_id=decision, applied_at=now)
+                if result["status"]["current_camera_id"] != target:
+                    scene = call("GetCurrentProgramScene", "resync")["currentProgramSceneName"]
+                    if scene in routes and scene != result["status"]["current_camera_id"]:
+                        current_time = control.request("state")["status"]["time"]
+                        control.event("manualOverride", camera_id=scene, time=current_time)
+            finally:
+                with scene_lock:
+                    changing_to = None
 
 
 if __name__ == "__main__":

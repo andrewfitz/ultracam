@@ -28,7 +28,7 @@ import XCTest
   func testCoreVideoPackedAndPlanarMetadata() throws {
     for type in [kCVPixelFormatType_422YpCbCr8, kCVPixelFormatType_422YpCbCr8_yuvs,
       kCVPixelFormatType_32BGRA,
-      kCVPixelFormatType_420YpCbCr8BiPlanarFullRange] {
+      kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, kCVPixelFormatType_420YpCbCr10BiPlanarFullRange] {
       var image: CVPixelBuffer?
       XCTAssertEqual(CVPixelBufferCreate(nil, 64, 32, type, nil, &image), kCVReturnSuccess)
       XCTAssertNoThrow(try VideoBufferLayout.validate(XCTUnwrap(image)))
@@ -49,7 +49,8 @@ import XCTest
     }
   }
   func testPlanarGeometryStridesAndAggregateAllocation() throws {
-    for (type, bytes, rows) in [(UInt32(0x34323066), 1, 2), (0x50323136, 2, 3)] {
+    for (type, bytes, rows) in [(UInt32(0x34323066), 1, 2),
+      (kCVPixelFormatType_420YpCbCr10BiPlanarFullRange, 2, 2), (0x50323136, 2, 3)] {
       let planes = [VideoBufferLayout.Plane(width: 5, height: 3, rowBytes: 5 * bytes),
         VideoBufferLayout.Plane(width: 3, height: rows, rowBytes: 6 * bytes)]
       var metadata = VideoBufferLayout.Metadata(width: 5, height: 3, pixelFormat: type,

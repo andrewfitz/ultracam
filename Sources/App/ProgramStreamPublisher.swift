@@ -69,7 +69,7 @@ enum ProgramStreamPublisherError: Error, Equatable {
 
 protocol ProgramStreamPublishing: AnyObject, Sendable {
   func connect(server: String, key: String, format: ProgramStreamFormat, onDisconnect: @escaping @Sendable (ProgramStreamDisconnectReason) -> Void) async throws
-  func setMediaEpoch(_ epoch: CMTime)
+  func setMediaEpoch(_ epoch: CMTime, includesAudio: Bool)
   func appendVideo(_ sample: CMSampleBuffer)
   func appendAudio(_ buffer: AVAudioPCMBuffer, at time: AVAudioTime)
   func statistics() async -> ProgramStreamTransportStatistics
@@ -77,7 +77,7 @@ protocol ProgramStreamPublishing: AnyObject, Sendable {
 }
 
 extension ProgramStreamPublishing {
-  func setMediaEpoch(_ epoch: CMTime) {}
+  func setMediaEpoch(_ epoch: CMTime, includesAudio: Bool) {}
 
   func connect(server: String, key: String, onDisconnect: @escaping @Sendable (ProgramStreamDisconnectReason) -> Void) async throws {
     try await connect(server: server, key: key, format: .init(), onDisconnect: onDisconnect)
@@ -116,7 +116,7 @@ private final class RTMPProgramPublisher: ProgramStreamPublishing, @unchecked Se
   private var shutdown: Task<Void, Never>?
   private var disconnected: (@Sendable (ProgramStreamDisconnectReason) -> Void)?
   private var transport = ProgramStreamTransportStatistics()
-  private var mediaEpoch: CMTime?
+  private var mediaEpoch: (time: CMTime, includesAudio: Bool)?
   private var videoInput: AsyncStream<CMSampleBuffer>.Continuation?
   private var audioInput: AsyncStream<AudioPacket>.Continuation?
 
@@ -303,15 +303,15 @@ private final class RTMPProgramPublisher: ProgramStreamPublishing, @unchecked Se
     lock.withLock { transport.droppedVideo &+= 1 }
   }
 
-  func setMediaEpoch(_ epoch: CMTime) {
+  func setMediaEpoch(_ epoch: CMTime, includesAudio: Bool) {
     lock.withLock {
-      if mediaEpoch == nil { mediaEpoch = epoch }
+      if mediaEpoch == nil { mediaEpoch = (epoch, includesAudio) }
     }
   }
 
   private func configureStreamEpoch() async {
     if let epoch = lock.withLock({ mediaEpoch }) {
-      await stream.setPublishEpoch(epoch)
+      await stream.setPublishEpoch(epoch.time, includesAudio: epoch.includesAudio)
     }
   }
 

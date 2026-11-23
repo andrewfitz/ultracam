@@ -328,13 +328,16 @@ impl TimelineRecorder {
             StreamEvent::Tick { time } => {
                 if self.last_media_time.is_some_and(|last| time + 1e-6 < last) {
                     self.session_generation = self.session_generation.saturating_add(1);
+                    self.last_media_time = Some(*time);
+                } else {
+                    self.last_media_time =
+                        Some(self.last_media_time.map_or(*time, |last| last.max(*time)));
                 }
-                self.last_media_time = Some(*time);
             }
             StreamEvent::Video { observation } => {
                 if (observation.session_generation == 0
                     || observation.session_generation == self.session_generation)
-                    && !observation.camera_id.is_empty()
+                    && self.timeline.config.targets().any(|id| id == &observation.camera_id)
                     && self
                         .last_media_time
                         .is_none_or(|last| observation.time >= last)

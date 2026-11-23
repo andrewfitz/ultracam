@@ -12,6 +12,7 @@ struct AppRecordingProfile: Codable, Equatable, Sendable {
   var folderPath: String?
 
   var bitrate: Int { min(50, max(1, videoMbps)) * 1_000_000 }
+  var hasCustomFolder: Bool { folderBookmark != nil || folderPath != nil }
 
   mutating func chooseFolder(_ url: URL?) throws {
     let access = url.map(RecordingDirectoryAccess.init)
@@ -21,7 +22,13 @@ struct AppRecordingProfile: Codable, Equatable, Sendable {
   }
 
   func folder() throws -> URL? {
-    guard let folderBookmark else { return nil }
+    guard let folderBookmark else {
+      // A saved destination whose access grant was lost still names the
+      // intended folder. Writing to the camera default would misplace the take.
+      if folderPath != nil { throw CocoaError(.fileReadNoPermission) }
+      return nil
+    }
+    guard !folderBookmark.isEmpty else { throw CocoaError(.fileReadNoPermission) }
     var stale = false
     return try URL(resolvingBookmarkData: folderBookmark, options: [.withSecurityScope, .withoutUI],
       relativeTo: nil, bookmarkDataIsStale: &stale)

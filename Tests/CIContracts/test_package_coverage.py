@@ -1,5 +1,9 @@
 import re
 from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -8,6 +12,16 @@ RUSTUP_SCRIPTS = ['build.sh', 'camera-smoke.sh', 'monitor-app-integration.sh', '
 
 
 class PackageCoverageTests(unittest.TestCase):
+    def test_ci_checkout_can_select_the_tracked_auto_switcher_without_a_sibling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkout = Path(directory).resolve() / 'ultracam'
+            (checkout / 'scripts').mkdir(parents=True)
+            (checkout / 'Apps').symlink_to(ROOT / 'Apps')
+            script = checkout / 'scripts/auto_switcher_source.py'
+            shutil.copyfile(ROOT / 'scripts/auto_switcher_source.py', script)
+            selected = subprocess.check_output([sys.executable, str(script)], text=True)
+            self.assertEqual(Path(selected.strip()), checkout / 'Apps/AutoSwitcher')
+
     def test_every_in_repo_package_with_tests_runs_in_test_sh(self):
         script = (ROOT / 'scripts/test.sh').read_text()
         packages = [p.parent.name for p in (ROOT / 'Packages').glob('*/Package.swift')

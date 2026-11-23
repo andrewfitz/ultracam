@@ -106,7 +106,7 @@ jobs:
         run: |
           set -euo pipefail
           product="$ULTRACAM_WORK_ROOT/agent-work/ultracam/Ultracam.app"
-          python3 scripts/validate_bundle.py "$product"
+          python3 scripts/validate_bundle.py "$product" --signed
           /usr/bin/codesign --verify --deep --strict "$product"
           /usr/bin/codesign --verify --deep --strict "$product/Contents/Library/SystemExtensions/org.ultracam.app.camera.systemextension"
       - name: Remove ephemeral signing material and profiles

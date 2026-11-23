@@ -59,8 +59,8 @@ let audioLog = Logger(subsystem: "org.ultracam.app", category: "audio")
 final class AudioMeterTap: @unchecked Sendable {
   // @unchecked: `slots` is shared through the ring's acquire/release protocol
   // (a slot belongs to the producer from `tail` to `head`, to the meter queue
-  // from `head` back to `tail`), and `consumerMeter`/`consumerSession` are
-  // confined to `meterQueue`. Everything else is atomic or under a Mutex.
+  // from `head` back to `tail`), and the consumer's meter, session and capture
+  // generation are confined to `meterQueue`.
 
   /// Legacy embedded-audio defaults; source declarations configure the live format.
   /// Only what the meters show runs: true peak (and the sample peak behind
@@ -153,6 +153,7 @@ final class AudioMeterTap: @unchecked Sendable {
   // session start on the main thread never releases a meter in use.
   private var consumerMeter: AudioMeter?
   private var consumerSession: UInt64 = 0
+  private var consumerCapture: UInt64 = 0
 
   /// Meter queue only: what the live meter's over watch saw last.
   private var overWatch = OverWatch()
@@ -196,7 +197,7 @@ final class AudioMeterTap: @unchecked Sendable {
   /// meter, so a new session starts new ones.
   private struct DisplayMeters {
     weak var owner: AudioMeter?
-    var meters: [Int: AudioMeter] = [:]
+    var meters: [AudioMeter] = []
   }
   private let displays = Mutex(DisplayMeters())
   /// Settings › Audio's true-peak warning level, dBTP, as a Float's bits. Any thread.
@@ -254,9 +255,13 @@ final class AudioMeterTap: @unchecked Sendable {
   /// Ordered declarations configure meters before packets arrive. This runs on
   /// the capture control queue, never the driver thread.
   func configure(format: SourceAudioFormat) throws {
-    let candidate = try AudioMeter(configuration: Self.configuration(for: format, take: false))
-    let changed = try sessions.withLock { state -> Bool in
-      guard state.format != format else { return false }
+    try sessions.withLock { state in
+      guard state.format != format else {
+        // A redeclaration of the same format is the same stream: As Detected stays.
+        gapPending.store(true, ordering: .relaxed)
+        return
+      }
+      let candidate = try AudioMeter(configuration: Self.configuration(for: format, take: false))
       try take.withLock { take in
         guard let current = take, !current.inputClosed,
           head.load(ordering: .acquiring) == current.startPacket else { return }
@@ -265,11 +270,12 @@ final class AudioMeterTap: @unchecked Sendable {
         take?.meter = try AudioMeter(configuration: Self.configuration(for: format, take: true))
       }
       state.format = format
-      if viewers.load(ordering: .relaxed) > 0 { requestSession(candidate, state: &state) }
-      return true
+      if viewers.load(ordering: .relaxed) > 0 {
+        requestSession(candidate, state: &state, resetsDetection: true)
+      } else {
+        noteGap()
+      }
     }
-    // A redeclaration of the same format is the same stream: As Detected stays.
-    if changed { noteGap() } else { gapPending.store(true, ordering: .relaxed) }
   }
 
   private static func configuration(for format: SourceAudioFormat, take: Bool) throws -> AudioMeterConfiguration {
@@ -290,6 +296,8 @@ final class AudioMeterTap: @unchecked Sendable {
       gapPending.store(true, ordering: .relaxed)
       return
     }
+    // A producer already in flight keeps its capture generation through a reset.
+    let capture = detected.load(ordering: .acquiring) >> 8
     guard !sessionPending.load(ordering: .acquiring) else {
       overlapped.add(1, ordering: .relaxed)
       gapPending.store(true, ordering: .relaxed)
@@ -334,7 +342,7 @@ final class AudioMeterTap: @unchecked Sendable {
       slot.pointee.session = session.load(ordering: .acquiring)
       slot.pointee.takeNumber = measuringTake.load(ordering: .acquiring)
       slot.pointee.followsGap = gapPending.exchange(false, ordering: .relaxed)
-      slot.pointee.capture = detected.load(ordering: .relaxed) >> 8
+      slot.pointee.capture = capture
       // Releasing: the slot's contents before the meter queue can see it.
       head.store(next &+ 1, ordering: .releasing)
       if queued + 1 > maxQueued.load(ordering: .relaxed) { maxQueued.store(queued + 1, ordering: .relaxed) }
@@ -359,6 +367,8 @@ final class AudioMeterTap: @unchecked Sendable {
     while next != end {
       let slot = slots + (next & slotMask)
       let packetSession = slot.pointee.session
+      let followsGap = slot.pointee.followsGap || consumerCapture != slot.pointee.capture
+      consumerCapture = slot.pointee.capture
       // Sessions only move forward: an older packet is stale without a look at the sessions.
       if packetSession > consumerSession {
         // If this is the first packet drained after a rapid attach/detach cycle,
@@ -379,7 +389,7 @@ final class AudioMeterTap: @unchecked Sendable {
       }
       if packetSession == consumerSession, let meter = consumerMeter {
         let shown = displayMeters(of: meter)
-        if slot.pointee.followsGap {
+        if followsGap {
           meter.noteDiscontinuity()
           shown.forEach { $0.noteDiscontinuity() }
         }
@@ -399,7 +409,7 @@ final class AudioMeterTap: @unchecked Sendable {
       if let currentTake, next >= currentTake.start, slot.pointee.takeNumber == currentTake.number {
         let takeMeter = currentTake.meter
         // A gap in the stream, or audio left out while the take was paused.
-        if slot.pointee.followsGap || (lastTakePacket.map { $0 != next &- 1 } ?? false) { takeMeter.noteDiscontinuity() }
+        if followsGap || (lastTakePacket.map { $0 != next &- 1 } ?? false) { takeMeter.noteDiscontinuity() }
         if Self.process(slot.pointee, with: takeMeter) == nil {
           // A packet can be admitted before its declared format is checked.
           // It must not leave the take meter's filter history connected to
@@ -407,12 +417,7 @@ final class AudioMeterTap: @unchecked Sendable {
           takeMeter.noteDiscontinuity()
         }
         lastTakePacket = next
-        if takeWatch.observe(takeMeter.snapshot(), source: currentTake.number, sampleRate: takeMeter.configuration.sampleRate,
-          level: Self.warningLevel) != nil {
-          take.withLock { state in
-            if state?.number == currentTake.number { state?.overs += 1 }
-          }
-        }
+        observeTakeOvers(takeMeter, number: currentTake.number)
       }
       // The packet is released here, never on the driver thread.
       slot.pointee.samples = nil
@@ -485,9 +490,9 @@ final class AudioMeterTap: @unchecked Sendable {
         }
       }
     } else if let samples = slot.samples {
-      samples.withUnsafeBytes { raw in
-        guard let base = raw.baseAddress else { return }
-        let pcm = base.assumingMemoryBound(to: Int32.self)
+      guard meter.configuration.channelCount <= slot.stride,
+        meter.configuration.sampleRate == EmbeddedAudioFormat.sampleRate else { return nil }
+      func processPCM(_ pcm: UnsafePointer<Int32>) {
         meter.process(interleaved: pcm, frameCount: slot.frames, frameStride: slot.stride)
         for display in displays where display.configuration.channelCount <= slot.stride {
           display.process(interleaved: pcm, frameCount: slot.frames, frameStride: slot.stride)
@@ -495,6 +500,17 @@ final class AudioMeterTap: @unchecked Sendable {
         if detecting {
           covered = channelsWithSignal(pcm, frames: slot.frames, channels: meter.configuration.channelCount,
             stride: slot.stride, threshold: Int32(Double(signalAmplitude) * 2_147_483_648))
+        }
+      }
+      samples.withUnsafeBytes { raw in
+        guard let base = raw.baseAddress else { return }
+        if Int(bitPattern: base).isMultiple(of: MemoryLayout<Int32>.alignment) {
+          processPCM(base.assumingMemoryBound(to: Int32.self))
+        } else {
+          let aligned = UnsafeMutableRawPointer.allocate(byteCount: raw.count, alignment: MemoryLayout<Int32>.alignment)
+          defer { aligned.deallocate() }
+          aligned.copyMemory(from: base, byteCount: raw.count)
+          processPCM(aligned.bindMemory(to: Int32.self, capacity: raw.count / MemoryLayout<Int32>.stride))
         }
       }
     } else {
@@ -639,9 +655,10 @@ final class AudioMeterTap: @unchecked Sendable {
 
   /// Replacement requests coalesce to one meter, even if a producer stalls.
   /// Session publication and retirement share the producer's nonwaiting claim.
-  private func requestSession(_ meter: AudioMeter, state: inout Sessions) {
+  private func requestSession(_ meter: AudioMeter, state: inout Sessions, resetsDetection: Bool = false) {
     state.pending = meter
     sessionPending.store(true, ordering: .releasing)
+    if resetsDetection { noteGap() }
     if !commitPendingSession(&state) { scheduleSessionRetry() }
   }
 
@@ -740,12 +757,11 @@ final class AudioMeterTap: @unchecked Sendable {
   /// capture restarted): the meters prime their filters there instead of
   /// interpolating across the gap. Any thread.
   func noteGap() {
-    gapPending.store(true, ordering: .relaxed)
     // A new capture: As Detected starts over, and the last capture's queued packets don't count.
     var current = detected.load(ordering: .relaxed)
     while true {
       let (exchanged, original) = detected.compareExchange(expected: current,
-        desired: ((current >> 8) &+ 1) << 8, ordering: .relaxed)
+        desired: ((current >> 8) &+ 1) << 8, ordering: .releasing)
       if exchanged { return }
       current = original
     }
@@ -773,18 +789,18 @@ final class AudioMeterTap: @unchecked Sendable {
     guard channels > 0, let full = meter, channels < full.configuration.channelCount else { return nil }
     return displays.withLock { state in
       if state.owner !== full { state = DisplayMeters(owner: full) }
-      if let existing = state.meters[channels] { return existing }
+      if let existing = state.meters.first(where: { $0.configuration.channelCount == channels }) { return existing }
       let configuration = AudioMeterConfiguration(sampleRate: full.configuration.sampleRate, channelCount: channels,
         meters: [.samplePeak, .truePeak])
       guard let display = try? AudioMeter(configuration: configuration) else { return nil }
-      state.meters[channels] = display
+      state.meters.append(display)
       return display
     }
   }
 
   /// The display meters fed alongside `meter`. Any thread.
   private func displayMeters(of meter: AudioMeter) -> [AudioMeter] {
-    displays.withLock { $0.owner === meter ? Array($0.meters.values) : [] }
+    displays.withLock { $0.owner === meter ? $0.meters : [] }
   }
 
   /// Settings › Audio: overs count and log from this true peak, dBTP. Any thread.
@@ -860,7 +876,10 @@ final class AudioMeterTap: @unchecked Sendable {
     // publishes the take meter's last few milliseconds; producer (meter queue) only.
     meterQueue.sync {
       drainRing()
-      take.withLock { $0?.meter }?.flush()
+      if let state = take.withLock({ $0 }) {
+        state.meter.flush()
+        observeTakeOvers(state.meter, number: state.number)
+      }
     }
     guard let state = take.withLock({ state -> TakeState? in
       defer { state = nil }
@@ -869,6 +888,16 @@ final class AudioMeterTap: @unchecked Sendable {
     measuringTake.store(0, ordering: .releasing)
     detach()
     return Self.summary(state)
+  }
+
+  /// A short final packet can publish its first over only when the take flushes.
+  private func observeTakeOvers(_ meter: AudioMeter, number: UInt64) {
+    if takeWatch.observe(meter.snapshot(), source: number, sampleRate: meter.configuration.sampleRate,
+      level: Self.warningLevel) != nil {
+      take.withLock { state in
+        if state?.number == number { state?.overs += 1 }
+      }
+    }
   }
 
   private static func summary(_ state: TakeState) -> AudioTakeSummary {

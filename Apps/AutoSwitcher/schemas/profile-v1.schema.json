@@ -152,6 +152,13 @@
                     "null"
                   ]
                 }
+              },
+              "if": {
+                "properties": { "signal": { "const": "audioFeature" } }
+              },
+              "then": {
+                "required": ["name"],
+                "properties": { "name": { "type": "string", "minLength": 1 } }
               }
             }
           }
@@ -159,5 +166,21 @@
       }
     }
   },
+  "allOf": [
+    {
+      "if": { "properties": { "strategy": { "const": "talkingHead" } } },
+      "then": { "properties": { "additional_targets": { "maxItems": 0 } } }
+    },
+    {
+      "if": {
+        "required": ["strategy"],
+        "properties": { "strategy": { "const": "rules" } }
+      },
+      "then": {
+        "required": ["rules"],
+        "properties": { "rules": { "minItems": 1 } }
+      }
+    }
+  ],
   "additionalProperties": false
 }

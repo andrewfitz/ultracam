@@ -556,9 +556,9 @@ struct UIInspectorViewContent: View {
       if snapshot.lutName != nil || snapshot.lutError != nil {
         HStack {
           Spacer()
-          // Asks first only while the LUT is in live use: on air, or burned into a take.
-          Button(liveLUTCameras(camera, snapshot: snapshot).isEmpty ? "Remove LUT" : "Remove LUT…") {
-            if !liveLUTCameras(camera, snapshot: snapshot).isEmpty {
+          let onAir = onAirLUTCameras(camera)
+          Button(onAir.isEmpty ? "Remove LUT" : "Remove LUT…") {
+            if !onAir.isEmpty {
               confirmingLUTRemoval = camera.id
             } else {
               context.send(.forgetLUT(cameraID: camera.id))
@@ -574,7 +574,7 @@ struct UIInspectorViewContent: View {
             }
             Button("Cancel", role: .cancel) { confirmingLUTRemoval = nil }.keyboardShortcut(.defaultAction)
           } message: {
-            Text(lutRemovalMessage(camera: camera, snapshot: snapshot))
+            Text((onAir.map { "\($0.name)'s on-air picture changes at once." } + ["The file on disk is kept."]).joined(separator: " "))
           }
         }
       }
@@ -672,6 +672,7 @@ struct UIInspectorViewContent: View {
   }
 
   nonisolated static func signalText(_ snapshot: UICameraSnapshot) -> String {
+    if snapshot.captureAuthorizationPending { return "Waiting for capture access" }
     switch snapshot.signal {
     case .none: return snapshot.deviceAvailable ? "Capture stopped" : snapshot.inputName == nil ? "No input" : "Input disconnected"
     case .connecting: return "Starting…"
@@ -703,37 +704,11 @@ struct UIInspectorViewContent: View {
     return true
   }
 
-  /// The LUT is changing a picture someone is receiving: the LUT is on, and the camera is
-  /// on air or ISO, or the LUT is burned into the take being recorded.
-  static func lutInLiveUse(camera: UICameraPresentation, snapshot: UICameraSnapshot) -> Bool {
-    camera.lutIsOn && (camera.tally.isRed || burnsIntoTake(snapshot))
-  }
-
-  private static func burnsIntoTake(_ snapshot: UICameraSnapshot) -> Bool {
-    (snapshot.recording.status == .recording || snapshot.recording.status == .paused) && snapshot.recording.takeBurnsInLUT
-  }
-
-  /// The cameras Remove LUT would change live: this one, or with Sync cameras on (which
-  /// removes the LUT from every camera) each camera whose LUT is in live use.
-  private func liveLUTCameras(_ camera: UICameraPresentation, snapshot: UICameraSnapshot)
-    -> [(camera: UICameraPresentation, snapshot: UICameraSnapshot)] {
+  /// Synced removal can change several on-air pictures. A take keeps its LUT snapshot
+  /// from the start of recording even if the camera's live LUT is removed.
+  private func onAirLUTCameras(_ camera: UICameraPresentation) -> [UICameraPresentation] {
     let candidates = context.session.syncCameras ? context.presentation.cameras : [camera]
-    return candidates.compactMap { candidate -> (camera: UICameraPresentation, snapshot: UICameraSnapshot)? in
-      let found: UICameraSnapshot? = candidate.id == camera.id ? snapshot : context.snapshot(candidate.id)
-      guard let current = found,
-        Self.lutInLiveUse(camera: candidate, snapshot: current) else { return nil }
-      return (camera: candidate, snapshot: current)
-    }
-  }
-
-  private func lutRemovalMessage(camera: UICameraPresentation, snapshot: UICameraSnapshot) -> String {
-    let lines = liveLUTCameras(camera, snapshot: snapshot).map { live -> String in
-      let onAir = live.camera.tally.isRed
-      let uses = [onAir ? "on air" : nil, Self.burnsIntoTake(live.snapshot) ? "burned into the recording" : nil]
-        .compactMap { $0 }
-      return "\(live.camera.name)'s LUT is \(uses.joined(separator: " and "))."
-    }
-    return (lines + ["The picture changes at once. The file on disk is kept."]).joined(separator: " ")
+    return candidates.filter { $0.lutEnabled && $0.lutIsOn && $0.tally.isRed }
   }
 }
 

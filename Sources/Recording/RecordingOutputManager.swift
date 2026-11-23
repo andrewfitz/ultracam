@@ -345,7 +345,7 @@ public final class RecordingOutputManager: @unchecked Sendable {
       try session.start()
       return session
     } catch {
-      session.cancelWithoutThrowing()
+      try? session.cancel()
       throw error
     }
   }
@@ -371,13 +371,10 @@ public final class RecordingOutputManager: @unchecked Sendable {
   fileprivate var fileExtension: String { configuration.fileExtension }
   fileprivate var fileManagerRef: FileManager { fileManager }
 
-  /// Only unlink a regular partial file created by this process. Never
-  /// recursively remove a directory or follow an attacker-created symlink.
-  fileprivate func safeTemporaryFileExists(at url: URL) -> Bool {
-    guard fileManager.fileExists(atPath: url.path),
-      let attributes = try? fileManager.attributesOfItem(atPath: url.path),
-      (attributes[.type] as? FileAttributeType) == .typeRegular else { return false }
-    return (try? fileManager.destinationOfSymbolicLink(atPath: url.path)) == nil
+  /// Includes a dangling symlink, which still occupies a take's name.
+  static func pathExists(at url: URL) -> Bool {
+    var info = stat()
+    return lstat(url.path, &info) == 0
   }
   fileprivate var namingRef: RecordingFileNaming { configuration.naming }
 
@@ -402,21 +399,19 @@ public final class RecordingOutputManager: @unchecked Sendable {
   /// Records `session`'s headroom and checks that it, every other live
   /// session's headroom on the volume and every reservation there fit above
   /// the floor, without reserving anything.
-  fileprivate func checkHeadroom(_ headroom: UInt64, for session: ObjectIdentifier) throws {
+  fileprivate func checkHeadroom(_ headroom: UInt64, for session: ObjectIdentifier, resuming: Bool = false) throws {
     volume.lock.lock()
     defer { volume.lock.unlock() }
     let previous = volume.headrooms[session]
-    volume.headrooms[session] = headroom
+    // The paused writer can still have more in flight than the last full rate estimate.
+    let requested = resuming ? max(previous ?? 0, headroom) : headroom
+    volume.headrooms[session] = requested
     do {
       try checkAndReserveLocked(additional: 0)
     } catch {
-      // A rejected check must not leave the failed candidate headroom in the
-      // shared pool and starve otherwise-admissible sessions.
-      if let previous {
-        volume.headrooms[session] = previous
-      } else {
-        volume.headrooms.removeValue(forKey: session)
-      }
+      // Undo a rejected increase. A reduction releases media already drained, even when
+      // the drive is below the floor and a failed recorder makes its final zero-byte claim.
+      volume.headrooms[session] = previous.map { min(requested, $0) }
       throw error
     }
   }
@@ -497,7 +492,7 @@ public final class RecordingOutputManager: @unchecked Sendable {
       return [movie, sidecar, sidecar.appendingPathExtension("journal"),
         feedDirectory.appendingPathComponent(".\(stem).partial"),
         feedDirectory.appendingPathComponent(".\(stem).partial.ultracam-recovery")]
-        .contains { fileManager.fileExists(atPath: $0.path) }
+        .contains { Self.pathExists(at: $0) }
     }
     while Self.issuedPaths.contains(issuedKey(stem)) || onDisk(stem) {
       stem = "\(stemBase)-\(suffix)"
@@ -510,7 +505,7 @@ public final class RecordingOutputManager: @unchecked Sendable {
       Self.isDescendant(final, of: configuration.rootDirectory) else {
       throw RecordingOutputError.unsafePath
     }
-    guard !fileManager.fileExists(atPath: temporary.path), !fileManager.fileExists(atPath: final.path) else {
+    guard !Self.pathExists(at: temporary), !Self.pathExists(at: final) else {
       throw RecordingOutputError.destinationExists
     }
     return RecordingOutputPaths(rootDirectory: configuration.rootDirectory,
@@ -659,7 +654,7 @@ public final class RecordingOutputSession: @unchecked Sendable {
     guard stateValue == .recording else {
       throw RecordingOutputError.invalidState(stateValue, operation: "pause")
     }
-    do { handle?.synchronizeFile() }
+    try handle?.synchronize()
     stateValue = .paused
     // Accepted samples can still be encoding or waiting to reach disk. Keep
     // their last conservative claim until the recorder reports what remains
@@ -682,8 +677,8 @@ public final class RecordingOutputSession: @unchecked Sendable {
     }
     // Other feeds can claim the space released while paused. Re-admit this
     // take before it can accept new samples again.
-    if externalWriterOwnsFile, let lastHeadroom {
-      try manager.checkHeadroom(lastHeadroom, for: ObjectIdentifier(self))
+    if externalWriterOwnsFile {
+      try manager.checkHeadroom(lastHeadroom ?? 0, for: ObjectIdentifier(self), resuming: true)
     }
     stateValue = .recording
   }
@@ -778,8 +773,8 @@ public final class RecordingOutputSession: @unchecked Sendable {
     }
     do {
       if let handle {
-        handle.synchronizeFile()
-        handle.closeFile()
+        try handle.synchronize()
+        try handle.close()
         self.handle = nil
       }
       // The external writer creates the temporary path after admission. Check
@@ -805,7 +800,7 @@ public final class RecordingOutputSession: @unchecked Sendable {
           throw RecordingOutputError.ioFailure("The media writer produced an empty output file.")
         }
       }
-      guard !manager.fileManagerRef.fileExists(atPath: paths.finalFile.path) else {
+      guard !RecordingOutputManager.pathExists(at: paths.finalFile) else {
         throw RecordingOutputError.destinationExists
       }
       if recoveryJournal?.entry.sidecarOwned == true {
@@ -836,19 +831,14 @@ public final class RecordingOutputSession: @unchecked Sendable {
   public func preserveForRecovery(discardingEmptyTake: Bool = false) {
     lock.lock(); defer { lock.unlock() }
     guard stateValue != .finished, stateValue != .cancelled else { return }
-    handle?.synchronizeFile()
-    handle?.closeFile()
+    try? handle?.synchronize()
+    try? handle?.close()
     handle = nil
-    let attributes = try? manager.fileManagerRef.attributesOfItem(atPath: paths.temporaryFile.path)
-    let regular = (attributes?[.type] as? FileAttributeType) == .typeRegular
-    let empty = regular && ((attributes?[.size] as? NSNumber)?.uint64Value ?? 0) == 0
-    // Anything else at the path (a directory, a link) is not this take's to judge or remove.
-    if discardingEmptyTake, attributes == nil || empty {
-      if empty, ownsTemporaryFile, manager.safeTemporaryFileExists(at: paths.temporaryFile) {
-        try? manager.fileManagerRef.removeItem(at: paths.temporaryFile)
+    if discardingEmptyTake {
+      // Keep the journal when the media or its metadata could not be removed.
+      if (try? removeTemporaryFileLocked(onlyIfEmpty: true)) == true {
+        try? removeRecoveryJournalLocked()
       }
-      if recoveryJournal?.entry.sidecarOwned == true { try? RecordingTakeSidecar.removePairedMetadata(for: paths.finalFile) }
-      recoveryJournal?.remove()
     }
     ownsTemporaryFile = false
     recoveryJournal = nil
@@ -861,50 +851,52 @@ public final class RecordingOutputSession: @unchecked Sendable {
     guard stateValue != .finished && stateValue != .cancelled else {
       throw RecordingOutputError.invalidState(stateValue, operation: "cancel")
     }
-    handle?.synchronizeFile()
-    handle?.closeFile()
+    try? handle?.close()
     handle = nil
-    if ownsTemporaryFile && manager.safeTemporaryFileExists(at: paths.temporaryFile) {
-      do { try manager.fileManagerRef.removeItem(at: paths.temporaryFile) }
-      catch {
-        stateValue = .failed
-        releaseReservationLocked()
-        throw RecordingOutputError.ioFailure(error.localizedDescription)
-      }
-    }
     do {
-      if recoveryJournal?.entry.sidecarOwned == true {
-        try RecordingTakeSidecar.removePairedMetadata(for: paths.finalFile)
+      if ownsTemporaryFile {
+        _ = try removeTemporaryFileLocked(onlyIfEmpty: false)
       }
+      try removeRecoveryJournalLocked()
     } catch {
       stateValue = .failed
       releaseReservationLocked()
       throw error
     }
-    recoveryJournal?.remove()
-    recoveryJournal = nil
     stateValue = .cancelled
     releaseReservationLocked()
   }
 
-  fileprivate func cancelWithoutThrowing() {
-    lock.lock(); defer { lock.unlock() }
-    guard stateValue != .finished && stateValue != .cancelled else { return }
-    handle?.closeFile()
-    handle = nil
-    if ownsTemporaryFile, manager.safeTemporaryFileExists(at: paths.temporaryFile) {
-      try? manager.fileManagerRef.removeItem(at: paths.temporaryFile)
+  private func removeTemporaryFileLocked(onlyIfEmpty: Bool) throws -> Bool {
+    guard RecordingOutputManager.isWithin(paths.feedDirectory, of: paths.rootDirectory,
+      allowingRoot: !manager.namingRef.cameraSubfolders) else { throw RecordingOutputError.unsafePath }
+    let path = paths.temporaryFile.path
+    var info = stat()
+    if lstat(path, &info) != 0 {
+      let failure = errno
+      if failure == ENOENT { return true }
+      throw RecordingOutputError.ioFailure(String(cString: strerror(failure)))
     }
-    if recoveryJournal?.entry.sidecarOwned == true { try? RecordingTakeSidecar.removePairedMetadata(for: paths.finalFile) }
+    guard ownsTemporaryFile, (info.st_mode & S_IFMT) == S_IFREG,
+      !onlyIfEmpty || info.st_size == 0 else { return false }
+    if unlink(path) != 0 {
+      let failure = errno
+      if failure != ENOENT { throw RecordingOutputError.ioFailure(String(cString: strerror(failure))) }
+    }
+    return true
+  }
+
+  private func removeRecoveryJournalLocked() throws {
+    if recoveryJournal?.entry.sidecarOwned == true {
+      try RecordingTakeSidecar.removePairedMetadata(for: paths.finalFile)
+    }
     recoveryJournal?.remove()
     recoveryJournal = nil
-    stateValue = .cancelled
-    releaseReservationLocked()
   }
 
   deinit {
     lock.lock()
-    handle?.closeFile()
+    try? handle?.close()
     handle = nil
     releaseReservationLocked()
     lock.unlock()
@@ -925,8 +917,8 @@ public final class RecordingOutputSession: @unchecked Sendable {
       allowingRoot: !manager.namingRef.cameraSubfolders) else {
       throw RecordingOutputError.unsafePath
     }
-    guard !manager.fileManagerRef.fileExists(atPath: paths.temporaryFile.path),
-      !manager.fileManagerRef.fileExists(atPath: paths.finalFile.path) else {
+    guard !RecordingOutputManager.pathExists(at: paths.temporaryFile),
+      !RecordingOutputManager.pathExists(at: paths.finalFile) else {
       throw RecordingOutputError.destinationExists
     }
   }

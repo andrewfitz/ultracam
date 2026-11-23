@@ -26,7 +26,7 @@ import XCTest
     let allocation = NoCopyIngestAllocation(baseAddress: raw, length: 4096, generation: 1)
     var completion: (() -> Void)?
     var released = false
-    let lease = try NoCopyIngestLease(pointer: raw, length: 32, allocation: allocation, inspectVM: { base, length in NoCopyVMRange(baseAddress: base, length: length, generation: 1) },
+    let lease = try NoCopyIngestLease(pointer: raw, length: 32, allocation: allocation, vmPageSize: 4096, inspectVM: { base, length in NoCopyVMRange(baseAddress: base, length: length, generation: 1) },
       frameRelease: { released = true })
     lease.submitGPU { done in completion = done }
     XCTAssertFalse(released)
@@ -40,7 +40,7 @@ import XCTest
     let allocation = NoCopyIngestAllocation(baseAddress: raw, length: 4096, generation: 1)
     var owner: NSObject? = NSObject()
     weak let retainedOwner = owner
-    let lease = try NoCopyIngestLease(pointer: raw, length: 32, allocation: allocation,
+    let lease = try NoCopyIngestLease(pointer: raw, length: 32, allocation: allocation, vmPageSize: 4096,
       inspectVM: { base, length in NoCopyVMRange(baseAddress: base, length: length, generation: 1) },
       frameRelease: { [owner] in withExtendedLifetime(owner) {} },
       onGPUResourcesReleased: { XCTAssertNotNil(retainedOwner) })
@@ -64,9 +64,30 @@ import XCTest
     defer { raw.deallocate() }
     let allocation = NoCopyIngestAllocation(baseAddress: raw, length: 8192, generation: 2)
     XCTAssertThrowsError(try NoCopyIngestLease(pointer: raw.advanced(by: 1), length: 8,
-      allocation: allocation, inspectVM: { _, _ in nil })) { XCTAssertEqual($0 as? NoCopyIngestError, .splitVMRegion) }
+      allocation: allocation, vmPageSize: 4096, inspectVM: { _, _ in nil })) { XCTAssertEqual($0 as? NoCopyIngestError, .splitVMRegion) }
     XCTAssertThrowsError(try NoCopyIngestLease(pointer: raw, length: 8,
-      allocation: allocation, inspectVM: { base, length in NoCopyVMRange(baseAddress: base, length: length, generation: 3) })) { XCTAssertEqual($0 as? NoCopyIngestError, .generationMismatch) }
+      allocation: allocation, vmPageSize: 4096, inspectVM: { base, length in NoCopyVMRange(baseAddress: base, length: length, generation: 3) })) { XCTAssertEqual($0 as? NoCopyIngestError, .generationMismatch) }
+  }
+
+  func testInteriorPageMayBeProvenByContainingVMRegion() throws {
+    let page = Int(getpagesize())
+    let raw = UnsafeMutableRawPointer.allocate(byteCount: 3 * page, alignment: page)
+    defer { raw.deallocate() }
+    let base = UInt(bitPattern: raw)
+    let allocation = NoCopyIngestAllocation(baseAddress: raw, length: 3 * page, generation: 2)
+    let pointer = raw.advanced(by: page + 17)
+    let lease = try NoCopyIngestLease(pointer: pointer, length: 20, allocation: allocation,
+      inspectVM: { _, _ in NoCopyVMRange(baseAddress: base, length: 3 * page, generation: 2) })
+    XCTAssertEqual(lease.roundedBaseAddress, base + UInt(page))
+    XCTAssertEqual(lease.roundedLength, page)
+    XCTAssertEqual(lease.pixelOffset, 17)
+    XCTAssertThrowsError(try NoCopyIngestLease(pointer: pointer, length: 20, allocation: allocation, vmPageSize: page,
+      inspectVM: { _, _ in NoCopyVMRange(baseAddress: base, length: 2 * page - 1, generation: 2) })) {
+      XCTAssertEqual($0 as? NoCopyIngestError, .splitVMRegion)
+    }
+    XCTAssertThrowsError(try NoCopyIngestLease(pointer: pointer, length: 20, allocation: allocation, vmPageSize: 3)) {
+      XCTAssertEqual($0 as? NoCopyIngestError, .invalidVMPageSize)
+    }
   }
 
   func testOverflowAndOutsideAllocationAreRejected() {

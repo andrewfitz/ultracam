@@ -44,19 +44,16 @@ struct DerivedOutputContract {
       kCMFormatDescriptionExtension_PixelAspectRatio, kCMFormatDescriptionExtension_FieldCount,
       kCMFormatDescriptionExtension_FieldDetail, kCMFormatDescriptionExtension_ChromaLocationTopField,
       kCMFormatDescriptionExtension_ChromaLocationBottomField]
-    // Required colour fields have no implicit compatibility fallback.
-    for key in keys.prefix(3) {
-      guard CMFormatDescriptionGetExtension(requested, extensionKey: key) != nil,
-        CMFormatDescriptionGetExtension(published, extensionKey: key) != nil else { return false }
-    }
-    return keys.allSatisfy { key in
+    return keys.enumerated().allSatisfy { index, key in
       let lhs = CMFormatDescriptionGetExtension(requested, extensionKey: key)
       let rhs = CMFormatDescriptionGetExtension(published, extensionKey: key)
+      // The first three colour fields are mandatory.
+      if index < 3 && (lhs == nil || rhs == nil) { return false }
       if key == kCMFormatDescriptionExtension_FullRangeVideo {
         // CoreMedia may omit range metadata. The exact native FourCC
         // defines its default; explicit contradictory tags remain distinct.
-        if let lhs, !(lhs is Bool) { return false }
-        if let rhs, !(rhs is Bool) { return false }
+        if let lhs, CFGetTypeID(lhs) != CFBooleanGetTypeID() { return false }
+        if let rhs, CFGetTypeID(rhs) != CFBooleanGetTypeID() { return false }
         let nativeFullRange = CMFormatDescriptionGetMediaSubType(requested) == kCVPixelFormatType_422YpCbCr10BiPlanarFullRange
         return (lhs as? Bool ?? nativeFullRange) == (rhs as? Bool ?? nativeFullRange)
       }

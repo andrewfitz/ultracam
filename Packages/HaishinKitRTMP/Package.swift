@@ -10,6 +10,7 @@ let package = Package(
     .target(name: "HaishinKit", dependencies: ["Logboard"],
       swiftSettings: [.enableUpcomingFeature("ExistentialAny")]),
     .target(name: "RTMPHaishinKit", dependencies: ["HaishinKit"],
+      exclude: ["RTMP/RTMPStream_Mac-Studio.local_Nov-22-122617-2026_Conflict.swift"],
       swiftSettings: [.enableUpcomingFeature("ExistentialAny")]),
     .testTarget(name: "RTMPHaishinKitTests", dependencies: ["RTMPHaishinKit"])
   ])

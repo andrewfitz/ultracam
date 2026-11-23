@@ -21,7 +21,7 @@ struct Parameters {
   uint4 outputConversion;
   float4 scaling; // scaled source width/height, signed canvas origin
 };
-static_assert(sizeof(Parameters) == 208, "Parameters is LUTProcessor.Parameters: ten 16-byte rows");
+static_assert(sizeof(Parameters) == 208, "Parameters must match LUTProcessor.Parameters");
 
 float3 decode(float y, float2 c, constant Parameters &p) {
   float luma = (y - p.decodeRange.x) / p.decodeRange.y;
@@ -137,14 +137,18 @@ struct RGBSource {
   }
 };
 
-// Explicit SDR transfer/gamut conversion, in linear light. IDs mirror Swift.
+// Explicit transfer/gamut conversion in linear light. IDs mirror Swift.
 inline float decodeTransfer(float v, uint t) {
   float a = abs(v), sign = v < 0 ? -1.0f : 1.0f;
   if (t == 4) {
     float n = pow(max(v, 0.0f), 1.0f / 78.84375f);
     return 100.0f * pow(max(n - .8359375f, 0.0f) / max(18.8515625f - 18.6875f * n, 1e-7f), 1.0f / .1593017578125f);
   }
-  if (t == 5) return v <= .5f ? v * v / 3.0f : (exp((v - .55991073f) / .17883277f) + .28466892f) / 12.0f;
+  if (t == 5) {
+    // HLG below nominal black must stay black through the inverse OETF.
+    float signal = max(v, 0.0f);
+    return signal <= .5f ? signal * signal / 3.0f : (exp((signal - .55991073f) / .17883277f) + .28466892f) / 12.0f;
+  }
   if (t == 2) return sign * (a < 0.081f ? a / 4.5f : pow((a + 0.099f) / 1.099f, 1.0f / 0.45f));
   if (t == 3) return sign * (a <= 0.04045f ? a / 12.92f : pow((a + 0.055f) / 1.055f, 2.4f));
   return v;
@@ -285,6 +289,13 @@ inline void horizontalPass(Source s, texture3d<float, access::sample> lut, textu
     if (float(ox) < p.scaling.z || float(ox) >= p.scaling.z + p.scaling.x) {
       out.write(float4(0), uint2(ox, group.y)); return;
     }
+    // At unit scale the Lanczos kernel is one at the source pixel and zero
+    // at every other integer tap. Padding and cropping shift by whole pixels.
+    if (p.scaling.x == float(p.geometry.x)) {
+      uint sourceX = uint(int(ox) - int(p.scaling.z));
+      out.write(float4(graded(s, sourceX, group.y, lut, p), 1), uint2(ox, group.y));
+      return;
+    }
     float scale = float(p.geometry.x) / p.scaling.x;
     float filterScale = max(scale, 1.0f);
     float center = (float(ox) - p.scaling.z + 0.5f) * scale - 0.5f;
@@ -337,6 +348,9 @@ kernel void horizontalPlanar(texture2d<float, access::read> luma [[texture(0)]],
 // Pass 2: vertical Lanczos + output encode, one thread per output block.
 inline float3 vertical(texture2d<float, access::read> input, uint x, uint y, uint outputHeight, constant Parameters &p) {
   if (float(y) < p.scaling.w || float(y) >= p.scaling.w + p.scaling.y) return float3(0);
+  if (p.scaling.y == float(input.get_height())) {
+    return input.read(uint2(x, uint(int(y) - int(p.scaling.w)))).rgb;
+  }
   if (input.get_height() != outputHeight * 2 || p.scaling.y != outputHeight || p.scaling.w != 0) {
     float scale = float(input.get_height()) / p.scaling.y;
     float filterScale = max(scale, 1.0f);

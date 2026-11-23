@@ -24,6 +24,7 @@ import XCTest
     var statisticsDelay: TimeInterval = 0
     var reportsUpload = true
     var lose: (@Sendable (ProgramStreamDisconnectReason) -> Void)?
+    var epochs: [(time: CMTime, includesAudio: Bool)] = []
     var pictures: [CMTime] = []
     var pcm: [(UInt64, [Float])] = []
     var pcmRight: [[Float]] = []
@@ -40,6 +41,9 @@ import XCTest
           else { continuation.resume() }
         }
       }
+    }
+    func setMediaEpoch(_ epoch: CMTime, includesAudio: Bool) {
+      lock.withLock { epochs.append((epoch, includesAudio)) }
     }
     func appendVideo(_ sample: CMSampleBuffer) { lock.withLock { pictures.append(sample.presentationTimeStamp) } }
     func appendAudio(_ buffer: AVAudioPCMBuffer, at time: AVAudioTime) {
@@ -502,6 +506,61 @@ import XCTest
     for channel in 0..<2 { buffer.floatChannelData![channel].initialize(repeating: 0.5, count: 1600) }
     return buffer
   }
+
+  func testAudioTapRejectsPartialOverlapAndKeepsItsSampleGrid() throws {
+    let tap = ProgramStreamAudioTap(pairIndex: 0) { _, _ in }
+    defer { tap.stop() }
+    let format = try SourceAudioFormat(sampleRate: 48_000, channels: 1, sample: .int16,
+      interleaved: true, layout: AudioChannelMap(), clock: .hostTime)
+    let epoch = CaptureEpochID(sessionID: UUID(), epoch: 1)
+    let start = 120 * Int64(48_000)
+    for offset: Int64 in [0, 240, 480] {
+      let packet = try CaptureAudioPacket(planes: [Data(count: 960)], sampleFrameCount: 480,
+        format: format, packetTime: CMTime(value: start + offset, timescale: 48_000))
+      tap.ingest(packet, epoch: epoch, pairedHostTime: nil, audioMapping: nil)
+      tap.drainForTesting()
+    }
+    XCTAssertEqual(tap.statistics.packets, 2)
+    XCTAssertEqual(tap.statistics.dropped, 1)
+    XCTAssertEqual(tap.statistics.lastHostTime, CMTime(value: start + 479, timescale: 48_000))
+  }
+
+  func testAudioTapRequiresARealPacketToEstablishItsPairedClock() throws {
+    let tap = ProgramStreamAudioTap(pairIndex: 0) { _, _ in }
+    defer { tap.stop() }
+    let format = try SourceAudioFormat(sampleRate: 48_000, channels: 1, sample: .int16,
+      interleaved: true, layout: AudioChannelMap(), clock: .pairedWithFrames)
+    let epoch = CaptureEpochID(sessionID: UUID(), epoch: 1)
+    let host = CMTime(value: 120, timescale: 1)
+    let empty = try CaptureAudioPacket(planes: [Data()], sampleFrameCount: 0, format: format, packetTime: .zero)
+    let valid = try CaptureAudioPacket(planes: [Data(count: 960)], sampleFrameCount: 480,
+      format: format, packetTime: CMTime(value: 480, timescale: 48_000))
+    tap.ingest(empty, epoch: epoch, pairedHostTime: host, audioMapping: nil)
+    tap.ingest(valid, epoch: epoch, pairedHostTime: nil, audioMapping: nil)
+    tap.drainForTesting()
+    XCTAssertEqual(tap.statistics.dropped, 2)
+    XCTAssertEqual(tap.statistics.packets, 0)
+    tap.ingest(valid, epoch: epoch, pairedHostTime: host, audioMapping: nil)
+    tap.drainForTesting()
+    XCTAssertEqual(tap.statistics.packets, 1)
+    XCTAssertEqual(tap.statistics.lastHostTime, host)
+  }
+  func testMediaEpochCarriesTheProfilesAudioSetting() throws {
+    for includesAudio in [false, true] {
+      let media = ProgramStreamMedia(wantsAudio: includesAudio)
+      let sink = Sink()
+      media.attach(sink)
+      for frame in 0..<5 {
+        media.video(try video(48_000 + Int64(frame * 1_600)), fresh: true)
+      }
+      XCTAssertEqual(sink.epochs.count, 1)
+      let epoch = try XCTUnwrap(sink.epochs.first)
+      XCTAssertEqual(epoch.time, sink.pictures.first)
+      XCTAssertEqual(epoch.includesAudio, includesAudio)
+      XCTAssertEqual(sink.pcm.isEmpty, !includesAudio)
+    }
+  }
+
   func testEveryStreamCadenceEmitsExactContinuousStereoPCMIntervals() throws {
     let format = try XCTUnwrap(AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 2))
     let base: Int64 = 48_000

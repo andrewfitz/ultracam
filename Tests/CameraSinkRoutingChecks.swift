@@ -42,12 +42,38 @@ import XCTest
 
   @MainActor func testDemandFindsSourceStreamAfterCameraRename() {
     // The extension published these names before "Feed 1" became "Camera 1".
-    let published: [(id: UInt32, name: String)] = [(7, "Ultracam · Feed 1 Input"), (8, "Ultracam · Feed 1")]
-    XCTAssertEqual(CameraDemandMonitor.sourceStream(published, named: "Ultracam · Camera 1"), 8)
-    XCTAssertEqual(CameraDemandMonitor.sourceStream(published, named: "Ultracam · Feed 1"), 8)
-    XCTAssertEqual(CameraDemandMonitor.sourceStream(published, named: "Ultracam · Feed 1 Input"), 8,
+    let published: [CameraStreamNames.Stream] = [(7, "Ultracam · Feed 1 Input", nil), (8, "Ultracam · Feed 1", nil)]
+    XCTAssertEqual(CameraStreamNames.source(published, named: "Ultracam · Camera 1"), 8)
+    XCTAssertEqual(CameraStreamNames.source(published, named: "Ultracam · Feed 1"), 8)
+    XCTAssertEqual(CameraStreamNames.source(published, named: "Ultracam · Feed 1 Input"), 8,
       "Renaming a camera to the old sink name must still monitor its source")
-    XCTAssertNil(CameraDemandMonitor.sourceStream([(7, "Ultracam · Feed 1 Input")], named: "Ultracam · Camera 1"))
+    XCTAssertNil(CameraStreamNames.source([(7, "Ultracam · Feed 1 Input", nil)], named: "Ultracam · Camera 1"))
+  }
+
+  func testLegacyFeedRetainsSourceDemandAfterRenameWithFixedSinkName() {
+    let streams: [CameraStreamNames.Stream] = [
+      (7, VideoContract.sinkName, CameraStreamNames.sinkDirection),
+      (8, "Ultracam · Original", nil),
+    ]
+    XCTAssertEqual(CameraStreamNames.source(streams, named: "Ultracam · Renamed"), 8)
+    XCTAssertNil(CameraStreamNames.source([streams[0]], named: VideoContract.sinkName))
+  }
+
+  func testNamesCannotOverrideReportedStreamDirections() {
+    let twoSinks: [CameraStreamNames.Stream] = [(7, "Camera Input", 0), (8, "Camera", 0)]
+    XCTAssertNil(CameraStreamNames.pair(twoSinks, sinkName: "Camera Input", sourceName: "Camera"))
+    XCTAssertNil(CameraStreamNames.source(twoSinks, named: "Camera"))
+
+    let twoSources: [CameraStreamNames.Stream] = [(7, "Camera Input", 1), (8, "Camera", 1)]
+    XCTAssertNil(CameraStreamNames.pair(twoSources, sinkName: "Camera Input", sourceName: "Camera"))
+  }
+
+  func testDirectedStreamsRemainUsableWithoutNames() {
+    let unnamed: [CameraStreamNames.Stream] = [(7, "", 0), (8, "", 1)]
+    let pair = CameraStreamNames.pair(unnamed, sinkName: "Camera Input", sourceName: "Camera")
+    XCTAssertEqual(pair?.sink, 7)
+    XCTAssertEqual(pair?.source, 8)
+    XCTAssertEqual(CameraStreamNames.source(unnamed, named: "Camera"), 8)
   }
 
   @MainActor func testSourceNamedInputIsNotChosenAsTheSink() {
@@ -58,7 +84,7 @@ import XCTest
     let paired = CameraStreamNames.pair(streams, sinkName: "Renamed Input", sourceName: "Renamed")
     XCTAssertEqual(paired?.sink, 2)
     XCTAssertEqual(paired?.source, 1)
-    XCTAssertEqual(CameraDemandMonitor.sourceStream([(1, "Input Cam"), (2, "Input Cam Input")], named: "Renamed"), 1)
+    XCTAssertEqual(CameraStreamNames.source(streams, named: "Renamed"), 1)
     // DAL direction 0 is an output stream (the sink), 1 an input stream (the source).
     let directed = CameraStreamNames.pair([
       (3, "Not the source", 1),

@@ -35,8 +35,11 @@ struct AutoSwitcherTranscriptCue: Codable, Equatable, Sendable {
 }
 
 enum AutoSwitcherControlEvent: Equatable, Sendable {
+  case tick(time: Double)
   case health(cameraID: String, healthy: Bool, time: Double)
   case manualOverride(cameraID: String, time: Double)
+  case acknowledge(decisionID: UUID, time: Double?)
+  case reject(decisionID: UUID)
   case reset
 }
 
@@ -44,55 +47,47 @@ enum AutoSwitcherControlEvent: Equatable, Sendable {
 /// frames and never applies a cut itself; the host acknowledges a cut after
 /// ProgramOutputRoute applies the target frame.
 final class AutoSwitcherBridge: @unchecked Sendable {
-  typealias InstructionHandler = @Sendable (AutoSwitcherInstruction) -> Void
-  typealias ErrorHandler = @Sendable (String) -> Void
-  typealias ExpiredHandler = @Sendable (UUID) -> Void
-  typealias AudioCueHandler = @Sendable (AutoSwitcherAudioCue) -> Void
-  typealias ControlEventHandler = @Sendable (AutoSwitcherControlEvent) -> Void
-  typealias TranscriptCueHandler = @Sendable (AutoSwitcherTranscriptCue) -> Void
+  enum Event: Sendable {
+    case instruction(AutoSwitcherInstruction)
+    case error(String, connectionLost: Bool)
+    case decisionExpired(UUID)
+    case audio(AutoSwitcherAudioCue)
+    case control(AutoSwitcherControlEvent)
+    case transcript(AutoSwitcherTranscriptCue)
+  }
 
   private let queue = DispatchQueue(label: "org.ultracam.auto-switcher",
     qos: .userInteractive)
   private let stateLock = NSLock()
   private let queueKey = DispatchSpecificKey<UInt8>()
   private var handle: SwitcherProcess?
-  private var _connectionLost = false
-  var connectionLost: Bool { stateLock.withLock { _connectionLost } }
-  private var _lastError: String?
-  private var _onInstruction: InstructionHandler?
-  private var _onError: ErrorHandler?
-  private var _onDecisionExpired: ExpiredHandler?
-  private var _onAudioCue: AudioCueHandler?
-  private var _onControlEvent: ControlEventHandler?
-  private var _onTranscriptCue: TranscriptCueHandler?
+  private var events: [Event] = []
+  private var onEventsReady: (@Sendable () -> Void)?
 
-  private(set) var lastError: String? {
-    get { stateLock.withLock { _lastError } }
-    set { stateLock.withLock { _lastError = newValue } }
+  /// One wakeup for an ordered batch. The consumer can also drain the final
+  /// batch synchronously after stopping the worker.
+  func setEventsReadyHandler(_ handler: @escaping @Sendable () -> Void) {
+    let ready = stateLock.withLock {
+      onEventsReady = handler
+      return !events.isEmpty
+    }
+    if ready { handler() }
   }
-  var onInstruction: InstructionHandler? {
-    get { stateLock.withLock { _onInstruction } }
-    set { stateLock.withLock { _onInstruction = newValue } }
+
+  func takeEvents() -> [Event] {
+    stateLock.withLock {
+      let pending = events
+      events = []
+      return pending
+    }
   }
-  var onError: ErrorHandler? {
-    get { stateLock.withLock { _onError } }
-    set { stateLock.withLock { _onError = newValue } }
-  }
-  var onDecisionExpired: ExpiredHandler? {
-    get { stateLock.withLock { _onDecisionExpired } }
-    set { stateLock.withLock { _onDecisionExpired = newValue } }
-  }
-  var onAudioCue: AudioCueHandler? {
-    get { stateLock.withLock { _onAudioCue } }
-    set { stateLock.withLock { _onAudioCue = newValue } }
-  }
-  var onControlEvent: ControlEventHandler? {
-    get { stateLock.withLock { _onControlEvent } }
-    set { stateLock.withLock { _onControlEvent = newValue } }
-  }
-  var onTranscriptCue: TranscriptCueHandler? {
-    get { stateLock.withLock { _onTranscriptCue } }
-    set { stateLock.withLock { _onTranscriptCue = newValue } }
+
+  private func enqueue(_ event: Event) {
+    let handler = stateLock.withLock {
+      events.append(event)
+      return events.count == 1 ? onEventsReady : nil
+    }
+    handler?()
   }
 
   init?(settings: NaturalTalkingHeadSettings, anchor: FeedID, emphasis: FeedID, availableRoutes: [FeedID] = []) {
@@ -199,29 +194,29 @@ final class AutoSwitcherBridge: @unchecked Sendable {
       confidence: max(0, min(1, confidence)), isFinal: isFinal, sessionGeneration: 0)
     queue.async { [weak self] in
       guard let self, self.handle != nil else { return }
-      let transcriptCueHandler = self.onTranscriptCue
-      transcriptCueHandler?(cue)
       self.send([
         "type": "transcript",
         "cue": ["segment_id": segmentID, "revision": revision, "start": start,
                  "end": end, "kind": kind, "confidence": cue.confidence,
                  "is_final": isFinal, "session_generation": 0],
-      ])
+      ], recordedInput: .transcript(cue))
     }
   }
 
   func acknowledge(decisionID: UUID, appliedAt: CMTime?) {
+    let time = appliedAt.flatMap(seconds)
     queue.async { [weak self] in
       guard let self else { return }
       var event: [String: Any] = ["type": "acknowledge", "decision_id": decisionID.uuidString]
-      if let appliedAt, let seconds = seconds(appliedAt) { event["applied_at"] = seconds }
-      self.send(event)
+      if let time { event["applied_at"] = time }
+      self.send(event, recordedInput: .control(.acknowledge(decisionID: decisionID, time: time)))
     }
   }
 
   func reject(decisionID: UUID) {
     queue.async { [weak self] in
-      self?.send(["type": "reject", "decision_id": decisionID.uuidString])
+      self?.send(["type": "reject", "decision_id": decisionID.uuidString],
+        recordedInput: .control(.reject(decisionID: decisionID)))
     }
   }
 
@@ -256,7 +251,7 @@ final class AutoSwitcherBridge: @unchecked Sendable {
     return CMTime(value: value, timescale: 240_000).validValue
   }
 
-  private func send(_ event: [String: Any]) {
+  private func send(_ event: [String: Any], recordedInput: Event? = nil) {
     guard let handle,
       let data = try? JSONSerialization.data(withJSONObject: event),
       let json = String(data: data, encoding: .utf8) else { return }
@@ -265,74 +260,72 @@ final class AutoSwitcherBridge: @unchecked Sendable {
       let response = try handle.exchange(json)
       output = response == "[]" ? nil : response
     } catch {
-      stateLock.withLock { _connectionLost = true }
-      report("Auto Switcher connection closed: \(error.localizedDescription)")
       handle.close()
       self.handle = nil
+      enqueue(.error("Auto Switcher connection closed: \(error.localizedDescription)", connectionLost: true))
       return
     }
+    if let recordedInput { enqueue(recordedInput) }
     // Capture control inputs on the same serialized path as audio. In
     // particular, a clock rebase is reset + health + manual override.
     switch event["type"] as? String {
-    case "reset": onControlEvent?(.reset)
+    case "reset": enqueue(.control(.reset))
+    case "tick":
+      if let time = event["time"] as? Double { enqueue(.control(.tick(time: time))) }
     case "video":
       if let observation = event["observation"] as? [String: Any],
         let camera = observation["camera_id"] as? String,
         let healthy = observation["healthy"] as? Bool, let time = observation["time"] as? Double {
-        onControlEvent?(.health(cameraID: camera, healthy: healthy, time: time))
+        enqueue(.control(.health(cameraID: camera, healthy: healthy, time: time)))
       }
     default: break
     }
     guard let output else { return }
     guard let data = output.data(using: .utf8),
       let values = try? JSONDecoder().decode([RustOutput].self, from: data) else {
-      report("Rust auto-switcher returned invalid JSON")
+      enqueue(.error("Rust auto-switcher returned invalid JSON", connectionLost: false))
       return
     }
     for value in values {
       switch value.type {
       case "audioCue":
-        if let cue = value.cue { onAudioCue?(cue) }
+        if let cue = value.cue { enqueue(.audio(cue)) }
       case "cut":
         guard let instruction = value.instruction,
           let target = instruction.targetCameraID,
           let decisionID = UUID(uuidString: instruction.decisionID),
           let cutTime = Self.instructionTime(seconds: instruction.cutTime),
           let expiresAt = Self.instructionTime(seconds: instruction.expiresAt) else { continue }
-        let instructionHandler = onInstruction
-        instructionHandler?(AutoSwitcherInstruction(decisionID: decisionID,
+        enqueue(.instruction(AutoSwitcherInstruction(decisionID: decisionID,
           sessionGeneration: instruction.sessionGeneration,
           targetCameraID: FeedID(rawValue: target), cutTime: cutTime,
           expiresAt: expiresAt, confidence: instruction.confidence,
-          reason: instruction.reason, forced: instruction.forced))
+          reason: instruction.reason, forced: instruction.forced)))
       case "status":
         // An override can be rejected or snapped forward by the director.
         // Persist its accepted clock and camera, rather than the raw request.
         if event["type"] as? String == "manualOverride",
           let camera = value.currentCameraID, let time = value.time,
           value.pendingDecisionID == nil {
-          onControlEvent?(.manualOverride(cameraID: camera, time: time))
+          enqueue(.control(.manualOverride(cameraID: camera, time: time)))
         }
-      case "error": report(value.message ?? "Rust auto-switcher error")
+      case "error": enqueue(.error(value.message ?? "Rust auto-switcher error", connectionLost: false))
       case "decisionExpired":
         if let decisionID = value.decisionID.flatMap(UUID.init(uuidString:)) {
-          let expiredHandler = onDecisionExpired
-          expiredHandler?(decisionID)
+          enqueue(.decisionExpired(decisionID))
         }
       default: break
       }
     }
   }
 
-  private func report(_ message: String) {
-    lastError = message
-    let errorHandler = onError
-    errorHandler?(message)
-  }
-
   private func seconds(_ time: CMTime) -> Double? { secondsValue(time) }
 
-
+  #if ULTRACAM_TEST_SUPPORT
+  func enqueueEventForTesting(_ event: Event) {
+    queue.async { [weak self] in self?.enqueue(event) }
+  }
+  #endif
 }
 
 private struct RustOutput: Decodable {

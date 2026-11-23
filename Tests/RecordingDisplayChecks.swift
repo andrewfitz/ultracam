@@ -200,12 +200,52 @@ import XCTest
     return UIPresentationBuilder.camera(camera, index: 0, in: session)
   }
 
+  func testPreparingATakeShowsStartingAndAllowsStopBeforePause() {
+    var camera = camera(signal: .noSignal)
+    camera.recording.status = .recording
+    camera.recording.isStarting = true
+    let starting = presented(camera)
+    XCTAssertEqual(starting.stripState, .starting)
+    XCTAssertEqual(starting.recordTitle, "Starting recording…")
+    XCTAssertTrue(starting.recordButtonActive)
+    XCTAssertTrue(starting.recordButtonEnabled)
+    XCTAssertNil(starting.pauseTitle)
+    XCTAssertNil(starting.dropsLine)
+    var session = UISessionSnapshot()
+    session.cameras = [camera]
+    let preparation = UIPresentationBuilder.session(session)
+    XCTAssertFalse(preparation.canPauseAll)
+    XCTAssertEqual(preparation.recordControl, .stop)
+    XCTAssertEqual(preparation.recordingSummary, "Starting recording…")
+
+    camera.recording.isStarting = false
+    session.cameras = [camera]
+    XCTAssertEqual(presented(camera).stripState, .recordingNoSignal)
+    XCTAssertEqual(presented(camera).pauseTitle, "Pause")
+    XCTAssertTrue(UIPresentationBuilder.session(session).canPauseAll)
+  }
+
   func testSavedOutlastsAStop() {
     XCTAssertEqual(presented(camera(running: false)).stripState, .saved, "The take's result is still the news")
     XCTAssertEqual(presented(camera(signal: .noSignal)).stripState, .saved)
     var next = camera(running: false)
     next.recording.savedFileName = nil
     XCTAssertEqual(presented(next).stripState, .stopped)
+  }
+
+  func testFailedPreparationDoesNotReportThePriorSavedTakeInItsAlert() {
+    var camera = camera()
+    camera.recording.failedToStart = true
+    camera.recording.error = "Could not prepare the encoder."
+    XCTAssertEqual(presented(camera).recordTitle, "Couldn't start recording")
+    XCTAssertEqual(presented(camera).recordDetail, camera.recording.error)
+    XCTAssertNil(UIPresentationBuilder.takeSavedLine(camera))
+
+    var session = UISessionSnapshot()
+    session.cameras = [camera]
+    let problem = UIPresentationBuilder.problems(session).first { $0.id == "take.\(camera.id)" }
+    XCTAssertEqual(problem?.title, "Couldn't start recording")
+    XCTAssertEqual(problem?.alert?.body, camera.recording.error)
   }
 
   func testSavedKeepsItsLostFrames() {

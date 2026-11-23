@@ -377,13 +377,15 @@ public enum EmbeddedAudioRecording {
   private static func makeSampleBuffer(sampleFrameCount: Int,
     presentationTime: CMTime,
     fill: (UnsafeMutableRawPointer) -> Void) throws -> CMSampleBuffer {
+    let (outputBytes, overflow) = sampleFrameCount.multipliedReportingOverflow(
+      by: EmbeddedAudioFormat.recordingBytesPerFrame)
+    guard !overflow else { throw EmbeddedAudioError.sizeOverflow }
     let formatDescription = try cachedFormat.result.get()
     var status: OSStatus
     var blockBuffer: CMBlockBuffer?
     // Allocate storage owned by CoreMedia. Passing Data's pointer directly
     // would leave a sample buffer referring to storage that can be released as
     // soon as this method returns.
-    let outputBytes = sampleFrameCount * EmbeddedAudioFormat.recordingBytesPerFrame
     status = CMBlockBufferCreateWithMemoryBlock(
       allocator: kCFAllocatorDefault,
       memoryBlock: nil,

@@ -19,6 +19,9 @@ struct CapturedCPUMemoryFrame: @unchecked Sendable {
   let allocation: NoCopyIngestAllocation
   let inspectVM: NoCopyVMInspector
   let frameOwner: AnyObject
+  // Plane geometry and the declared allocation range are immutable. VM evidence
+  // still belongs to the instant a GPU lease is acquired.
+  private let storage: Result<(layouts: [CPUMemoryPlaneLayout], length: Int), Error>
 
   init(pointer: UnsafeRawPointer, width: Int, height: Int, bytesPerRow: Int,
     allocation: NoCopyIngestAllocation, inspectVM: @escaping NoCopyVMInspector,
@@ -26,11 +29,17 @@ struct CapturedCPUMemoryFrame: @unchecked Sendable {
     planes: [Plane]? = nil) {
     self.pointer = pointer; self.width = width; self.height = height
     self.bytesPerRow = bytesPerRow; self.pixelFormat = pixelFormat
-    self.planes = planes ?? [Plane(offset: 0, bytesPerRow: bytesPerRow, height: height)]
+    let planes = planes ?? [Plane(offset: 0, bytesPerRow: bytesPerRow, height: height)]
+    self.planes = planes
     self.allocation = allocation; self.inspectVM = inspectVM; self.frameOwner = frameOwner
+    storage = Result {
+      try Self.validateStorage(pointer: pointer, width: width, height: height, bytesPerRow: bytesPerRow,
+        pixelFormat: pixelFormat, planes: planes, allocation: allocation)
+    }
   }
 
-  func validatedPlaneLayouts() throws -> [CPUMemoryPlaneLayout] {
+  private static func validateStorage(pointer: UnsafeRawPointer, width: Int, height: Int, bytesPerRow: Int,
+    pixelFormat: OSType, planes: [Plane], allocation: NoCopyIngestAllocation) throws -> (layouts: [CPUMemoryPlaneLayout], length: Int) {
     let layouts = try CPUMemoryPlaneLayout.planes(pixelFormat: pixelFormat, width: width, height: height)
     guard planes.count == layouts.count, planes.first?.bytesPerRow == bytesPerRow else { throw NoCopyIngestError.invalidLength }
     var previousEnd = 0
@@ -39,34 +48,25 @@ struct CapturedCPUMemoryFrame: @unchecked Sendable {
         plane.bytesPerRow >= layout.minimumRowBytes,
         (pixelFormat == 0x5231324c || plane.bytesPerRow.isMultiple(of: layout.componentBytes)),
         (pixelFormat == 0x5231324c || plane.offset.isMultiple(of: layout.componentBytes)) else { throw NoCopyIngestError.invalidLength }
-      let extent = plane.bytesPerRow.multipliedReportingOverflow(by: plane.height)
+      // The stride locates each row. Both ingest paths read only the active
+      // bytes in the final row, so its trailing padding need not be owned.
+      let lastRow = plane.bytesPerRow.multipliedReportingOverflow(by: plane.height - 1)
+      let extent = lastRow.partialValue.addingReportingOverflow(layout.minimumRowBytes)
       let end = plane.offset.addingReportingOverflow(extent.partialValue)
-      guard !extent.overflow, !end.overflow else { throw NoCopyIngestError.arithmeticOverflow }
+      guard !lastRow.overflow, !extent.overflow, !end.overflow else { throw NoCopyIngestError.arithmeticOverflow }
       previousEnd = end.partialValue
     }
-    return layouts
-  }
-
-  func minimumRowBytes() throws -> Int {
-    try CPUMemoryPlaneLayout.planes(pixelFormat: pixelFormat, width: width, height: height)[0].minimumRowBytes
-  }
-
-  /// CPU compatibility may read only this owned range; VM page rounding is
-  /// separately established when requesting a no-copy GPU lease.
-  func validatedCPUReadableLength() throws -> Int {
-    _ = try validatedPlaneLayouts()
-    let last = planes.last!
-    let extent = last.bytesPerRow.multipliedReportingOverflow(by: last.height)
-    let length = last.offset.addingReportingOverflow(extent.partialValue)
-    guard !extent.overflow, !length.overflow else { throw NoCopyIngestError.arithmeticOverflow }
     guard allocation.length > 0 else { throw NoCopyIngestError.invalidLength }
     let start = UInt(bitPattern: pointer)
-    let end = start.addingReportingOverflow(UInt(length.partialValue))
+    let end = start.addingReportingOverflow(UInt(previousEnd))
     let allocationEnd = allocation.baseAddress.addingReportingOverflow(UInt(allocation.length))
     guard !end.overflow, !allocationEnd.overflow else { throw NoCopyIngestError.arithmeticOverflow }
     guard start >= allocation.baseAddress, end.partialValue <= allocationEnd.partialValue else { throw NoCopyIngestError.outsideAllocation }
-    return length.partialValue
+    return (layouts, previousEnd)
   }
+
+  func validatedPlaneLayouts() throws -> [CPUMemoryPlaneLayout] { try storage.get().layouts }
+  func validatedCPUReadableLength() throws -> Int { try storage.get().length }
 
   func lease() throws -> NoCopyIngestLease {
     let length = try validatedCPUReadableLength()

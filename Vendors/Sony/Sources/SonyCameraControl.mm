@@ -540,7 +540,8 @@ struct SonyState {
   std::map<std::string, SonySession> sessions;
 };
 
-static bool sonyCloseSession(SonySession &session) {
+static bool sonyCloseSession(SonySession &session,
+    CrError (*releaseDevice)(CrDeviceHandle) = SCRSDK::ReleaseDevice) {
   if (!session.handle) return true;
   bool disconnected;
   { std::lock_guard<std::mutex> lock(session.callback->mutex); disconnected = session.callback->disconnected; }
@@ -550,10 +551,9 @@ static bool sonyCloseSession(SonySession &session) {
     session.callback->condition.wait_for(lock, std::chrono::seconds(3), [&] { return session.callback->disconnected; });
     disconnected = session.callback->disconnected;
   }
-  // Sony forbids ReleaseDevice before OnDisconnected. A timeout is not an
-  // acknowledgement: keep the callback and handle alive until it arrives.
-  if (!disconnected) return false;
-  SCRSDK::ReleaseDevice(session.handle);
+  // Keep the callback and handle alive until Sony acknowledges disconnection
+  // and successfully releases the device.
+  if (!disconnected || releaseDevice(session.handle)) return false;
   session.handle = 0;
   return true;
 }
@@ -1028,7 +1028,7 @@ static SonyRuntime &sonyRuntime() {
     auto found = self->_sony->sessions.find(feedID.UTF8String);
     if (found != self->_sony->sessions.end()) {
       if (![self closeSession:found->second]) {
-        [self reply:reply object:nil error:@"Sony has not acknowledged disconnection yet. The connection is retained safely; retry after the camera disconnects."];
+        [self reply:reply object:nil error:@"Sony camera cleanup is pending. Retry disconnect to release the retained connection."];
         return;
       }
       self->_sony->sessions.erase(found);
@@ -1041,7 +1041,7 @@ static SonyRuntime &sonyRuntime() {
   [self enqueueSony:^{
 #if ULTRACAM_SONY_SDK
     if (!sonyRuntime().shutdown(*self->_sony)) {
-      [self reply:reply object:nil error:@"Sony has not acknowledged every disconnect. SDK cleanup is pending; callbacks remain alive until acknowledgement."];
+      [self reply:reply object:nil error:@"Sony SDK cleanup is pending. Camera connections are retained until disconnection and release complete."];
       return;
     }
 #endif

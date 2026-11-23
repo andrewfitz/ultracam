@@ -24,8 +24,8 @@ struct VendorRegistrySnapshot: Sendable {
   private(set) var snapshot: VendorRegistrySnapshot
   private var observations: [DeviceObservation] = []
   nonisolated private let configurationErrors: [String: PluginError]
-  private var subscribers: [UUID: WeakObservation] = [:]
-  private var pending: [VendorRegistrySnapshot] = []
+  private var subscribers: [WeakObservation] = []
+  private var pending: [(snapshot: VendorRegistrySnapshot, subscribers: [WeakObservation])] = []
   private var publishing = false
   private struct WeakObservation { weak var value: VendorRegistryObservation? }
 
@@ -75,10 +75,11 @@ struct VendorRegistrySnapshot: Sendable {
     !id.isEmpty && id.utf8.allSatisfy { (97...122).contains($0) || (48...57).contains($0) || $0 == 45 || $0 == 95 }
   }
   nonisolated static func pluginID(for deviceID: String) throws -> String {
-    guard let colon = deviceID.firstIndex(of: ":"), deviceID.index(after: colon) < deviceID.endIndex else {
+    let bytes = deviceID.utf8
+    guard let colon = bytes.firstIndex(of: 0x3a), bytes.index(after: colon) < bytes.endIndex else {
       throw PluginError.invalidState("Malformed device ID")
     }
-    let prefix = String(deviceID[..<colon])
+    let prefix = String(decoding: bytes[..<colon], as: UTF8.self)
     guard validPluginID(prefix) else { throw PluginError.invalidState("Malformed device prefix") }
     return prefix
   }
@@ -98,6 +99,9 @@ struct VendorRegistrySnapshot: Sendable {
   }
   private static func checked(_ descriptor: VendorDescriptor, _ update: CaptureDeviceSnapshot) -> CaptureVendorSnapshot {
     var error = update.error
+    if error == nil, !update.devices.isEmpty, !(update.status.installed && update.status.supported) {
+      error = .unavailable(update.status.reason ?? "Capture driver is unavailable")
+    }
     var seen = Set<String>()
     if error == nil {
       for device in update.devices {
@@ -121,20 +125,22 @@ struct VendorRegistrySnapshot: Sendable {
   }
   func observe(_ handler: @escaping @MainActor @Sendable (VendorRegistrySnapshot) -> Void) -> VendorRegistryObservation {
     let token = VendorRegistryObservation(handler)
-    subscribers[UUID()] = WeakObservation(value: token)
+    subscribers.removeAll { $0.value == nil }
+    subscribers.append(WeakObservation(value: token))
     token.deliver(snapshot)
     return token
   }
   private func publish() {
-    pending.append(snapshot)
+    subscribers.removeAll { $0.value == nil }
+    // A subscriber added during delivery receives the latest snapshot immediately.
+    // Earlier, queued publications belong only to their original subscribers.
+    pending.append((snapshot, subscribers))
     guard !publishing else { return }
     publishing = true
     defer { publishing = false }
     while !pending.isEmpty {
       let value = pending.removeFirst()
-      subscribers = subscribers.filter { $0.value.value != nil }
-      let current = subscribers.values.compactMap(\.value)
-      current.forEach { $0.deliver(value) }
+      for subscriber in value.subscribers { subscriber.value?.deliver(value.snapshot) }
     }
   }
 }

@@ -636,6 +636,65 @@ fn camera_health_uses_each_cameras_latest_observation_within_the_generation() {
 }
 
 #[test]
+fn unconfigured_camera_observation_does_not_rebase_the_program_clock() {
+    let cfg = SwitcherConfig::default();
+    let mut director = Director::new(cfg.clone()).unwrap();
+    let mut recorder = TimelineRecorder::new(cfg, "realtime", Uuid::new_v4());
+    for event in [
+        StreamEvent::Tick { time: 10.0 },
+        StreamEvent::Take { camera_id: "B".into(), time: 10.0 },
+        health("unused", 85.0, true, 1),
+        StreamEvent::Tick { time: 10.1 },
+    ] {
+        record_with_director(&mut director, &mut recorder, event);
+    }
+    assert_eq!(director.session_generation(), 1);
+    assert_eq!(director.pending().unwrap().target_camera_id, "B");
+    record_with_director(
+        &mut director,
+        &mut recorder,
+        StreamEvent::ManualOverride { camera_id: "B".into(), time: 10.1 },
+    );
+    assert_eq!(recorder.timeline.cuts.last().unwrap().session_generation, 1);
+}
+
+#[test]
+fn exact_boundary_can_complete_dwell_with_a_zero_window() {
+    let mut cfg = config();
+    cfg.candidate_dwell = 0.25;
+    cfg.boundary_window = 0.0;
+    let mut director = Director::new(cfg).unwrap();
+    director.process_event(audio(1.0, 1.0, 0.5));
+    assert!(director.tick(1.0).is_none());
+    let cut = director.tick(1.25).expect("candidate retained its exact boundary");
+    assert_eq!(cut.cut_time, 1.0);
+}
+
+#[test]
+fn overflowing_evidence_does_not_trigger_rules_or_enter_the_replay_ledger() {
+    for (condition, event) in [
+        (
+            serde_json::json!({"signal":"audioFeature","name":"tone","minimum":0.5}),
+            serde_json::json!({"type":"audio","cue":{"id":1,"time":12,"speech_energy":0,"features":{"tone":1e60}}}),
+        ),
+        (
+            serde_json::json!({"signal":"providerScore","minimum":0.5}),
+            serde_json::json!({"type":"video","observation":{"camera_id":"B","time":12,"provider_score":1e60}}),
+        ),
+    ] {
+        let cfg: SwitcherConfig = serde_json::from_value(serde_json::json!({
+            "strategy":"rules", "anchor_camera_id":"A", "emphasis_camera_id":"B",
+            "rules":[{"target":"B", "all":[condition]}]
+        })).unwrap();
+        let mut director = Director::new(cfg.clone()).unwrap();
+        let mut recorder = TimelineRecorder::new(cfg, "realtime", Uuid::new_v4());
+        record_with_director(&mut director, &mut recorder, serde_json::from_value(event).unwrap());
+        assert!(director.tick(12.0).is_none());
+        assert!(recorder.timeline.events.is_empty());
+    }
+}
+
+#[test]
 fn offline_sorts_observations_without_reordering_controls() {
     let id = Uuid::new_v4();
     let controls = [
@@ -888,4 +947,111 @@ fn timer_rotates_multiple_routes_and_waits_for_application() {
     assert!(d.acknowledge(first.decision_id,Some(60.25)));
     assert!(d.tick(120.0).is_none());
     assert_eq!(d.tick(120.25).unwrap().target_camera_id,"desk");
+}
+
+#[test]
+fn candidate_dwell_restarts_after_audio_stops_supporting_the_cut() {
+    let mut cfg = config();
+    cfg.candidate_dwell = 0.25;
+    let mut director = Director::new(cfg).unwrap();
+    director.process_event(audio(1.0, 1.0, 0.5));
+    assert!(director.tick(1.0).is_none());
+    assert_eq!(director.state(), DirectorState::CandidateCut);
+
+    director.process_event(audio(1.125, 0.0, 0.0));
+    assert!(director.tick(1.125).is_none());
+    assert_eq!(director.state(), DirectorState::HoldAnchor);
+
+    director.process_event(audio(1.25, 1.0, 0.0));
+    assert!(director.tick(1.25).is_none());
+    assert_eq!(director.tick(1.5).unwrap().cut_time, 1.0);
+}
+
+#[test]
+fn revised_final_transcript_invalidates_its_saved_candidate_boundary() {
+    let mut cfg = config();
+    cfg.candidate_dwell = 0.25;
+    let mut director = Director::new(cfg).unwrap();
+    let mut cue = TranscriptCue {
+        text: None,
+        speaker: None,
+        segment_id: "revised".into(),
+        revision: 1,
+        start: 0.8,
+        end: 1.0,
+        kind: CueKind::SentenceEnd,
+        confidence: 1.0,
+        is_final: true,
+        session_generation: 0,
+    };
+    director.process_event(audio(1.0, 1.0, 0.0));
+    director.ingest_transcript(cue.clone());
+    assert!(director.tick(1.0).is_none());
+    assert_eq!(director.state(), DirectorState::CandidateCut);
+
+    cue.revision += 1;
+    cue.confidence = 0.25;
+    director.ingest_transcript(cue);
+    assert!(director.tick(1.25).is_none());
+    assert_eq!(director.state(), DirectorState::WaitForSafeBoundary);
+}
+
+#[test]
+fn boundary_from_an_earlier_shot_does_not_mask_a_usable_gap() {
+    let mut director = Director::new(config()).unwrap();
+    director.manual_override("A".into(), 1.0);
+    director.process_event(audio(1.0, 1.0, 0.5));
+    director.process_event(audio(1.2, 1.0, 0.5));
+    let cut = director.tick(1.0625).unwrap();
+    assert_eq!(cut.cut_time, 1.2);
+}
+
+#[test]
+fn future_gap_outside_the_window_does_not_mask_a_forced_cut_boundary() {
+    let mut cfg = config();
+    cfg.boundary_window = 0.02;
+    let mut director = Director::new(cfg).unwrap();
+    director.process_event(audio(2.9, 0.0, 0.5));
+    director.process_event(audio(3.03, 0.0, 0.5));
+    let cut = director.tick(3.0).unwrap();
+    assert!(cut.forced);
+    assert_eq!(cut.cut_time, 2.9);
+}
+
+#[test]
+fn audio_rule_waits_until_the_cue_reaches_the_media_clock() {
+    let cfg = serde_json::from_value(serde_json::json!({
+        "strategy": "rules",
+        "anchor_camera_id": "A",
+        "emphasis_camera_id": "B",
+        "minimum_shot_duration": 0,
+        "cooldown": 0,
+        "rules": [{"target": "B", "all": [{"signal": "energy", "minimum": 0.5}]}]
+    }))
+    .unwrap();
+    let mut director = Director::new(cfg).unwrap();
+    director.process_event(audio(1.0, 1.0, 0.0));
+    assert!(director.tick(0.875).is_none());
+    assert_eq!(director.tick(1.0).unwrap().target_camera_id, "B");
+}
+
+#[test]
+fn small_backward_ticks_cannot_accumulate_clock_discontinuity() {
+    let cfg = config();
+    let mut director = Director::new(cfg.clone()).unwrap();
+    let mut recorder = TimelineRecorder::new(cfg, "realtime", Uuid::new_v4());
+    for time in [1.0, 1.0 - 0.75e-6, 1.0 - 1.5e-6] {
+        record_with_director(&mut director, &mut recorder, StreamEvent::Tick { time });
+    }
+    assert_eq!(director.session_generation(), 2);
+
+    record_with_director(
+        &mut director,
+        &mut recorder,
+        StreamEvent::ManualOverride {
+            camera_id: "B".into(),
+            time: 1.0,
+        },
+    );
+    assert_eq!(recorder.timeline.cuts.last().unwrap().session_generation, 2);
 }

@@ -80,6 +80,10 @@
         "type": {
           "const": "state"
         },
+        "session_generation": {
+          "type": "integer",
+          "minimum": 1
+        },
         "session": {
           "type": "string",
           "format": "uuid"
@@ -102,6 +106,9 @@
         },
         "status": {
           "$ref": "../ultracam-auto-switcher/switcher-output"
+        },
+        "pending": {
+          "$ref": "#/$defs/pending"
         }
       },
       "required": [
@@ -123,6 +130,10 @@
         },
         "type": {
           "const": "update"
+        },
+        "session_generation": {
+          "type": "integer",
+          "minimum": 1
         },
         "session": {
           "type": "string",
@@ -152,14 +163,7 @@
           ]
         },
         "pending": {
-          "oneOf": [
-            {
-              "type": "null"
-            },
-            {
-              "$ref": "../ultracam-auto-switcher/switcher-output#/$defs/instruction"
-            }
-          ]
+          "$ref": "#/$defs/pending"
         }
       },
       "required": [
@@ -243,5 +247,17 @@
         "hold"
       ]
     }
-  ]
+  ],
+  "$defs": {
+    "pending": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "../ultracam-auto-switcher/switcher-output#/$defs/instruction"
+        }
+      ]
+    }
+  }
 }

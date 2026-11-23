@@ -925,10 +925,13 @@ fragment float4 mk_scopeFragment(mk_ScopeVertexOut in [[stage_in]], constant mk_
   light = min(light, float3(1));
   color = min(color + light, float3(1));
   alpha = alpha + (1 - alpha) * max(light.r, max(light.g, light.b));
-  // Encoded unpremultiplied, so coverage and opacity blend as on an SDR layer.
-  // Black (most of a scope) stays black in every encoding.
-  if (d.encode.x != 0 && alpha > 0 && any(color > 0)) color = mk_scopeEncode(color / alpha, d) * alpha;
-  // sRGB targets re-encode on store; exact where the scope is opaque.
-  if (d.flags.y) color = float3(mk_srgbToLinear(color.r), mk_srgbToLinear(color.g), mk_srgbToLinear(color.b));
+  // Convert straight colour, then premultiply in the attachment's blend space.
+  // Black (including zero coverage) stays black in every encoding.
+  if ((d.encode.x != 0 || d.flags.y) && alpha > 0 && any(color > 0)) {
+    color /= alpha;
+    if (d.encode.x != 0) color = mk_scopeEncode(color, d);
+    if (d.flags.y) color = float3(mk_srgbToLinear(color.r), mk_srgbToLinear(color.g), mk_srgbToLinear(color.b));
+    color *= alpha;
+  }
   return float4(color, alpha);
 }

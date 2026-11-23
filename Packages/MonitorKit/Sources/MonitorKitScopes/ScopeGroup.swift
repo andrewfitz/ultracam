@@ -29,7 +29,7 @@ public final class ScopeGroup {
   /// Whether `pipeline` (nil: unfused) is final for `pipelineKey`, so the engine is not asked again.
   private var pipelineIsFinal = false
   private var tile = Tile()
-  /// Every member's bins and statistics; rebuilt only when a member's bins are.
+  /// Scratch for the resources touched by a concurrent fused dispatch.
   private var barrierResources: [any MTLResource] = []
 
   // Metal 4 state of the fused pass, made on first use.
@@ -89,7 +89,6 @@ public final class ScopeGroup {
     }
     self.engine = engine
     self.accumulators = accumulators
-    rebuildBarrierResources()
   }
 
   deinit {
@@ -302,19 +301,24 @@ public final class ScopeGroup {
     monitorLUT: MonitorLUT?, encoder: MTLComputeCommandEncoder
   ) throws {
     guard var f = try beginFused(frame, members: members, burnInLUT: burnInLUT, monitorLUT: monitorLUT) else { return }
-    if barrierResourcesAreStale { rebuildBarrierResources() }
+    let concurrent = encoder.dispatchType == .concurrent
+    defer { if concurrent { barrierResources.removeAll(keepingCapacity: true) } }
     let leader = accumulators[f.leadIndex]
     ScopeAccumulator.bindInputs(&f.leadPass, frame: frame, burnInLUT: burnInLUT, monitorLUT: monitorLUT, engine: engine, encoder)
     var slot = 0
     while slot < 3 {
       if let i = members.member(slot) {
-        accumulators[i].bindMember(at: slot, encoder)
+        let member = accumulators[i]
+        member.bindMember(at: slot, encoder)
+        if concurrent {
+          barrierResources.append(member.bins)
+          barrierResources.append(member.statisticsBuffer)
+        }
       } else {
         leader.bindMember(at: slot, encoder)
       }
       slot += 1
     }
-    let concurrent = encoder.dispatchType == .concurrent
     // Also orders these clears after an earlier accumulation into the same encoder.
     if concurrent { encoder.memoryBarrier(resources: barrierResources) }
     ScopeAccumulator.encodeClear(&f.maintenance, pipeline: engine.groupClearPipeline, encoder)
@@ -371,20 +375,6 @@ public final class ScopeGroup {
     }
     assert(t.threadgroupBytes <= max(engine.threadgroupMemoryBudget, 16), "fused bins exceed threadgroup memory")
     tile = t
-  }
-
-  private var barrierResourcesAreStale: Bool {
-    guard barrierResources.count == 2 * accumulators.count else { return true }
-    var i = 0
-    while i < accumulators.count {
-      if barrierResources[2 * i] !== accumulators[i].bins { return true }
-      i += 1
-    }
-    return false
-  }
-
-  private func rebuildBarrierResources() {
-    barrierResources = accumulators.flatMap { [$0.bins as any MTLResource, $0.statisticsBuffer] }
   }
 
   /// Threads per fused threadgroup.

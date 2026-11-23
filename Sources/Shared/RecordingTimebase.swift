@@ -164,6 +164,8 @@ struct RecordingTimebase: Sendable {
     let p = try quantize(numerator: numerator, denominator: denominator)
     let d = try quantize(numerator: Int128(duration.value), denominator: Int128(duration.timescale))
     guard d.value > 0 else { throw Failure.nonpositiveDuration }
+    // The writer uses this end to remove pauses on the fixed track grid.
+    guard !p.value.addingReportingOverflow(d.value).overflow else { throw Failure.unrepresentableTime }
     if let lastTrackPTS, p.value <= lastTrackPTS { throw Failure.timestampCollision }
     var intervalError = 0.0
     if let lastSourcePTS, let lastTrackPTS {

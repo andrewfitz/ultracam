@@ -32,5 +32,12 @@ import XCTest
     XCTAssertEqual(estimator.estimate, .init(bytes: Int.max, duration: 0, slots: Int.max))
   }
 
+  func testNaNDurationLimitCannotSilentlyDisableAdmissionCheck() {
+    var estimator = ResourceEstimator(limits: .init(bytes: 10, duration: .nan, slots: 1))
+    guard case .failure(.invalid) = estimator.admit(owner: "frame", stage: .capture, bytes: 1, duration: 1) else {
+      return XCTFail("expected invalid duration limit")
+    }
+    XCTAssertTrue(estimator.activeOwners.isEmpty)
+  }
 }
 private extension Result { var isSuccess: Bool { if case .success = self { return true }; return false } }

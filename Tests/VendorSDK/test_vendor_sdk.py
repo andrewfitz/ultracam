@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import shutil
 import stat
 import subprocess
 import os
@@ -116,6 +117,24 @@ class VendorSDKTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.sdk.install(self.manifest, self.root, self.archive())
 
+    def test_archive_hash_and_extraction_use_the_same_open_file(self):
+        archive = self.archive()
+        replacement = self.archive({}, name='replacement.zip')
+        expected = hashlib.sha256(archive.read_bytes()).hexdigest()
+        self.manifest['sdk']['sha256'] = expected
+        hash_stream = self.sdk.stream_sha256
+
+        def replace_after_hash(stream):
+            digest = hash_stream(stream)
+            if Path(stream.name) == archive:
+                replacement.replace(archive)
+            return digest
+
+        with patch.object(self.sdk, 'stream_sha256', side_effect=replace_after_hash):
+            self.assertTrue(self.sdk.install(self.manifest, self.root, archive)['available'])
+        stamp = json.loads((self.vendor / 'SDK' / self.sdk.STAMP).read_text())
+        self.assertEqual(stamp['archiveSHA256'], expected)
+
     def test_archive_traversal_duplicates_and_symlinks_fail(self):
         for bad in ('../escape', '/absolute', 'a/../../escape', 'C:/windows', 'a\\escape'):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
@@ -160,14 +179,17 @@ class VendorSDKTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'no SDK'):
             self.sdk.install({'id': 'uvc'}, self.root, self.archive())
 
-    def test_cli_missing_optional_status_and_unknown_vendor(self):
-        raw = dict(schemaVersion=1, id='fixture', kinds=['control'], sources=[],
+    def write_manifest(self, identity='fixture'):
+        raw = dict(schemaVersion=1, id=identity, kinds=['control'], sources=[],
                    sdk=dict(self.manifest['sdk']))
         raw['sdk']['root'] = 'SDK'
         raw['sdk']['requiredFiles'] = ['SDK/include/api.h']
         raw['sdk']['fileSHA256'] = {'SDK/' + name: hashlib.sha256(data).hexdigest()
                                     for name, data in self.files.items()}
         (self.vendor / 'vendor.json').write_text(json.dumps(raw))
+
+    def test_cli_missing_optional_status_and_unknown_vendor(self):
+        self.write_manifest()
         command = [sys.executable, str(ROOT / 'scripts/vendor-sdk.py'), '--checkout-root', str(self.root), '--json']
         result = subprocess.run(command + ['status'], capture_output=True, text=True,
                                 env=dict(os.environ, PYTHONDONTWRITEBYTECODE='1'))
@@ -180,6 +202,22 @@ class VendorSDKTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn('Traceback', result.stderr)
 
+    def test_sony_compatibility_entry_point_uses_the_manifest_installer(self):
+        self.write_manifest('sony')
+        scripts = self.root / 'scripts'
+        scripts.mkdir()
+        for name in ('install-sony-sdk.py', 'vendor-sdk.py', 'vendors.py'):
+            shutil.copy2(ROOT / 'scripts' / name, scripts / name)
+        command = [sys.executable, str(scripts / 'install-sony-sdk.py'), str(self.archive())]
+        result = subprocess.run(command, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        stamp = json.loads((self.vendor / 'SDK' / self.sdk.STAMP).read_text())
+        self.assertEqual(stamp['vendor'], 'sony')
+        result = subprocess.run(command, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('contains existing payload', result.stderr)
+        self.assertNotIn('Traceback', result.stderr)
+
     def test_manifest_driven_nested_layout(self):
         self.manifest['sdk']['archiveLayout'] = {'nestedArchive': 'SimpleCli.zip', 'mappings': [
             {'prefix': 'app/CRSDK/', 'destination': 'include', 'flatten': True},
@@ -190,6 +228,41 @@ class VendorSDKTests(unittest.TestCase):
             output.writestr('external/crsdk/runtime.dylib', self.files['lib/runtime.dylib'])
         result = self.sdk.install(self.manifest, self.root, self.archive({'SimpleCli.zip': inner.getvalue()}))
         self.assertTrue(result['available'])
+
+    def test_mappings_without_a_nested_archive_use_the_outer_zip(self):
+        self.manifest['sdk']['archiveLayout'] = {'mappings': [
+            {'prefix': 'dist/include/', 'destination': 'include', 'flatten': False},
+            {'prefix': 'dist/lib/', 'destination': 'lib', 'flatten': False}]}
+        archive = self.archive({'dist/' + key: data for key, data in self.files.items()})
+        self.assertTrue(self.sdk.install(self.manifest, self.root, archive)['available'])
+
+    def test_mappings_check_stamps_in_the_outer_and_nested_archives(self):
+        self.manifest['sdk']['archiveLayout'] = {'nestedArchive': 'SimpleCli.zip', 'mappings': [
+            {'prefix': 'dist/include/', 'destination': 'include', 'flatten': False},
+            {'prefix': 'dist/lib/', 'destination': 'lib', 'flatten': False}]}
+        wrong_version = b'{"version":"different"}'
+        for stamped_location in ('outer', 'nested'):
+            inner = io.BytesIO()
+            with zipfile.ZipFile(inner, 'w') as output:
+                for name, data in self.files.items():
+                    output.writestr('dist/' + name, data)
+                if stamped_location == 'nested':
+                    output.writestr(self.sdk.STAMP, wrong_version)
+            files = {'SimpleCli.zip': inner.getvalue()}
+            if stamped_location == 'outer':
+                files[self.sdk.STAMP] = wrong_version
+            with self.subTest(location=stamped_location), self.assertRaisesRegex(ValueError, 'version stamp'):
+                self.sdk.install(self.manifest, self.root, self.archive(files))
+            self.assertFalse((self.vendor / 'SDK').exists())
+
+    def test_invalid_version_stamp_reports_unavailable(self):
+        self.sdk.install(self.manifest, self.root, self.archive())
+        stamp = self.vendor / 'SDK/.ultracam-sdk.json'
+        stamp.write_text('[]')
+        self.assertFalse(self.sdk.status(self.manifest, self.root)['available'])
+        stamp.unlink()
+        stamp.symlink_to('missing-stamp')
+        self.assertFalse(self.sdk.status(self.manifest, self.root)['available'])
 
 
 if __name__ == '__main__':

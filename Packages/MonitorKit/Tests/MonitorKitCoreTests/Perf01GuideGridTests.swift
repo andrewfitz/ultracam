@@ -65,6 +65,19 @@ final class Perf01GuideGridTests: XCTestCase {
     }
   }
 
+  func testPixelExactGridSkipsOffscreenColumnsAtExtremePan() {
+    var geometry = ViewGeometry()
+    geometry.magnification.pixelExact = true
+    geometry.magnification.centerX = 0
+    let layout = MonitorLayout(pictureWidth: 1_000_000_000, pictureHeight: 16,
+      viewportWidth: 100, viewportHeight: 16, geometry: geometry)
+    var guides = settings(rows: 16)
+    guides.hidesWhileMagnified = false
+    let raster = GuideRaster(layout: layout, guides: guides)
+    XCTAssertTrue(raster.segments.contains { $0.x0 == 50.5 && $0.x1 == 50.5 })
+    XCTAssertLessThanOrEqual(raster.segments.count, GuideRaster.maximumSegments)
+  }
+
   // Run with MONITORKIT_PERF01_GRID_BENCH=1 swift test --filter Perf01GuideGridTests/testWideGridMicrobenchmark
   func testWideGridMicrobenchmark() throws {
     guard ProcessInfo.processInfo.environment["MONITORKIT_PERF01_GRID_BENCH"] == "1" else {

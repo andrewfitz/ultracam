@@ -11,6 +11,11 @@ class RuntimeCoverageTests(unittest.TestCase):
         self.module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.module)
 
+    def methods(self, source):
+        code = self.module.swift_code(source)
+        suite = self.module.SWIFT_SUITE.search(code)
+        return self.module.test_members(code, suite.end(), suite[1])
+
     def test_counts_only_explicit_class_methods_and_ignores_literal_braces(self):
         source = '\n'.join([
             'final class FixtureChecks: XCTestCase {',
@@ -18,7 +23,29 @@ class RuntimeCoverageTests(unittest.TestCase):
             '  func testSync() { /* } */ }', '}',
             'final class Helper { func testNotRegistered() {} }',
         ])
-        self.assertEqual(self.module.class_test_methods(source, 'FixtureChecks'), ['testAsync', 'testSync'])
+        self.assertEqual(self.methods(source), ['testAsync', 'testSync'])
+
+    def test_counts_suite_methods_after_raw_strings_and_interpolations(self):
+        source = r'''class FixtureChecks: XCTestCase {
+          func testStrings() {
+            let raw = #"quoted "}" payload"#
+            let quote = #"""#
+            let interpolated = "\(String(repeating: "}", count: 1))"
+            let rawInterpolation = ##"\##(String(repeating: "}", count: 1))"##
+            /* outer /* nested */ } */
+          }
+          func testAfterStrings() {}
+        }'''
+        self.assertEqual(self.methods(source), ['testStrings', 'testAfterStrings'])
+
+    def test_does_not_count_local_test_named_functions(self):
+        source = '''class FixtureChecks: XCTestCase {
+          func testProof() {
+            func testHelper() {}
+          }
+          func testSecondProof() {}
+        }'''
+        self.assertEqual(self.methods(source), ['testProof', 'testSecondProof'])
 
     def test_accepts_exact_runtime_counts(self):
         log = "Test Suite 'FixtureChecks' passed at today.\n\t Executed 3 tests, with 0 failures (0 unexpected) in 1 seconds\n"

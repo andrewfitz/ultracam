@@ -156,10 +156,10 @@ final class AllocationTests: XCTestCase {
     XCTAssertLessThanOrEqual(a, b, "the renderer allocates beyond the library calls it makes")
   }
 
-  /// The view's tick (as a display link runs it, here into an offscreen target)
-  /// adds nothing to the renderer's encode.
+  /// An offscreen tick into a caller buffer adds nothing beyond the renderer
+  /// and Metal's registration of the snapshot's completion handler.
   @MainActor
-  func testViewTickAllocatesNothingBeyondTheRenderer() throws {
+  func testCallerBufferTickAllocatesNothingBeyondMatchingMetalCalls() throws {
     try skipUnderTheDebugLayer()
     let gpu = try requireGPU()
     let source = MonitorSource()
@@ -179,6 +179,7 @@ final class AllocationTests: XCTestCase {
       try reference.update()
       try gpu.run { try reference.encode(target: target, into: $0) }
     }
+    let completion: MTLCommandBufferHandler = { _ in }
     var viewCounts: [Int] = [], rendererCounts: [Int] = []
     for i in 6..<30 {
       source.submit(pool[i % 4])
@@ -191,6 +192,7 @@ final class AllocationTests: XCTestCase {
       let b = try AllocationCounter.measure {
         _ = try reference.update()
         try reference.encode(target: target, into: cb2)
+        cb2.addCompletedHandler(completion)
       }!
       cb2.commit()
       cb2.waitUntilCompleted()
@@ -198,7 +200,7 @@ final class AllocationTests: XCTestCase {
       rendererCounts.append(b)
     }
     let a = viewCounts.sorted()[viewCounts.count / 2], b = rendererCounts.sorted()[rendererCounts.count / 2]
-    print("BENCH MonitorMetalView tick: \(a) heap allocations; its renderer alone: \(b)")
+    print("BENCH MonitorMetalView caller-buffer tick: \(a) heap allocations; renderer and completion handler: \(b)")
     XCTAssertLessThanOrEqual(a, b)
     XCTAssertEqual(view.drawCount, 30)
   }

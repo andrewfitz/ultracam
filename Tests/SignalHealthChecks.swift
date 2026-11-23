@@ -38,6 +38,21 @@ import XCTest
     XCTAssertFalse(tracker.isUnhealthy(id))
   }
 
+  func testWaitingInterruptsSteadySignalRecovery() {
+    var tracker = SignalHealthTracker()
+    tracker.note(id, signal: .lost(since: 0), now: 0)
+    XCTAssertEqual(tracker.tick(now: 1), [.unhealthy(id)])
+    tracker.note(id, signal: .live, now: 2)
+    tracker.note(id, signal: .waiting, now: 4)
+    XCTAssertNil(tracker.secondsUntilEligible(id, now: 7))
+    XCTAssertEqual(tracker.tick(now: 7), [])
+    XCTAssertTrue(tracker.isUnhealthy(id))
+
+    tracker.note(id, signal: .live, now: 8)
+    XCTAssertEqual(tracker.tick(now: 12.9), [])
+    XCTAssertEqual(tracker.tick(now: 13), [.eligible(id)])
+  }
+
   func testUnsupportedIsNoPictureFromWhenItWasSeen() {
     var tracker = SignalHealthTracker()
     tracker.note(id, signal: .unsupported("1080i"), now: 50)
@@ -168,7 +183,7 @@ import XCTest
 
   func testMoveIsToldAndNamesHold() throws {
     var session = program([camera(2), camera(1, signal: .noSignal, lost: 2)])
-    session.programMoved = UIProgramMove(from: "Camera 1", to: "Camera 2", heldShot: true)
+    session.programMoved = UIProgramMove(fromID: "camera-1", from: "Camera 1", to: "Camera 2", heldShot: true)
     let problem = try XCTUnwrap(UIPresentationBuilder.problems(session).first { $0.id == "program.moved" })
     XCTAssertEqual(problem.title, "Camera 1 signal lost")
     XCTAssertEqual(problem.detail, "Program moved to Camera 2. Hold stays on.")

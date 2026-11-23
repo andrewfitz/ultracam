@@ -38,8 +38,12 @@ import XCTest
 
   func testAllPublishedSlotsAdvertiseThirteenRatesIncluding120And23976() throws {
     let runtime = CameraDeviceRuntime(automaticTimers: false, createNativeProvider: false)
+    let second = CameraDeviceRuntime(automaticTimers: false, createNativeProvider: false)
     XCTAssertEqual(runtime.formats.count, OutputFormatCatalog.published.count)
+    XCTAssertEqual(second.formats.count, runtime.formats.count)
     XCTAssertEqual(FrameRateTarget.allCases.count, 13)
+    XCTAssertTrue(zip(runtime.formats, second.formats).allSatisfy { $0 === $1 },
+      "Every runtime should reuse the immutable format catalog")
     for format in runtime.formats {
       XCTAssertTrue(DerivedOutputContract.sameDuration(format.minFrameDuration, FrameRateTarget.fps120.duration))
       XCTAssertTrue(DerivedOutputContract.sameDuration(format.maxFrameDuration, FrameRateTarget.fps23976.duration))
@@ -128,6 +132,26 @@ import XCTest
         XCTAssertTrue(error.localizedDescription.contains("Metal 4"))
       }
       XCTAssertEqual(runtime.consumers, 0, "Capability failure must occur before acquiring a consumer lease")
+      XCTAssertFalse(runtime.inUse)
+    }
+  }
+
+  func testFailedStartReleasesThePendingViewerListedByCMIO() throws {
+    let runtime = CameraDeviceRuntime(automaticTimers: false, createNativeProvider: false)
+    let waiting = UUID()
+    let starting = UUID()
+    try runtime.queue.sync {
+      runtime.source.authorizeSourceForTesting(clientID: waiting)
+      runtime.source.authorizeSourceForTesting(clientID: starting)
+      runtime.source.observeStreamingClientsForTesting([starting])
+      runtime.makeGPUStandbyProducerForTesting = { throw VideoError.message("Injected capability failure") }
+
+      XCTAssertThrowsError(try runtime.source.startStream())
+      XCTAssertEqual(runtime.consumers, 0)
+      XCTAssertTrue(runtime.source.hasPendingStart)
+      runtime.source.disconnectSourceForTesting(clientID: starting)
+      XCTAssertTrue(runtime.source.hasPendingStart, "The earlier viewer is still waiting to start")
+      runtime.source.disconnectSourceForTesting(clientID: waiting)
       XCTAssertFalse(runtime.inUse)
     }
   }

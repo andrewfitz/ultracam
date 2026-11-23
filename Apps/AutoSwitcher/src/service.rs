@@ -19,6 +19,7 @@ use std::{
 use uuid::Uuid;
 
 const MAX_LINE: u64 = 256 * 1024;
+const CLIENT_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Deserialize)]
 struct Request {
@@ -56,7 +57,7 @@ fn line(value: &Value) -> Result<Vec<u8>> {
 
 impl Session {
     fn state(&self) -> Value {
-        json!({"v":1,"type":"state","session":self.id,"seq":self.seq,
+        json!({"v":1,"type":"state","session":self.id,"seq":self.seq,"session_generation":self.director.session_generation(),
             "pending":self.director.pending(), "clock":if self.clock {"server"} else {"host"}, "hotkeys": self.bindings.is_some(), "config":self.director.config,"status":self.director.status(f64::NAN)})
     }
 
@@ -102,7 +103,7 @@ impl Session {
         let outputs = self.director.process_event(event.clone());
         self.director.config.manual_hold = profile_hold;
         self.seq += 1;
-        let value = json!({"v":1,"session":self.id,"seq":self.seq,"type":"update",
+        let value = json!({"v":1,"session":self.id,"seq":self.seq,"type":"update","session_generation":self.director.session_generation(),
             "pending":self.director.pending(), "application":application,"event":event,"outputs":outputs,"status":self.director.status(f64::NAN)});
         let bytes = Arc::new(line(&value)?);
         if let Err(error) = self.journal.write_all(&bytes) {
@@ -134,7 +135,7 @@ fn connection(mut stream: TcpStream, state: Arc<Mutex<Session>>, clock: bool) ->
         session: state.clone(),
     };
     stream.set_nodelay(true)?;
-    stream.set_write_timeout(Some(Duration::from_secs(3)))?;
+    stream.set_write_timeout(Some(CLIENT_TIMEOUT))?;
     let mut reader = BufReader::new(stream.try_clone()?);
     loop {
         let mut input = Vec::new();
@@ -174,6 +175,7 @@ fn connection(mut stream: TcpStream, state: Arc<Mutex<Session>>, clock: bool) ->
                     session.state()
                 };
                 stream.write_all(&line(&snapshot)?)?;
+                // A watcher may close its write half and continue reading updates.
                 for update in rx {
                     stream.write_all(&update)?;
                 }
@@ -209,7 +211,9 @@ fn connection(mut stream: TcpStream, state: Arc<Mutex<Session>>, clock: bool) ->
                         | StreamEvent::Transcript { .. }
                         | StreamEvent::Take { .. }
                 );
-                if other_host && !observation {
+                if !event.has_valid_cue_values() {
+                    json!({"v":1,"type":"error","message":"invalid observation values"})
+                } else if other_host && !observation {
                     json!({"v":1,"type":"error","message":"native host owns routing and clock"})
                 } else if clock && matches!(event, StreamEvent::Tick { .. }) {
                     json!({"v":1,"type":"error","message":"server owns the clock"})
@@ -371,8 +375,12 @@ impl LevelAdapter {
             levels.time >= 0.0 && levels.rms.is_finite() && levels.peak.is_finite(),
             "invalid meter reading"
         );
-        let energy = levels.rms.clamp(0.0, 1.0);
-        let speaking = levels.present && energy >= 0.035;
+        let (energy, emphasis) = if levels.present {
+            (levels.rms.clamp(0.0, 1.0), levels.peak.clamp(0.0, 1.0))
+        } else {
+            (0.0, 0.0)
+        };
+        let speaking = energy >= 0.035;
         if speaking {
             self.silence_start = None;
         } else {
@@ -386,7 +394,7 @@ impl LevelAdapter {
             time: levels.time,
             duration: gap.filter(|d| *d > 0.0 && *d <= 1.0).unwrap_or(0.02),
             speech_energy: energy,
-            emphasis: levels.peak.clamp(0.0, 1.0),
+            emphasis,
             laughter: 0.0,
             pause_duration: self
                 .silence_start
@@ -441,21 +449,8 @@ pub fn attach(port: u16) -> Result<()> {
     let mut input = std::io::stdin().lock().lines();
     let host: Value = serde_json::from_str(&input.next().context("expected configuration")??)?;
     let config: SwitcherConfig = serde_json::from_value(host.clone())?;
-    let mut sock = TcpStream::connect((Ipv4Addr::LOCALHOST, port))?;
-    sock.set_nodelay(true)?;
-    sock.set_read_timeout(Some(Duration::from_secs(2)))?;
-    sock.set_write_timeout(Some(Duration::from_secs(2)))?;
-    let mut reader = BufReader::new(sock.try_clone()?);
-    let mut request = |v: Value| -> Result<Value> {
-        sock.write_all(&line(&v)?)?;
-        let mut bytes = Vec::new();
-        reader
-            .by_ref()
-            .take(MAX_LINE * 2)
-            .read_until(b'\n', &mut bytes)?;
-        Ok(serde_json::from_slice(&bytes)?)
-    };
-    let state = request(json!({"v":1,"op":"claim","hold":config.manual_hold}))?;
+    let mut socket = local(port, Duration::from_secs(2))?;
+    let state = call(&mut socket, json!({"v":1,"op":"claim","hold":config.manual_hold}))?;
     let server: SwitcherConfig = serde_json::from_value(state["config"].clone())?;
     ensure!(
         state["hotkeys"] == false,
@@ -481,6 +476,7 @@ pub fn attach(port: u16) -> Result<()> {
         "profile needs more routes than the host provides"
     );
     let mut delivered = Value::Null;
+    let mut generation = state["session_generation"].as_u64();
     println!("[]");
     let mut levels = LevelAdapter::default();
     for input in input {
@@ -500,8 +496,13 @@ pub fn attach(port: u16) -> Result<()> {
             };
             *id = json!(external);
         }
-        let update = request(json!({"v":1,"op":"event","event":event}))?;
+        let update = call(&mut socket, json!({"v":1,"op":"event","event":event}))?;
         ensure!(update["outputs"].is_array(), "server rejected event");
+        let next_generation = update["session_generation"].as_u64();
+        if next_generation != generation {
+            levels.reset();
+            generation = next_generation;
+        }
         let mut outputs = update["outputs"].as_array().unwrap().clone();
         outputs.extend(cue);
         let pending = &update["pending"];
@@ -528,10 +529,11 @@ pub fn attach(port: u16) -> Result<()> {
     Ok(())
 }
 
-fn local(port: u16) -> Result<BufReader<TcpStream>> {
+fn local(port: u16, timeout: Duration) -> Result<BufReader<TcpStream>> {
     let socket = TcpStream::connect((Ipv4Addr::LOCALHOST, port))?;
     socket.set_nodelay(true)?;
-    socket.set_write_timeout(Some(Duration::from_secs(3)))?;
+    socket.set_write_timeout(Some(timeout))?;
+    socket.set_read_timeout(Some(timeout))?;
     Ok(BufReader::new(socket))
 }
 
@@ -548,15 +550,16 @@ fn call(peer: &mut BufReader<TcpStream>, message: Value) -> Result<Value> {
 }
 
 pub fn watch(port: u16) -> Result<()> {
-    let mut socket = local(port)?;
+    let mut socket = local(port, CLIENT_TIMEOUT)?;
     let snapshot = call(&mut socket, json!({"v":1,"op":"watch"}))?;
+    socket.get_mut().set_read_timeout(None)?;
     println!("{snapshot}");
     std::io::copy(&mut socket, &mut std::io::stdout().lock())?;
     Ok(())
 }
 
 pub fn take(port: u16, route: String) -> Result<()> {
-    let mut peer = local(port)?;
+    let mut peer = local(port, CLIENT_TIMEOUT)?;
     let update = call(&mut peer, json!({"v":1,"op":"take","route":route}))?;
     if let Some(error) = update["outputs"]
         .as_array()
@@ -572,10 +575,7 @@ pub fn feed_pcm(port: u16, rate: u32, origin: f64, tick: bool) -> Result<()> {
     ensure!(origin.is_finite() && origin >= 0.0, "invalid origin");
     let mut decoder = auto_switcher::audio::PcmCueDecoder::new(rate, 20, 0.025)?;
     let mut input = std::io::stdin().lock();
-    let mut socket = local(port)?;
-    socket
-        .get_mut()
-        .set_read_timeout(Some(Duration::from_secs(3)))?;
+    let mut socket = local(port, CLIENT_TIMEOUT)?;
     let mut buffer = [0; 4096];
     loop {
         let count = input.read(&mut buffer)?;

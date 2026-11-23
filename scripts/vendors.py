@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-"""Validated vendor build descriptions; paths are manifest-relative, never shell code.
-
-This reader is deliberately inactive until manifest-driven project activation.
-"""
+"""Validate vendor build descriptions and resolve explicit SDK inventories."""
 import argparse
 import hashlib
 import json
+import os
 import re
 from pathlib import Path
 
@@ -17,6 +15,7 @@ _FIELDS = {'schemaVersion', 'id', 'kinds', 'sources', 'publicHeaders',
 _NAME = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
 _ID = re.compile(r'^[a-z][a-z0-9-]*$')
 _DEFINE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*(?:=[A-Za-z0-9_.-]+)?$')
+SDK_STAMP = '.ultracam-sdk.json'
 
 def _check(condition, message):
     if not condition:
@@ -27,13 +26,31 @@ def _strings(value, field):
     _check(len(value) == len(set(value)), f'{field} has duplicates')
     return value
 
-def _path(value, base, roots, field, exists=True):
+def _path(value, base, roots, field, exists=True, *, resolve=True):
     _check(isinstance(value, str) and value and '\x00' not in value, f'{field} must be a path')
     _check(not Path(value).is_absolute(), f'{field} must be manifest-relative')
-    path = (base / value).resolve()
+    path = (base / value).resolve() if resolve else Path(os.path.abspath(base / value))
     _check(any(path.is_relative_to(root) and path != root for root in roots), f'{field} escapes allowed roots: {value}')
     _check(not exists or path.exists(), f'{field} does not exist: {value}')
     return str(path)
+
+def check_sdk_version_stamp(data, version):
+    stamp = json.loads(data)
+    _check(isinstance(stamp, dict) and stamp.get('version') == version,
+           'SDK version stamp does not match manifest')
+
+def verify_sdk_version_stamp(root, version):
+    stamp = root / SDK_STAMP
+    _check(not stamp.is_symlink(), 'Unsafe SDK version stamp')
+    if stamp.exists():
+        _check(stamp.is_file(), 'Unsafe SDK version stamp')
+        check_sdk_version_stamp(stamp.read_bytes(), version)
+
+def stream_sha256(stream):
+    digest = hashlib.sha256()
+    for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+        digest.update(chunk)
+    return digest.hexdigest()
 
 def validate_manifest(value, manifest_path, checkout_root, sdk_roots=()):
     """Return normalized data or ValueError. Unknown fields and flags fail closed."""
@@ -140,7 +157,6 @@ def validate_manifest(value, manifest_path, checkout_root, sdk_roots=()):
         _check(isinstance(sdk['version'], str) and bool(sdk['version']), 'invalid SDK version')
         required = _strings(sdk['requiredFiles'], 'SDK requiredFiles')
         _check(bool(required), 'SDK predicate needs requiredFiles')
-        required_paths = [normalized(_path(p, base, roots, 'SDK required file', exists=False)) for p in required]
         archive_checksum = sdk.get('sha256')
         _check(archive_checksum is None or isinstance(archive_checksum, str) and bool(re.fullmatch(r'[0-9a-f]{64}', archive_checksum)), 'invalid SDK sha256')
         optional = sdk.get('optional', True)
@@ -150,14 +166,24 @@ def validate_manifest(value, manifest_path, checkout_root, sdk_roots=()):
         _check(isinstance(enabled_build, dict) and not set(enabled_build) - build_fields, 'invalid SDK enabledBuild fields')
         conditional = validate_manifest(dict(schemaVersion=SCHEMA_VERSION, id=value['id'], kinds=kinds,
             sources=[], **enabled_build), manifest_path, checkout_root, sdk_roots)
-        sdk_root = normalized(_path(sdk.get('root', 'SDK'), base, roots, 'SDK root', exists=False))
+        root_value = sdk.get('root', 'SDK')
+        sdk_root = Path(_path(root_value, base, roots, 'SDK root', exists=False))
+        declared_root = Path(os.path.abspath(base / root_value))
+        _check(sdk_root == declared_root or any(sdk_root.is_relative_to(cache) for cache in roots[1:]),
+               'SDK root contains a symlink outside the configured cache')
+
+        def sdk_input(path, field):
+            declared = Path(_path(path, base, (declared_root,), field, exists=False, resolve=False))
+            return normalized(sdk_root / declared.relative_to(declared_root))
+
+        required_paths = [sdk_input(path, 'SDK required file') for path in required]
         pins = sdk.get('fileSHA256', {})
         _check(isinstance(pins, dict), 'SDK fileSHA256 must be an object')
         checked_pins = {}
         for path, file_checksum in pins.items():
             _check(isinstance(file_checksum, str) and bool(re.fullmatch(r'[0-9a-f]{64}', file_checksum)), 'invalid SDK file checksum')
-            checked_path = normalized(_path(path, base, roots, 'SDK pin', exists=False))
-            _check(Path(root / checked_path).is_relative_to(root / sdk_root), 'SDK pin escapes SDK root')
+            checked_path = sdk_input(path, 'SDK pin')
+            _check(checked_path not in checked_pins, 'duplicate SDK pin path')
             checked_pins[checked_path] = file_checksum
         drivers = _strings(sdk.get('externalDrivers', []), 'SDK externalDrivers')
         for driver in drivers:
@@ -181,7 +207,7 @@ def validate_manifest(value, manifest_path, checkout_root, sdk_roots=()):
                     _check(isinstance(path, str) and path and not Path(path).is_absolute() and '..' not in Path(path).parts
                         and not any(c in path for c in ('\0', '\n', '\r')), 'unsafe archive mapping path')
                 _check(type(mapping['flatten']) is bool and mapping['prefix'].endswith('/'), 'invalid archive mapping format')
-        result['sdk'] = dict(archiveLayout=layout, externalDrivers=drivers, fileSHA256=checked_pins, root=sdk_root, policy=sdk['policy'], version=sdk['version'], requiredFiles=required_paths,
+        result['sdk'] = dict(archiveLayout=layout, externalDrivers=drivers, fileSHA256=checked_pins, root=normalized(sdk_root), policy=sdk['policy'], version=sdk['version'], requiredFiles=required_paths,
                              sha256=archive_checksum, optional=optional,
                              enabledBuild={key: conditional[key] for key in sorted(build_fields)})
     return result
@@ -216,15 +242,25 @@ def resolve_sdk_inventory(manifests, requested, checkout_root):
         enabled = requested.get(identity, not optional)
         _check(optional or enabled, f'{identity} SDK is required and cannot be disabled')
         _check(not enabled or sdk is not None, f'{identity} has no optional SDK')
-        if enabled:
-            for path in sdk['requiredFiles']:
-                _check((root / path).is_file(), f'{identity} SDK requested but missing: {path}')
-            for path, expected in sdk['fileSHA256'].items():
-                actual = hashlib.sha256((root / path).read_bytes()).hexdigest()
-                _check(actual == expected, f'{identity} SDK checksum mismatch: {path}; verify/install declared SDK {sdk["version"]}')
         reason = 'uses system frameworks' if sdk is None else 'disabled by explicit SDK inventory'
-        result[identity] = dict(available=enabled, version=sdk['version'] if enabled else None,
-                                reason=None if enabled else reason)
+        status = dict(available=enabled, version=sdk['version'] if enabled else None,
+                      reason=None if enabled else reason)
+        if enabled:
+            files = {}
+            pins = sdk['fileSHA256']
+            for path in sorted(set(sdk['requiredFiles']) | pins.keys()):
+                candidate = root / path
+                _check(candidate.is_file(), f'{identity} SDK requested but missing: {path}')
+                _check(candidate.resolve() == candidate, f'{identity} SDK file is a symlink or has a symlink ancestor: {path}')
+                with candidate.open('rb') as stream:
+                    digest = stream_sha256(stream)
+                _check(path not in pins or digest == pins[path],
+                       f'{identity} SDK checksum mismatch: {path}; verify/install declared SDK {sdk["version"]}')
+                files[path] = digest
+            verify_sdk_version_stamp(root / sdk['root'], sdk['version'])
+            # The generated digest uses the same bytes as the pin check.
+            status['files'] = files
+        result[identity] = status
     return result
 
 def input_digest(manifests, sdk_inventory):
@@ -240,7 +276,6 @@ def absolute(root, path):
     return str(Path(root) / path)
 
 def read_inventory(root=ROOT, inventory_path=None, sdk_present=None, sdk_disabled=None):
-    import os
     selected = inventory_path or os.environ.get('ULTRACAM_SDK_INVENTORY')
     requested = json.loads(Path(absolute(root, selected)).read_text()) if selected else {}
     _check(isinstance(requested, dict), 'SDK inventory must be an object')
@@ -251,15 +286,7 @@ def read_inventory(root=ROOT, inventory_path=None, sdk_present=None, sdk_disable
     cache = os.environ.get('ULTRACAM_SDK_CACHE')
     roots = (Path(cache).resolve(),) if cache else ()
     manifests = load_manifests(root, roots)
-    inventory = resolve_sdk_inventory(manifests, requested, root)
-    # Pin enabled input files in the generated digest. Optional absent SDKs do
-    # not inspect local files, so canonical generation is machine independent.
-    for manifest in manifests:
-        status = inventory[manifest['id']]
-        if status['available']:
-            status['files'] = {path: hashlib.sha256(Path(absolute(root, path)).read_bytes()).hexdigest()
-                               for path in sorted(set(manifest['sdk']['requiredFiles']) | set(manifest['sdk']['fileSHA256']))}
-    return manifests, inventory
+    return manifests, resolve_sdk_inventory(manifests, requested, root)
 
 def build_settings(manifests, inventory, membership='app', vendor=None):
     result = {field: [] for field in BUILD_FIELDS}

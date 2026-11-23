@@ -5,6 +5,41 @@ import XCTest
 @testable import RTMPHaishinKit
 
 final class PublishTimelineTests: XCTestCase {
+    func testPictureEpochAppliesAACPrimingOnlyWhenAudioIsExpected() async throws {
+        let videoOnlyTimestamp = try await firstPictureTimestamp(includesAudio: false)
+        XCTAssertEqual(videoOnlyTimestamp, 125)
+        let pairedTimestamp = try await firstPictureTimestamp(includesAudio: true)
+        XCTAssertEqual(Int(pairedTimestamp), 169, accuracy: 1)
+    }
+
+    private func firstPictureTimestamp(includesAudio: Bool) async throws -> UInt32 {
+        let server = try LoopbackRTMPServer()
+        defer { server.stop() }
+        let url = try await server.start()
+        let connection = RTMPConnection()
+        let stream = RTMPStream(connection: connection)
+        try await stream.setAudioSettings(AudioCodecSettings(bitRate: 160_000, sampleRate: 48_000))
+        _ = try await connection.connect(url)
+        _ = try await stream.publish("key")
+        let epoch = CMTime(value: 100, timescale: 1)
+        await stream.setPublishEpoch(epoch, includesAudio: includesAudio)
+        // The first input picture was dropped before the transport saw it.
+        let pictureTime = epoch + CMTime(value: 125, timescale: 1000)
+        await stream.appendEncodedVideo(try Self.picture(at: pictureTime))
+
+        let deadline = Date(timeIntervalSinceNow: 5)
+        while Date() < deadline {
+            if let video = server.receivedMedia.first(where: { $0.type == 9 && $0.payload.dropFirst().first == 1 }) {
+                await connection.closePermanently(gracefully: false)
+                return video.timestamp
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTFail("The receiver did not get a coded picture")
+        await connection.closePermanently(gracefully: false)
+        throw CancellationError()
+    }
+
     /// FLV has no edit list, so a receiver plays the AAC encoder's 2112 priming samples.
     /// A picture and the PCM captured with it must still decode at the same time.
     func testPictureAndPCMAtTheEpochDecodeTogetherAfterAACPriming() async throws {

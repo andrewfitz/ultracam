@@ -29,6 +29,13 @@ constant uint MK_V210 = 0, MK_UYVY8 = 1, MK_YUYV8 = 2, MK_BIPLANAR = 3, MK_RGB =
 #define MK_LAYOUT(f) ((f).shape.x)
 #endif
 
+// A non-finite float RGB sample reads as NaN → 0, ±inf → ±65504 (the widest value
+// any target keeps): inf - inf in a filter, or a NaN, would otherwise reach the
+// tools and overlay mixes. Finite values, and every unorm value, are unchanged.
+inline float3 mk_finiteRGB(float3 v) {
+  return select(select(v, clamp(v, -65504.0f, 65504.0f), isinf(v)), float3(0), isnan(v));
+}
+
 // Y' from R'G'B'. Written as g + kr(r - g) + kb(b - g) (kg = 1 - kr - kb) so a
 // neutral input returns its value exactly, which keeps classification
 // boundaries at integral codes exact.
@@ -161,7 +168,8 @@ float4 mk_decode(texture2d<uint, access::read> packed, texture2d<float, access::
   if (MK_LAYOUT(f) == MK_V210 && !f.options.x) return mk_codesToRGB(mk_v210Codes(packed, xy, f), f);
   if (MK_LAYOUT(f) == MK_RGB) {
     float3 rgb = luma.read(xy).rgb;
-    if (f.codeScale.w == 0 && !f.options.y) rgb = (rgb * f.codeScale.z - f.levels.x) / f.levels.y;
+    if (f.codeScale.w != 0) rgb = mk_finiteRGB(rgb);
+    else if (!f.options.y) rgb = (rgb * f.codeScale.z - f.levels.x) / f.levels.y;
     return float4(rgb, mk_luma(rgb, f.matrix.xyz));
   }
   float y = (mk_lumaCode(packed, luma, xy, f) - f.levels.x) / f.levels.y;
@@ -181,7 +189,8 @@ float4 mk_decode(texture2d<uint, access::read> packed, texture2d<float, access::
                  texture2d<float, access::read> chroma, uint2 xy, constant mk_FrameParams& f, float3 inverse) {
   if (MK_LAYOUT(f) == MK_RGB) {
     float3 rgb = luma.read(xy).rgb;
-    if (f.codeScale.w == 0 && !f.options.y) rgb = mk_quotient(rgb * f.codeScale.z - f.levels.x, f.levels.y, inverse.x);
+    if (f.codeScale.w != 0) rgb = mk_finiteRGB(rgb);
+    else if (!f.options.y) rgb = mk_quotient(rgb * f.codeScale.z - f.levels.x, f.levels.y, inverse.x);
     return float4(rgb, mk_luma(rgb, f.matrix.xyz));
   }
   float3 codes = MK_LAYOUT(f) == MK_V210 && !f.options.x

@@ -108,6 +108,12 @@ import XCTest
     XCTAssertThrowsError(try Timecode(hours: 0, minutes: 0, seconds: 0, frames: 0, dropFrame: true).validate(rate: .constant(CMTime(value: 1, timescale: 25))))
   }
 
+  func testTimecodeUsesExactBoundaryForWholeAndFractionalRates() throws {
+    let label = try Timecode(hours: 0, minutes: 0, seconds: 0, frames: 49, dropFrame: false)
+    XCTAssertThrowsError(try label.validate(rate: .constant(CMTime(value: 1, timescale: 49))))
+    XCTAssertNoThrow(try label.validate(rate: .constant(CMTime(value: 1001, timescale: 50_000))))
+  }
+
   private func format(_ rate: FrameRate) throws -> SourceFormat {
     try SourceFormat(width: 3840, height: 2160, pixel: .v210, rate: rate)
   }

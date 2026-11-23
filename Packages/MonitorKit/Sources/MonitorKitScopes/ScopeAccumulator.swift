@@ -415,7 +415,8 @@ public final class ScopeAccumulator {
     appliedBurnInLUT = burnApplied
     appliedMonitorLUT = monitorApplied
     let measured = ScopeContext(
-      range: frame.signal.signal(for: s.stage).range, matrix: matrix(settings: s, frame: frame, burnInLUT, monitorLUT))
+      range: frame.layout.effectiveRange(frame.signal.signal(for: s.stage).range),
+      matrix: matrix(settings: s, frame: frame, burnInLUT, monitorLUT))
     if context != measured { context = measured }
     if accumulatedSettings != s { accumulatedSettings = s }
   }
@@ -449,6 +450,9 @@ public final class ScopeAccumulator {
       if key.layout.byteLength != bins.length {
         let replacement = try Self.makeBins(engine.device, key.layout)
         retired.retire(bins)
+        // A later classic accumulation can replace Metal 4 bins even if this
+        // scope never encodes on Metal 4 again.
+        engine.residency.track(nil as MTLBuffer?, in: &resident.bins)
         bins = replacement
       }
       layout = key.layout

@@ -32,7 +32,8 @@ final class CaptureAdmissionBudget: @unchecked Sendable {
   private let minimumSlots: Int
   private var slots = 0
   private var bytes = 0
-  private var duration = 0.0
+  private var durationSum = 0.0
+  private var durationCorrection = 0.0
   private var peakSlots = 0
   private var peakBytes = 0
   private var accepted = 0
@@ -50,7 +51,8 @@ final class CaptureAdmissionBudget: @unchecked Sendable {
   func admit(bytes candidateBytes: Int, duration candidateDuration: Double) -> Lease? {
     lock.withLock {
       let (nextBytes, overflow) = bytes.addingReportingOverflow(candidateBytes)
-      let nextDuration = duration + candidateDuration
+      let (nextSum, nextCorrection) = addingDuration(candidateDuration)
+      let nextDuration = nextSum + nextCorrection
       guard candidateBytes > 0, candidateDuration.isFinite, candidateDuration > 0,
         !overflow, nextBytes <= maximumBytes, slots < maximumSlots, nextDuration.isFinite,
         slots < minimumSlots || nextDuration <= maximumDuration + maximumDuration.ulp * 4 else {
@@ -59,7 +61,8 @@ final class CaptureAdmissionBudget: @unchecked Sendable {
       }
       slots += 1
       bytes = nextBytes
-      duration = nextDuration
+      durationSum = nextSum
+      durationCorrection = nextCorrection
       peakSlots = max(peakSlots, slots)
       peakBytes = max(peakBytes, bytes)
       accepted += 1
@@ -70,14 +73,28 @@ final class CaptureAdmissionBudget: @unchecked Sendable {
     lock.withLock {
       slots -= 1
       bytes -= releasedBytes
-      duration = max(0, duration - releasedDuration)
       released += 1
-      if slots == 0 { duration = 0 }
+      if slots == 0 {
+        durationSum = 0
+        durationCorrection = 0
+      } else {
+        (durationSum, durationCorrection) = addingDuration(-releasedDuration)
+      }
     }
   }
+
+  /// Keep shorter leases accounted for when a much longer lease releases first.
+  private func addingDuration(_ change: Double) -> (Double, Double) {
+    let nextSum = durationSum + change
+    let roundingError = abs(durationSum) >= abs(change)
+      ? (durationSum - nextSum) + change
+      : (change - nextSum) + durationSum
+    return (nextSum, durationCorrection + roundingError)
+  }
+
   var snapshot: Snapshot {
     lock.withLock {
-      Snapshot(currentSlots: slots, currentBytes: bytes, currentDuration: duration,
+      Snapshot(currentSlots: slots, currentBytes: bytes, currentDuration: max(0, durationSum + durationCorrection),
         peakSlots: peakSlots, peakBytes: peakBytes, accepted: accepted, rejected: rejected, released: released)
     }
   }

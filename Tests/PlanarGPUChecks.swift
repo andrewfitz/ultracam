@@ -24,6 +24,35 @@ import Synchronization
     _ = try PlanarGPUDecoder(device: device)
   }
 
+  func testDecodersRejectReadOnlyOutputBeforeAddingResidency() throws {
+    guard let device = MTLCreateSystemDefaultDevice(), device.supportsFamily(.metal4) else { throw XCTSkip("Metal 4 required") }
+    func texture(_ format: MTLPixelFormat, width: Int, height: Int) throws -> MTLTexture {
+      let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: format, width: width, height: height, mipmapped: false)
+      descriptor.usage = .shaderRead
+      return try XCTUnwrap(device.makeTexture(descriptor: descriptor))
+    }
+    let luma = try texture(.r8Unorm, width: 2, height: 2)
+    let uv = try texture(.rg8Unorm, width: 1, height: 1)
+    let chroma = try texture(.r8Unorm, width: 1, height: 1)
+    let output = try texture(.rgba32Float, width: 2, height: 2)
+    let packed = try XCTUnwrap(device.makeBuffer(length: 16))
+    let allocator = try XCTUnwrap(device.makeCommandAllocator()), command = try XCTUnwrap(device.makeCommandBuffer())
+    let residency = try device.makeResidencySet(descriptor: MTLResidencySetDescriptor())
+    let location = try PlanarGPUChromaLocation(horizontal: .left, vertical: .center)
+    let planar = try PlanarGPUDecoder(device: device)
+    let ndi = try NDIPlanarGPUDecoder(device: device)
+    let rgb = try RGBGPUDecoder(device: device)
+    command.beginCommandBuffer(allocator: allocator)
+    defer { command.endCommandBuffer() }
+    XCTAssertThrowsError(try planar.encode(luma: luma, chroma: uv, destination: output,
+      format: .video420, location: location, range: .video, command: command, residency: residency))
+    XCTAssertThrowsError(try ndi.encode(planes: [luma, chroma, chroma], destination: output,
+      layout: .i420, location: location, range: .video, command: command, residency: residency))
+    XCTAssertThrowsError(try rgb.encode(input: packed, output: output, width: 2, height: 2, bytesPerRow: 8,
+      format: .bgra8, commandBuffer: command, residency: residency))
+    XCTAssertEqual(residency.allocationCount, 0)
+  }
+
   func testGPUDecodesEveryFormatAtNativePrecisionWithRangeHeadroom() throws {
     for format in PlanarGPUFormat.allCases {
       let full = format == .full420

@@ -5,10 +5,12 @@ import SwiftUI
 
 /// A popover of the monitor tool bar: one of the toggled tools, clip
 /// indicators, or the picture's own settings.
-enum UIMonitorPanel: Hashable {
+enum UIMonitorPanel: Hashable, Identifiable {
   case tool(UIMonitorTool)
   case clipIndicators
   case picture
+
+  var id: Self { self }
 
   var title: String {
     switch self {
@@ -129,8 +131,18 @@ struct UIMonitorToolButtons: View {
   }
 
   var body: some View {
-    // An open popover keeps the bar it hangs from, whatever the pointer does.
-    if expanded || openPanel != nil { bar } else { rest }
+    ViewThatFits(in: .horizontal) {
+      // Each button has a fixed hit area. Fall back to the menu if they don't all fit.
+      Group {
+        if expanded || openPanel != nil { bar } else { rest }
+      }
+      .fixedSize(horizontal: true, vertical: false)
+      menu
+        .uiPictureControls()
+        .popover(item: $openPanel, arrowEdge: .bottom) { settings($0) }
+    }
+    .accessibilityElement(children: .contain)
+    .accessibilityLabel("Monitor tools for \(name)")
   }
 
   /// The tools button, then each enabled tool as a glyph that turns it off.
@@ -143,8 +155,6 @@ struct UIMonitorToolButtons: View {
       menu
     }
     .uiPictureControls()
-    .accessibilityElement(children: .contain)
-    .accessibilityLabel("Monitor tools for \(name)")
   }
 
   private func restGlyph(_ panel: UIMonitorPanel, action: @escaping () -> Void) -> some View {
@@ -159,22 +169,23 @@ struct UIMonitorToolButtons: View {
   }
 
   private var menu: some View {
-    Menu {
+    let titles = activeTitles
+    return Menu {
       ForEach(UIMonitorTool.allCases, id: \.self) { tool in
         Toggle(tool.title, isOn: Binding(get: { activeTools.contains(tool) }, set: { _ in toggle(tool) }))
           .disabled(UIMonitorToolSettingsView.unavailableReason(tool, isProgram: isProgram) != nil)
       }
       Toggle(UIMonitorPanel.clipIndicators.title, isOn: Binding(get: { clipOn }, set: { _ in toggleClip() }))
       Divider()
-      // A menu can't hold the settings, so these open the same popover the bar's chevrons
-      // do: the full bar comes up with it, from its own chevron.
+      // The settings open from the matching chevron when it fits, or from this menu.
       Menu("Settings") {
         ForEach(Self.panels, id: \.self) { panel in
           Button("\(panel.title)\u{2026}") { openPanel = panel }
         }
       }
     } label: {
-      Image(systemName: UISymbol.monitorTools(anyOn: !activeTitles.isEmpty))
+      Label("Monitor tools for \(name)", systemImage: UISymbol.monitorTools(anyOn: !titles.isEmpty))
+        .labelStyle(.iconOnly)
         .font(.callout.weight(.medium))
         .foregroundStyle(.white)
         .frame(width: 28, height: 24)
@@ -184,7 +195,7 @@ struct UIMonitorToolButtons: View {
     .buttonStyle(.plain)
     .menuIndicator(.hidden)
     .fixedSize()
-    .help(activeTitles.isEmpty ? "Monitor tools" : "Monitor tools: " + activeTitles.joined(separator: ", "))
+    .help(titles.isEmpty ? "Monitor tools" : "Monitor tools: " + titles.joined(separator: ", "))
     .accessibilityLabel("Monitor tools for \(name)")
   }
 
@@ -207,12 +218,10 @@ struct UIMonitorToolButtons: View {
         .popover(isPresented: presented(.picture), arrowEdge: .bottom) { settings(.picture) }
     }
     .uiPictureControls()
-    .accessibilityElement(children: .contain)
-    .accessibilityLabel("Monitor tools for \(name)")
   }
 
   private func presented(_ panel: UIMonitorPanel) -> Binding<Bool> {
-    Binding(get: { openPanel == panel }, set: { if !$0 { openPanel = nil } })
+    Binding(get: { openPanel == panel }, set: { if !$0 && openPanel == panel { openPanel = nil } })
   }
 
   private func settings(_ panel: UIMonitorPanel) -> some View {
@@ -240,6 +249,7 @@ private struct UIMonitorToolSplitButton: View {
       }
       .buttonStyle(.plain)
       .disabled(unavailableReason != nil)
+      .opacity(unavailableReason == nil ? 1 : 0.45)
       .help(unavailableReason ?? "\(isOn ? "Turn off" : "Turn on") \(panel.title)")
       .accessibilityLabel(panel.title)
       .accessibilityValue(isOn ? "On" : "Off")
@@ -257,7 +267,6 @@ private struct UIMonitorToolSplitButton: View {
       .help("\(panel.title) settings")
       .accessibilityLabel("\(panel.title) settings")
     }
-    .opacity(unavailableReason == nil ? 1 : 0.45)
   }
 }
 
@@ -293,10 +302,16 @@ struct UIMonitorToolSettingsView: View {
   let provider: any UIMonitorSettingsProviding
   /// Over a narrow picture: the groups in one column (`UIToolLayout.singleColumnPanelWidth`).
   let singleColumn: Bool
+  /// The visible snapshot invalidates the popover when a control changes.
   @State private var preferences: MonitorFeedPreferences
-  /// The provider snapshot represented by `preferences` when the popover last synchronized.
-  /// Keeping this separately lets us distinguish an external update from our own write.
-  @State private var synchronizedPreferences: MonitorFeedPreferences
+
+  /// Each control edits the provider's latest snapshot, including changes made in another window.
+  private var settingsBinding: Binding<MonitorFeedPreferences> {
+    Binding(get: { provider.preferences(for: cameraID) }, set: { value in
+      provider.setPreferences(value, for: cameraID)
+      preferences = provider.preferences(for: cameraID)
+    })
+  }
 
   init(panel: UIMonitorPanel, cameraID: String, cameraName: String, isProgram: Bool,
     provider: any UIMonitorSettingsProviding, singleColumn: Bool = false) {
@@ -308,7 +323,6 @@ struct UIMonitorToolSettingsView: View {
     self.singleColumn = singleColumn
     let initial = provider.preferences(for: cameraID)
     _preferences = State(initialValue: initial)
-    _synchronizedPreferences = State(initialValue: initial)
   }
 
   init(tool: UIMonitorTool, cameraID: String, cameraName: String, isProgram: Bool, provider: any UIMonitorSettingsProviding) {
@@ -367,11 +381,11 @@ struct UIMonitorToolSettingsView: View {
   /// Zebra has a switch per set, false color its mode, the picture none.
   private var headerSwitch: (label: String, isOn: Binding<Bool>)? {
     switch panel {
-    case .tool(.guides): return ("Guides", UIMonitorToolBindings.enabling($preferences, \.state.guides.enabled))
-    case .tool(.focus): return ("Focus peaking", UIMonitorToolBindings.enabling($preferences, \.state.focus.enabled))
-    case .tool(.scopes): return ("Scope", UIMonitorToolBindings.enabling($preferences, \.scopes.enabled))
+    case .tool(.guides): return ("Guides", UIMonitorToolBindings.enabling(settingsBinding, \.state.guides.enabled))
+    case .tool(.focus): return ("Focus peaking", UIMonitorToolBindings.enabling(settingsBinding, \.state.focus.enabled))
+    case .tool(.scopes): return ("Scope", UIMonitorToolBindings.enabling(settingsBinding, \.scopes.enabled))
     case .clipIndicators:
-      return ("Clip indicators", UIMonitorToolBindings.enabling($preferences, \.state.clipIndicators.enabled))
+      return ("Clip indicators", UIMonitorToolBindings.enabling(settingsBinding, \.state.clipIndicators.enabled))
     case .tool(.zebra), .tool(.falseColor), .picture: return nil
     }
   }
@@ -423,31 +437,22 @@ struct UIMonitorToolSettingsView: View {
     // Slider updates should only redraw the value and monitor surface. Do not
     // animate the popover or its host layout while a value is being dragged.
     .transaction { transaction in transaction.animation = nil }
-    .onChange(of: preferences) { _, value in
-      provider.setPreferences(value, for: cameraID)
-      synchronizedPreferences = value
-    }
-    // A provider update can arrive while this popover is open (for example from
-    // another surface). Refresh the local draft before the next edit so a later
-    // slider change cannot write the stale draft back over that newer state.
     .onChange(of: provider.preferences(for: cameraID)) { _, value in
-      guard value != synchronizedPreferences else { return }
       preferences = value
-      synchronizedPreferences = value
     }
   }
 
   @ViewBuilder private var settings: some View {
     switch panel {
-    case .tool(.guides): UIGuideSettingsForm(preferences: $preferences, cameraID: cameraID)
-    case .tool(.zebra): UIZebraSettingsForm(preferences: $preferences, cameraID: cameraID, isProgram: isProgram)
-    case .tool(.falseColor): UIFalseColorSettingsForm(preferences: $preferences, cameraID: cameraID, isProgram: isProgram)
-    case .tool(.focus): UIFocusSettingsForm(preferences: $preferences, cameraID: cameraID)
+    case .tool(.guides): UIGuideSettingsForm(preferences: settingsBinding, cameraID: cameraID)
+    case .tool(.zebra): UIZebraSettingsForm(preferences: settingsBinding, cameraID: cameraID, isProgram: isProgram)
+    case .tool(.falseColor): UIFalseColorSettingsForm(preferences: settingsBinding, cameraID: cameraID, isProgram: isProgram)
+    case .tool(.focus): UIFocusSettingsForm(preferences: settingsBinding, cameraID: cameraID)
     case .tool(.scopes):
-      UIScopeSettingsForm(preferences: $preferences, isProgram: isProgram,
+      UIScopeSettingsForm(preferences: settingsBinding, isProgram: isProgram,
         measurement: provider.scopeMeasurement(for: cameraID))
-    case .clipIndicators: UIClipIndicatorSettingsForm(preferences: $preferences, cameraID: cameraID, isProgram: isProgram)
-    case .picture: UIPictureSettingsForm(preferences: $preferences, cameraID: cameraID, isProgram: isProgram,
+    case .clipIndicators: UIClipIndicatorSettingsForm(preferences: settingsBinding, cameraID: cameraID, isProgram: isProgram)
+    case .picture: UIPictureSettingsForm(preferences: settingsBinding, cameraID: cameraID, isProgram: isProgram,
       cameraName: cameraName, provider: provider)
     }
   }

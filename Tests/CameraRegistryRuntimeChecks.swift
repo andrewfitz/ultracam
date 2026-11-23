@@ -47,9 +47,10 @@ import XCTest
   }
 
   func testQueuedPublicationCannotRebaseIntentSupersededByCapture() throws {
-    let old = VirtualCameraRegistrySnapshot(generation: 1, devices: [
+    let group = "group.org.ultracam.registry-intent-test.\(UUID().uuidString)"
+    let old = VirtualCameraRegistrySnapshot(generation: 1, appGroupIdentifier: group, devices: [
       .feed(feedID: FeedID.primary.rawValue, displayName: "Old")])
-    let newest = VirtualCameraRegistrySnapshot(generation: 2, devices: [
+    let newest = VirtualCameraRegistrySnapshot(generation: 2, appGroupIdentifier: group, devices: [
       .feed(feedID: FeedID.primary.rawValue, displayName: "Newest")])
     VirtualCameraRegistryTransport.recordIntent(old)
     // Capture records its current intent before acquiring the transport lock.
@@ -241,6 +242,26 @@ import XCTest
     XCTAssertNil(camera.runtime(for: feed.id))
     XCTAssertNil(retainedRuntime())
     XCTAssertTrue(camera.devices.isEmpty)
+  }
+
+  func testNativeRemovalFailureRetriesWithoutAnotherRegistryWrite() throws {
+    let feed = VirtualCameraDescriptor.feed(feedID: "automatic-removal-retry")
+    let camera = CameraProvider(automaticTimers: false, createNativeProvider: false,
+      registrySnapshot: snapshot([feed]))
+    let removed = expectation(description: "Idle device removed on retry")
+    var attempts = 0
+    camera.removeDeviceForTesting = { _ in
+      attempts += 1
+      if attempts == 1 { throw VideoError.message("Native removal failed") }
+      removed.fulfill()
+    }
+    try camera.reconcile(snapshot([], generation: 2))
+    wait(for: [removed], timeout: 4)
+    camera.queue.sync {
+      XCTAssertNil(camera.runtime(for: feed.id))
+      XCTAssertTrue(camera.devices.isEmpty)
+      XCTAssertEqual(attempts, 2)
+    }
   }
 
   private func snapshot(_ devices: [VirtualCameraDescriptor], generation: UInt64 = 1)

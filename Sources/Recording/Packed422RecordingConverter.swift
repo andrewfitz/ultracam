@@ -37,7 +37,7 @@ final class Packed422RecordingConverter: @unchecked Sendable {
     default: throw Failure.unsupportedSource
     }
     let width = CVPixelBufferGetWidth(source), height = CVPixelBufferGetHeight(source)
-    guard width.isMultiple(of: 2), !CVPixelBufferIsPlanar(source),
+    guard Self.supportedGeometry(width: width, height: height), !CVPixelBufferIsPlanar(source),
       let surface = CVPixelBufferGetIOSurface(source)?.takeUnretainedValue() else { throw Failure.unsupportedSource }
     try format.validate(width: width, height: height, rowBytes: CVPixelBufferGetBytesPerRow(source), dataSize: IOSurfaceGetAllocSize(surface))
     let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Uint, width: width / 2, height: height, mipmapped: false)
@@ -54,13 +54,19 @@ final class Packed422RecordingConverter: @unchecked Sendable {
   func convertUYVA(_ source: MTLBuffer, owner: AnyObject, width: Int, height: Int,
                    rowBytes: Int, alphaRowBytes: Int, output: CVPixelBuffer? = nil,
                    completion: @escaping Completion) throws {
-    guard width > 0, width.isMultiple(of: 2), source.device.registryID == device.registryID else { throw Failure.unsupportedSource }
+    guard Self.supportedGeometry(width: width, height: height), source.device.registryID == device.registryID else {
+      throw Failure.unsupportedSource
+    }
     try Packed422Format.uyva.validate(width: width, height: height, rowBytes: rowBytes,
       dataSize: source.length, alphaRowBytes: alphaRowBytes)
     let lease = try budget.acquire(backingID: source.gpuAddress, bytes: source.allocatedSize, generation: 0, owner: owner)
     try submit(width: width, height: height, format: .uyva, texture: nil, buffer: source,
       rowBytes: rowBytes, alphaRowBytes: alphaRowBytes, owner: owner, sourceImage: nil, sourceLease: lease,
       output: output, completion: completion)
+  }
+
+  private static func supportedGeometry(width: Int, height: Int) -> Bool {
+    width > 0 && width <= 16384 && width.isMultiple(of: 2) && height > 0 && height <= 16384
   }
 
   private func submit(width: Int, height: Int, format: Packed422Format, texture: MTLTexture?, buffer: MTLBuffer?,

@@ -149,6 +149,41 @@ import XCTest
     fixture.stop()
   }
 
+  func testPairedAudioFromBeforeTakeInstallCannotOpenOrAnchorTheNewTake() throws {
+    let audio = try SourceAudioFormat(sampleRate: 44100, channels: 1, sample: .float32,
+      interleaved: true, layout: AudioChannelMap(), clock: .pairedWithFrames)
+    let fixture = try AuditCaptureFixture(audio: .present(audio))
+    let writer = AuditPairedWriter()
+    let configuration = try SourceRecordingConfiguration(feedID: SourceRecordingFeedID("take-install-audio-audit"),
+      outputURL: URL(fileURLWithPath: "/tmp/unused-take-install-audio-audit.mov"), width: 128, height: 72)
+    let recorder = try SourceRecorderCore(configuration: configuration, writerFactory: { writer })
+    let adapter = SourceRecordingCallbackAdapter(feedID: configuration.feedID, recorder: recorder)
+    defer { fixture.stop(); try? adapter.stop() }
+    try fixture.start(self)
+
+    let priorVideoTime = CMTime(value: 20, timescale: 1)
+    let firstTakeVideoTime = CMTimeAdd(priorVideoTime, VideoContract.fastDuration)
+    try fixture.frame(time: priorVideoTime)
+    let priorVideoSequence = fixture.source.context.nextSequence - 1
+    try fixture.barrier(self, message: "Previous picture was delivered") { _ in }
+
+    try adapter.start()
+    XCTAssertTrue(fixture.controller.setRecordingCallbacks(feedID: fixture.feed, callbacks: adapter.callbacks))
+    try fixture.packet(audio, time: CMTime(value: 700000, timescale: 44100), pairedFrameSequence: priorVideoSequence)
+    try fixture.frame(time: firstTakeVideoTime)
+    let firstTakeVideoSequence = fixture.source.context.nextSequence - 1
+    try fixture.packet(audio, time: CMTime(value: 700008, timescale: 44100))
+    let firstPairedAudioTime = CMTime(value: 700016, timescale: 44100)
+    try fixture.packet(audio, time: firstPairedAudioTime, pairedFrameSequence: firstTakeVideoSequence)
+    fixture.source.stop()
+    try adapter.stop()
+
+    XCTAssertEqual(recorder.state, .finished, recorder.telemetry.lastError ?? "")
+    XCTAssertEqual(recorder.telemetry.audioBeforeFirstFrame, 2)
+    XCTAssertEqual(writer.packetTimes, [firstPairedAudioTime])
+    XCTAssertEqual(writer.videoTimes, [firstTakeVideoTime])
+  }
+
   /// Skipped, as it must be, but no longer uncounted, through the real adapter.
   func testAudioBeforeTheFirstFrameIsCounted() throws {
     let audio = try SourceAudioFormat(sampleRate: 44100, channels: 1, sample: .float32,

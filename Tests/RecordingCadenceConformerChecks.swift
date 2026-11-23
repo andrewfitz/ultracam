@@ -22,6 +22,28 @@ import XCTest
     XCTAssertEqual(c.statistics.emitted, 0)
     XCTAssertEqual(try c.finish().map(\.frame), [1])
   }
+
+  func testGapLimitComparesMixedTimebasesWithoutRounding() throws {
+    let duration = CMTime(value: 1, timescale: 30)
+    var c = try RecordingCadenceConformer<Int>(frameDuration: duration, maximumGapDuration: duration)
+    let origin = CMTime(value: -99, timescale: 2_147_483_647)
+    // This gap exceeds 1/30 by about 0.016 ns and rounds down in CMTimeSubtract.
+    let tooLate = CMTime(value: 71_582_689, timescale: 2_147_483_639)
+    _ = try c.append(frame: 1, pts: origin, duration: duration)
+    XCTAssertThrowsError(try c.append(frame: 2, pts: tooLate, duration: duration)) {
+      guard case RecordingCadenceConformer<Int>.Failure.gapExceeded = $0 else {
+        return XCTFail("Unexpected failure \($0)")
+      }
+    }
+    let withinLimit = CMTime(value: tooLate.value - 1, timescale: tooLate.timescale)
+    XCTAssertEqual(try c.append(frame: 2, pts: withinLimit, duration: duration).map(\.frame), [1])
+
+    // This gap is within the limit even though CMTimeSubtract rounds it up.
+    var other = try RecordingCadenceConformer<Int>(frameDuration: duration, maximumGapDuration: duration)
+    _ = try other.append(frame: 3, pts: CMTime(value: -87, timescale: 2_147_483_647), duration: duration)
+    XCTAssertEqual(try other.append(frame: 4, pts: CMTime(value: 71_582_700, timescale: 2_147_483_629),
+      duration: duration).map(\.frame), [3])
+  }
   func testPauseReanchorsOnCommonGrid() throws {
     var c = try RecordingCadenceConformer<Int>(frameDuration: t(40))
     _ = try c.append(frame: 1, pts: t(1000), duration: t(40))
@@ -87,6 +109,20 @@ import XCTest
     XCTAssertThrowsError(try c.reanchor())
     XCTAssertEqual(c.statistics.emitted, 0)
     XCTAssertEqual(try c.finish().count, 2)
+  }
+
+  func testSuccessiveReanchorsReduceLargeTimestampsExactlyOrReject() throws {
+    let frame = CMTime(value: Int64.max / 2 + 2, timescale: 4)
+    var c = try RecordingCadenceConformer<Int>(frameDuration: frame, maximumGapDuration: frame)
+    _ = try c.append(frame: 1, pts: .zero, duration: frame)
+    XCTAssertEqual(try c.reanchor().count, 1)
+    _ = try c.append(frame: 2, pts: .zero, duration: frame)
+    XCTAssertEqual(try c.reanchor().first?.presentationTime, frame)
+    _ = try c.append(frame: 3, pts: .zero, duration: frame)
+    XCTAssertThrowsError(try c.reanchor())
+    let tail = try XCTUnwrap(c.finish().first)
+    XCTAssertEqual(tail.presentationTime.value, frame.value)
+    XCTAssertEqual(tail.presentationTime.timescale, 2)
   }
 
 }

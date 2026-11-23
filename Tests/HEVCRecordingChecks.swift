@@ -40,6 +40,7 @@ import XCTest
           sourceAdmission: source, sidecarMovieURL: url)
         let adapter = try SourceRecordingCallbackAdapter(configuration: configuration)
         try adapter.start()
+        XCTAssertEqual(adapter.telemetry.encoderInputFormat, "420v (native)")
         XCTAssertTrue(try XCTUnwrap(adapter.callbacks.takeContext)(.init(sourceAdmission: source, audioDeclaration: .absent)))
         var made: CVPixelBuffer?
         XCTAssertEqual(CVPixelBufferCreate(nil, 320, 240, format.pixel.rawValue,
@@ -98,8 +99,10 @@ import XCTest
     XCTAssertThrowsError(try RecordingProfileMatrix.repackRoute(.hevcMain, sourcePixel: .v210))
   }
   func testProductionConfigurationRejectsInvalidDimensionsBeforeWriterStart() {
-    XCTAssertThrowsError(try SourceRecordingConfiguration(feedID: SourceRecordingFeedID("invalid-hevc"),
-      outputURL: URL(fileURLWithPath: "/tmp/unused-hevc.mov"), width: 0, height: 1080,
-      videoProfile: .matrix(.hevcMain10_422)))
+    for width in [0, Int(Int32.max) + 1] {
+      XCTAssertThrowsError(try SourceRecordingConfiguration(feedID: SourceRecordingFeedID("invalid-hevc"),
+        outputURL: URL(fileURLWithPath: "/tmp/unused-hevc.mov"), width: width, height: 1080,
+        videoProfile: .matrix(.hevcMain10_422)))
+    }
   }
 }

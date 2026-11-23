@@ -190,6 +190,9 @@ extension UIPresentationBuilder {
 
   /// What gets a stopped camera going: Start Capture, or the step its missing input needs first.
   private static func startAction(_ camera: UICameraSnapshot) -> UIProblemAction {
+    guard camera.enabled else {
+      return UIProblemAction(title: "Details", action: .openDiagnosticsSection(.camera(camera.id)))
+    }
     if camera.deviceAvailable || camera.captureAuthorizationRequestable {
       return UIProblemAction(title: "Start Capture", action: .startCamera(cameraID: camera.id))
     }
@@ -227,6 +230,12 @@ extension UIPresentationBuilder {
           action: UIProblemAction(title: "Choose Folder…", action: .chooseRecordingFolder(cameraID: id)),
           alert: UIProblemAlert(key: incident, event: .driveLow, title: "Recording drive full",
             body: "\(name) has no space left"), rank: 50))
+      } else if camera.recording.failedToStart {
+        let title = "Couldn't start recording"
+        list.append(UIProblem(id: "take.\(id)", title: title, detail: camera.recording.error,
+          level: .damage, cameraID: id, action: details,
+          alert: UIProblemAlert(key: incident, event: .takeEndedEarly, title: "\(name) couldn't start recording",
+            body: camera.recording.error ?? title, showsPanel: true), dismiss: acknowledge, rank: 50))
       } else {
         list.append(UIProblem(id: "take.\(id)", title: "Take ended early", detail: [name, saved].compactMap { $0 }.joined(separator: ", "),
           level: .damage, cameraID: id, action: details,
@@ -258,6 +267,7 @@ extension UIPresentationBuilder {
 
     if camera.running {
       let lost = lostClock(camera).map { " \($0)" } ?? ""
+      let connector = camera.inputConnector ?? "HDMI"
       switch camera.signal {
       case .noSignal where onAirHere && session.programInUse:
         let others = session.cameras.contains { $0.id != id && canTakeCut($0) }
@@ -266,17 +276,20 @@ extension UIPresentationBuilder {
         let action = !auto ? next.map { UIProblemAction(title: "Cut to \($0.name)", action: .cut(cameraID: $0.id)) } : nil
         list.append(UIProblem(id: "onair.\(id)", title: lost.isEmpty ? "\(name) on air: no signal" : "\(name) signal lost\(lost)",
           detail: takeCountdown(camera) ?? "Still on Program", level: .damage, cameraID: id, action: action ?? details,
-          stripText: "Check \(name)'s HDMI", stripShort: "Check HDMI",
-          alert: UIProblemAlert(key: "onair.\(name)", event: .onAirLost, title: "\(name) signal lost",
+          stripText: "Check \(name)'s \(connector)", stripShort: "Check \(connector)",
+          alert: UIProblemAlert(event: .onAirLost, title: "\(name) signal lost",
             body: others ? "Still on Program" : "No camera has a picture", showsPanel: true), rank: 10))
       case .noSignal where rolling:
-        list.append(UIProblem(id: "signal.\(id)", title: lost.isEmpty ? "\(name): recording, no signal" : "\(name) signal lost\(lost)",
+        let paused = camera.recording.status == .paused
+        let state = paused ? "paused" : "recording"
+        list.append(UIProblem(id: "signal.\(id)", title: lost.isEmpty ? "\(name): \(state), no signal" : "\(name) signal lost\(lost)",
           detail: takeCountdown(camera), level: .damage, cameraID: id, action: details,
-          stripText: "Check \(name)'s HDMI", stripShort: "Check HDMI",
-          alert: UIProblemAlert(event: .recordingNoSignal, title: "\(name) recording, no signal", body: "The take ends if the signal stays off"), rank: 20))
+          stripText: "Check \(name)'s \(connector)", stripShort: "Check \(connector)",
+          alert: paused ? nil : UIProblemAlert(event: .recordingNoSignal, title: "\(name) recording, no signal",
+            body: "The take ends if the signal stays off"), rank: 20))
       case .noSignal where camera.inUse && !camera.clientWaiting:
         list.append(UIProblem(id: "signal.\(id)", title: lost.isEmpty ? "\(name): no signal" : "\(name) signal lost\(lost)",
-          level: .damage, cameraID: id, action: details, stripText: "Check \(name)'s HDMI", stripShort: "Check HDMI", rank: 15))
+          level: .damage, cameraID: id, action: details, stripText: "Check \(name)'s \(connector)", stripShort: "Check \(connector)", rank: 15))
       case .unsupported:
         list.append(UIProblem(id: "signal.\(id)", title: onAirHere && session.programInUse ? "\(name) on air: unsupported format" : "\(name): unsupported format",
           level: onAirHere && session.programInUse ? .damage : .notice, cameraID: id, action: details,
@@ -344,7 +357,8 @@ extension UIPresentationBuilder {
 
   /// "12:31 saved", the one way a take's saved length is written.
   static func takeSavedLine(_ camera: UICameraSnapshot) -> String? {
-    (camera.unexpectedStop?.savedDuration ?? camera.recording.savedDuration)
+    guard !camera.recording.failedToStart else { return nil }
+    return (camera.unexpectedStop?.savedDuration ?? camera.recording.savedDuration)
       .map { "\(UIFormat.shortElapsed($0)) saved" }
   }
 
@@ -388,7 +402,7 @@ extension UIPresentationBuilder {
         // The row says what happened and where Program went; seen, it goes. Diagnostics'
         // Program tab (recent cuts) stays a click away in the status bar.
         action: UIProblemAction(title: "Dismiss", action: .acknowledgeProgramMove),
-        alert: UIProblemAlert(key: "onair.\(moved.from)", event: .onAirLost, title: title,
+        alert: UIProblemAlert(key: "onair.\(moved.fromID)", event: .onAirLost, title: title,
           body: "Program moved to \(moved.to)", showsPanel: true), rank: 14))
     }
     if session.programQueueStalled, let onAir = onAir(session) {
@@ -456,7 +470,7 @@ extension UIPresentationBuilder {
   private static func starting(_ camera: UICameraSnapshot) -> Bool {
     if camera.captureAuthorizationPending { return true }
     if camera.running { return camera.signal == .none || camera.signal == .connecting }
-    return camera.automaticStart && !camera.automaticStartFailed && camera.deviceAvailable
+    return camera.acceptsAutomaticDemand
   }
 
   /// The offer to turn alerts on, as a row of the status bar's list: before a session only.

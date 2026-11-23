@@ -9,6 +9,7 @@
 # again (an identical binary) links to the newest copy.
 # Usage: archive-dsym.sh <dSYM> <symbols directory> <build id> [keep, default 20]
 set -euo pipefail
+export LC_ALL=C
 if [[ $# -lt 3 || $# -gt 4 ]]; then
   echo 'Usage: archive-dsym.sh <dSYM> <symbols directory> <build id> [keep]' >&2
   exit 2
@@ -50,36 +51,41 @@ if [[ -z "$uuids" ]]; then
   echo "dwarfdump found no UUID in $dsym" >&2
   exit 1
 fi
+archive_name="$(basename "$dsym")"
 copy="$symbols/$build_id"
-partial="$symbols/.$build_id.partial"
-# Also any copy an interrupted run left.
-rm -rf "$symbols"/.*.partial
-/usr/bin/ditto "$dsym" "$partial/$(basename "$dsym")" || {
-  rm -rf "$partial"
+if [[ -e "$copy" || -L "$copy" ]]; then
+  echo "A symbol archive already exists: $copy" >&2
   exit 1
-}
-rm -rf "$copy"
-mv "$partial" "$copy"
+fi
 for uuid in $uuids; do
   link="$symbols/$uuid"
-  # ln -sfn on a real directory would link inside it.
   if [[ -e "$link" && ! -L "$link" ]]; then
     echo "Cannot index UUID over an existing archive entry: $link" >&2
     exit 1
   fi
+done
+partial="$(mktemp -d "$symbols/.$build_id.XXXXXX")"
+trap 'rm -rf "$partial"' EXIT
+/usr/bin/ditto "$dsym" "$partial/$archive_name"
+mv "$partial" "$copy"
+for uuid in $uuids; do
+  link="$symbols/$uuid"
   if [[ -L "$link" && -d "$link" && "$(readlink "$link")" > "$build_id" ]]; then continue; fi
   ln -sfn "$build_id" "$link"
 done
-# Newest first: every real directory is one build's copy.
+# Count copies of this bundle under valid build IDs.
+entries=("$symbols"/*)
 kept=0
-for entry in $(/bin/ls -1 "$symbols" | /usr/bin/sort -r); do
-  path="$symbols/$entry"
-  if [[ -L "$path" || ! -d "$path" ]]; then continue; fi
+for ((index=${#entries[@]} - 1; index >= 0; index--)); do
+  path="${entries[index]}"
+  bundle="$path/$archive_name"
+  if [[ ! "${path##*/}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ || -L "$path" || -L "$bundle" || ! -d "$bundle" ]]; then continue; fi
   kept=$((kept + 1))
   if [[ "$kept" -gt "$keep" ]]; then rm -rf "$path"; fi
 done
-for entry in $(/bin/ls -1 "$symbols"); do
-  path="$symbols/$entry"
-  if [[ -L "$path" && ! -e "$path" ]]; then rm -f "$path"; fi
+for path in "${entries[@]}"; do
+  if [[ "${path##*/}" =~ ^[A-Fa-f0-9]{8}(-[A-Fa-f0-9]{4}){3}-[A-Fa-f0-9]{12}$ && -L "$path" && ! -e "$path" ]]; then
+    rm -f "$path"
+  fi
 done
 echo "Symbols: $copy ($(echo "$uuids" | /usr/bin/tr '\n' ' ' | /usr/bin/sed 's/ $//'))"

@@ -3,7 +3,7 @@ import AudioToolbox
 import MonitorKitAudio
 
 /// PCM interpretation shared by metering and source-level analysis. Int24 is right justified
-/// and sign extended in its 32-bit container, as in the source contract.
+/// in its 32-bit container.
 enum SourceAudioMeterInput {
   static func interleavedSamples(_ packet: CaptureAudioPacket) -> [Float] {
     let format = packet.format
@@ -60,7 +60,8 @@ enum SourceAudioMeterInput {
     case .int16:
       return Float(Int16(littleEndian: raw.loadUnaligned(fromByteOffset: offset, as: Int16.self))) / 32_768
     case .int24in32:
-      return Float(Int32(littleEndian: raw.loadUnaligned(fromByteOffset: offset, as: Int32.self))) / 8_388_608
+      let word = Int32(littleEndian: raw.loadUnaligned(fromByteOffset: offset, as: Int32.self))
+      return Float((word << 8) >> 8) / 8_388_608
     case .int32:
       return Float(Int32(littleEndian: raw.loadUnaligned(fromByteOffset: offset, as: Int32.self))) / 2_147_483_648
     case .float32:
@@ -76,7 +77,7 @@ enum SourceAudioMeterInput {
     var level = 0.0
     for value in peaks where value.isFinite { peak = max(peak, value) }
     for value in rms where value.isFinite { level = max(level, value) }
-    return (Float(peak), Float(level))
+    return (Float(min(peak, 1)), Float(min(level, 1)))
   }
 }
 

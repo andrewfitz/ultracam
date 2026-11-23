@@ -31,6 +31,13 @@ final class UIMenuCommandBox: NSObject {
   init(_ commands: [UIMenuCommand]) { self.commands = commands }
 }
 
+extension UISessionSnapshot {
+  /// A visible preview can supply demand for this camera, including while macOS asks for access.
+  var menuPreviewCandidate: UICameraSnapshot? {
+    cameras.first { $0.acceptsAutomaticDemand && $0.previewEnabled }
+  }
+}
+
 @MainActor final class UIMenuBarController: NSObject, NSMenuDelegate {
   let model: AppModel
   let interface: UIInterfaceState
@@ -40,7 +47,7 @@ final class UIMenuCommandBox: NSObject {
 
   private let statusItem: NSStatusItem
   private let menu = NSMenu()
-  private var previewHost: NSHostingView<AnyView>?
+  private var previewHost: NSHostingView<UIMenuPreviewCard>?
   private var previewItem: NSMenuItem?
   private var includesPreviewCommand = false
   private var showLivePreview = false
@@ -50,7 +57,7 @@ final class UIMenuCommandBox: NSObject {
   private var refreshTimer: Timer?
   private var lastIcon: UIMenuBarIcon?
   private var iconUpdateScheduled = false
-  private var lastIconUpdate = Date.distantPast
+  private var lastIconUpdate: TimeInterval = 0
 
   init(model: AppModel, interface: UIInterfaceState) {
     self.model = model
@@ -60,8 +67,7 @@ final class UIMenuCommandBox: NSObject {
     menu.delegate = self
     menu.autoenablesItems = false
     statusItem.menu = menu
-    updateIcon()
-    track()
+    trackIcon()
   }
 
   // MARK: Bridge
@@ -94,30 +100,29 @@ final class UIMenuCommandBox: NSObject {
   // MARK: Icon
 
   /// Re-arms Observation after every change; updates are coalesced to at most one a second.
-  private func track() {
-    withObservationTracking {
-      _ = bridge().presentation().menuBarIcon
+  private func trackIcon() {
+    let icon = withObservationTracking {
+      UIPresentationBuilder.menuBarIcon(bridge().snapshot())
     } onChange: { [weak self] in
       Task { @MainActor [weak self] in self?.scheduleIconUpdate() }
     }
+    updateIcon(icon)
   }
 
   private func scheduleIconUpdate() {
     guard !iconUpdateScheduled else { return }
     iconUpdateScheduled = true
-    let delay = max(0, 1 - Date().timeIntervalSince(lastIconUpdate))
+    let delay = max(0, 1 - (ProcessInfo.processInfo.systemUptime - lastIconUpdate))
     Task { @MainActor [weak self] in
       try? await Task.sleep(for: .seconds(delay))
       guard let self else { return }
       self.iconUpdateScheduled = false
-      self.updateIcon()
-      self.track()
+      self.trackIcon()
     }
   }
 
-  private func updateIcon() {
-    lastIconUpdate = Date()
-    let icon = bridge().presentation().menuBarIcon
+  private func updateIcon(_ icon: UIMenuBarIcon) {
+    lastIconUpdate = ProcessInfo.processInfo.systemUptime
     guard icon != lastIcon, let button = statusItem.button else { return }
     lastIcon = icon
     button.image = Self.image(for: icon)
@@ -168,9 +173,7 @@ final class UIMenuCommandBox: NSObject {
 
   func menuWillOpen(_ menu: NSMenu) {
     menuOpen = true
-    // NSMenu doesn't rebuild its rows while open, but the preview card does: an automatic
-    // cut left the card showing one camera on air and the rows checking another. Common
-    // modes, so the timer also fires while the menu tracks the mouse.
+    // Update the rows and preview from the same snapshot while the menu tracks the mouse.
     refreshTimer?.invalidate()
     let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
       MainActor.assumeIsolated { self?.refreshOpenMenu() }
@@ -195,7 +198,7 @@ final class UIMenuCommandBox: NSObject {
     let session = bridge.snapshot()
     let presentation = UIPresentationBuilder.session(session)
     includesPreviewCommand = Self.waitingForPreview(presentation, session: session)
-    let host = NSHostingView(rootView: card(width: UIMenuPreviewContent.minimumWidth))
+    let host = NSHostingView(rootView: card(presentation, session: session, width: UIMenuPreviewContent.minimumWidth))
     host.frame.size = host.fittingSize
     let item = NSMenuItem()
     item.view = host
@@ -209,7 +212,7 @@ final class UIMenuCommandBox: NSObject {
     // picture fills the menu and stays centered instead of sitting at the left.
     previewWidth = max(UIMenuPreviewContent.minimumWidth, menu.size.width.rounded(.down))
     if previewWidth > host.frame.width {
-      host.rootView = card(width: previewWidth)
+      host.rootView = card(presentation, session: session, width: previewWidth)
       host.frame.size = host.fittingSize
     }
   }
@@ -217,9 +220,15 @@ final class UIMenuCommandBox: NSObject {
   /// Session changes update the rows in place. A change to the configured cameras or
   /// Program availability can still change the menu's structure.
   private func refreshOpenMenu() {
-    guard menuOpen, let previewItem else { return }
+    guard menuOpen, let previewItem, let previewHost else { return }
     let session = bridge().snapshot()
-    let fresh = Self.buildItems(presentation: UIPresentationBuilder.session(session), session: session, target: self,
+    guard session != previewHost.rootView.session else { return }
+    let presentation = UIPresentationBuilder.session(session)
+    previewHost.rootView = card(presentation, session: session, width: previewWidth)
+    let size = previewHost.fittingSize
+    if previewHost.frame.size != size { previewHost.frame.size = size }
+    includesPreviewCommand = includesPreviewCommand || Self.waitingForPreview(presentation, session: session)
+    let fresh = Self.buildItems(presentation: presentation, session: session, target: self,
       previewItem: previewItem, includesPreviewCommand: includesPreviewCommand, showLivePreview: showLivePreview)
     guard !Self.refresh(menu.items, with: fresh) else { return }
     menu.removeAllItems()
@@ -269,8 +278,8 @@ final class UIMenuCommandBox: NSObject {
     }
   }
 
-  private func card(width: CGFloat) -> AnyView {
-    AnyView(UIMenuPreviewCard(model: model, interface: interface, showLive: showLivePreview, width: width))
+  private func card(_ presentation: UISessionPresentation, session: UISessionSnapshot, width: CGFloat) -> UIMenuPreviewCard {
+    UIMenuPreviewCard(model: model, presentation: presentation, session: session, showLive: showLivePreview, width: width)
   }
 
   // MARK: Actions
@@ -347,7 +356,7 @@ final class UIMenuCommandBox: NSObject {
   }()
 
   private static func waitingForPreview(_ presentation: UISessionPresentation, session: UISessionSnapshot) -> Bool {
-    !presentation.camerasRunning && session.cameras.contains(where: \.automaticStart)
+    !presentation.camerasRunning && session.cameras.contains(where: \.acceptsAutomaticDemand)
   }
 
   /// No row depends on the window's selection.
@@ -365,7 +374,7 @@ final class UIMenuCommandBox: NSObject {
     if problems.contains(where: { $0.level == .damage }) { attention.image = damageImage }
     items.append(attention)
     if includesPreviewCommand ?? waiting {
-      items.append(row("Show Live Preview", [.showLivePreview], enabled: waiting && !showLivePreview,
+      items.append(row("Show Live Preview", [.showLivePreview], enabled: waiting && session.menuPreviewCandidate != nil && !showLivePreview,
         symbol: UISymbol.showPreview, target: target))
     }
     items.append(.separator())
@@ -445,10 +454,11 @@ final class UIMenuCommandBox: NSObject {
 
     // A separator above it, so a slip off a camera row can't land on it. It keeps its prompt.
     items.append(.separator())
+    let canStop = presentation.cameras.contains(where: \.canStop)
     items.append(row(presentation.camerasControlTitle,
-      action(presentation.cameras.contains(where: \.canStop) ? .stopAllCameras : .startAllCameras), key: "\r", modifiers: .command,
+      action(canStop ? .stopAllCameras : .startAllCameras), key: "\r", modifiers: .command,
       enabled: presentation.canStartAny,
-      symbol: presentation.camerasRunning ? UISymbol.stop : UISymbol.start, target: target))
+      symbol: canStop ? UISymbol.stop : UISymbol.start, target: target))
 
     items.append(.separator())
     items.append(row("Open Ultracam", action(.openMainWindow), key: "0", modifiers: .command, symbol: UISymbol.openWindow, target: target))
@@ -464,6 +474,7 @@ final class UIMenuCommandBox: NSObject {
     var status: [String] = []
     if let label = camera.tally.label { status.append(label) }
     switch camera.stripState {
+    case .starting: status.append("Starting recording…")
     case .recording, .updating: status.append("REC \(UIFormat.shortElapsed(snapshot?.recording.elapsed ?? 0))")
     case .recordingNoSignal: status.append("REC, no signal")
     case .paused: status.append("Paused \(UIFormat.shortElapsed(snapshot?.recording.elapsed ?? 0))")
@@ -524,23 +535,19 @@ final class UIMenuCommandBox: NSObject {
 
 // MARK: - Preview card
 
-/// Live card for the menu's first item. Reading the models in `body` keeps it
-/// current while the menu is open; it is torn down when the menu closes.
+/// Live pictures and meters, with the status snapshot used by the menu's rows.
 struct UIMenuPreviewCard: View {
   let model: AppModel
-  let interface: UIInterfaceState
+  let presentation: UISessionPresentation
+  let session: UISessionSnapshot
   let showLive: Bool
   /// The menu's width, so the card fills it edge to edge.
   var width = UIMenuPreviewContent.minimumWidth
 
   var body: some View {
-    TimelineView(.periodic(from: .now, by: 1)) { _ in
-      let session = UISessionBridge.live(model: model, interface: interface).snapshot()
-      UIMenuPreviewContent(presentation: UIPresentationBuilder.session(session), session: session,
-        pictures: UIAppPictures(model: model), showLive: showLive, width: width)
-    }
-    // The meter bars read the camera's tap every refresh, not this 1 s snapshot.
-    .environment(\.uiAudioMeters, UIAudioMeterSource { [model] in model.audioMeterTap(for: FeedID(rawValue: $0)) })
+    UIMenuPreviewContent(presentation: presentation, session: session,
+      pictures: UIAppPictures(model: model), showLive: showLive, width: width)
+      .environment(\.uiAudioMeters, UIAudioMeterSource { [model] in model.audioMeterTap(for: FeedID(rawValue: $0)) })
   }
 }
 
@@ -556,9 +563,12 @@ struct UIMenuPreviewContent: View {
   static let minimumWidth: CGFloat = 340
 
   /// Nothing runs and a camera starts with meeting apps: the menu's own "waiting" (D7: never the selection).
-  private var waiting: Bool { !presentation.camerasRunning && session.cameras.contains(where: \.automaticStart) }
-  /// The cameras that start with meeting apps: Show Live Preview shows one of them while waiting.
-  private var autoStarted: Set<String> { Set(session.cameras.filter(\.automaticStart).map(\.id)) }
+  private var waiting: Bool { !presentation.camerasRunning && session.cameras.contains(where: \.acceptsAutomaticDemand) }
+  /// Keep demand on the requested camera after capture starts, even if it is beyond the first two.
+  private var requestedPreview: UICameraPresentation? {
+    guard showLive, !presentation.outputInUse, let id = session.menuPreviewCandidate?.id else { return nil }
+    return presentation.cameras.first { $0.id == id }
+  }
   private var recordingCameras: [UICameraSnapshot] {
     session.cameras.filter { $0.recording.status == .recording || $0.recording.status == .paused }
   }
@@ -570,11 +580,13 @@ struct UIMenuPreviewContent: View {
           placeholder
         } else if session.programInUse {
           programPicture
+        } else if let requestedPreview {
+          cameraPicture(requestedPreview)
         } else if twoUp {
           HStack(spacing: 6) {
             ForEach(presentation.cameras.prefix(2)) { camera in miniPicture(camera) }
           }
-        } else if let shown = waiting ? presentation.cameras.first(where: { autoStarted.contains($0.id) }) : presentation.previewCamera {
+        } else if let shown = presentation.previewCamera {
           cameraPicture(shown)
         }
       }
@@ -586,7 +598,7 @@ struct UIMenuPreviewContent: View {
         .frame(maxWidth: .infinity)
       }
       // Only the two-picture layout has nothing on it that says whether a meeting uses Ultracam.
-      if twoUp && !showsPlaceholder {
+      if twoUp && !showsPlaceholder && requestedPreview == nil {
         Text(presentation.outputSummary)
           .font(.uiMeta)
           .foregroundStyle(.secondary)
@@ -604,18 +616,20 @@ struct UIMenuPreviewContent: View {
 
   private var thumbnailWidth: CGFloat { ((width - 24 - 6 * 3) / 4).rounded(.down) }
 
-  private var showsPlaceholder: Bool { !presentation.camerasRunning && !(waiting && showLive) }
+  private var showsPlaceholder: Bool { !presentation.camerasRunning && requestedPreview == nil }
   /// Two small pictures side by side while no meeting uses either camera.
   private var twoUp: Bool { session.cameras.count >= 2 && !presentation.outputInUse }
 
   private var placeholder: some View {
-    UIColumnPictureLayout { RoundedRectangle(cornerRadius: 10).fill(Color.black) }
+    let accessPending = session.cameras.contains(where: \.captureAuthorizationPending)
+    return UIColumnPictureLayout { RoundedRectangle(cornerRadius: 10).fill(Color.black) }
       .overlay {
         VStack(spacing: 6) {
           Image(systemName: waiting ? UISymbol.waitingCamera : UISymbol.camera).font(.system(size: 26, weight: .light))
-          Text(waiting ? "Waiting to start" : "Capture stopped")
+          Text(accessPending ? "Waiting for capture access" : waiting ? "Waiting to start" : "Capture stopped")
             .font(.callout.weight(.semibold))
-          Text(waiting ? "Starts when a meeting app opens Ultracam."
+          Text(accessPending ? "Respond to the camera access prompt to start capture."
+            : waiting ? "Starts when a meeting app opens Ultracam."
             : presentation.canStartAny ? "Start Capture to receive video." : "Connect an input or choose one in the inspector.")
             .font(.caption).foregroundStyle(.white.opacity(0.6)).multilineTextAlignment(.center)
         }
@@ -701,10 +715,11 @@ struct UIMenuPreviewContent: View {
   }
 
   @ViewBuilder private func recPill(for cameras: [UICameraSnapshot]) -> some View {
-    if !cameras.isEmpty {
-      let paused = cameras.allSatisfy { $0.recording.status == .paused }
-      let longest = cameras.map(\.recording.elapsed).max() ?? 0
-      UIPictureStatePill(style: paused ? .paused : .recording, count: cameras.count,
+    let started = cameras.filter { !$0.recording.isStarting }
+    if !started.isEmpty {
+      let paused = started.allSatisfy { $0.recording.status == .paused }
+      let longest = started.map(\.recording.elapsed).max() ?? 0
+      UIPictureStatePill(style: paused ? .paused : .recording, count: started.count,
         elapsed: UIFormat.shortElapsed(longest), compact: true, spokenElapsed: UIFormat.spokenElapsed(longest))
     }
   }

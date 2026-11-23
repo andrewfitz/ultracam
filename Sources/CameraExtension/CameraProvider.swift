@@ -157,6 +157,16 @@ final class CameraDeviceRuntime: NSObject, CMIOExtensionProviderSource, @uncheck
   private let output: ((CMSampleBuffer, CMIOExtensionStream.DiscontinuityFlags, UInt64) -> Void)?
   let logger = Logger(subsystem: VideoContract.extensionID, category: "camera")
   private(set) var formats: [CMIOExtensionStreamFormat] = []
+  private static let frameDurations = FrameRateTarget.allCases.map(\.duration)
+  // CMIO's stream formats have only read-only properties. Every runtime
+  // publishes the same catalog, so share these objects across all devices.
+  private nonisolated(unsafe) static let publishedFormats = Result<[CMIOExtensionStreamFormat], Error> {
+    try OutputFormatCatalog.descriptions().map { description in
+      CMIOExtensionStreamFormat(formatDescription: description,
+        maxFrameDuration: FrameRateTarget.fps23976.duration, minFrameDuration: FrameRateTarget.fps120.duration,
+        validFrameDurations: frameDurations)
+    }
+  }
 
   init(automaticTimers: Bool = true, createNativeProvider: Bool = true,
     queue: DispatchQueue? = nil,
@@ -171,11 +181,7 @@ final class CameraDeviceRuntime: NSObject, CMIOExtensionProviderSource, @uncheck
     super.init()
     self.queue.setSpecific(key: Self.queueKey, value: ObjectIdentifier(self.queue))
     do {
-      formats = try OutputFormatCatalog.descriptions().map { description in
-        CMIOExtensionStreamFormat(formatDescription: description,
-          maxFrameDuration: FrameRateTarget.fps23976.duration, minFrameDuration: FrameRateTarget.fps120.duration,
-          validFrameDurations: FrameRateTarget.allCases.map(\.duration))
-      }
+      formats = try Self.publishedFormats.get()
       // CMIOExtensionProvider is a process singleton. In-process tests create
       // native streams/devices but omit a second native provider registration.
       // Always hand CMIO the resolved serialization queue.  The initializer's
@@ -250,10 +256,9 @@ final class CameraDeviceRuntime: NSObject, CMIOExtensionProviderSource, @uncheck
     guard formats.indices.contains(nextIndex) else { throw VideoError.message("Unsupported camera format.") }
     let nextDuration: CMTime
     if let requested = frameDuration {
-      let allowed = FrameRateTarget.allCases.map(\.duration)
       let normalized = fromProducer
-        ? allowed.first(where: { DerivedOutputContract.sameDuration(requested, $0) })
-        : DerivedOutputContract.clientDuration(requested, allowed: allowed)
+        ? Self.frameDurations.first(where: { DerivedOutputContract.sameDuration(requested, $0) })
+        : DerivedOutputContract.clientDuration(requested, allowed: Self.frameDurations)
       guard let normalized else { throw VideoError.message("Unsupported camera frame rate; choose an advertised cadence.") }
       nextDuration = normalized
     } else { nextDuration = duration }
@@ -353,9 +358,12 @@ final class CameraDeviceRuntime: NSObject, CMIOExtensionProviderSource, @uncheck
       // Only the signature-authorized producer may select an existing entry.
       // Sample metadata remains exact, even when a client property setter used
       // a rounded Double representation of that same published cadence.
-      guard producerCanNegotiate, let index = formats.firstIndex(where: {
-        DerivedOutputContract(format: $0.formatDescription, duration: sampleDuration).mismatch(sample) == nil
-      }) else { return mismatch }
+      guard producerCanNegotiate,
+        Self.frameDurations.contains(where: { DerivedOutputContract.sameDuration(sampleDuration, $0) }),
+        let actual = CMSampleBufferGetFormatDescription(sample),
+        let index = formats.firstIndex(where: { DerivedOutputContract.matchesFormat(actual, $0.formatDescription) }),
+        DerivedOutputContract(format: formats[index].formatDescription, duration: sampleDuration).mismatch(sample) == nil
+      else { return mismatch }
       do { try setProperties(index: index, frameDuration: sampleDuration, fromProducer: true) }
       catch { return "renegotiation failed: \(error.localizedDescription)" }
     }
@@ -472,6 +480,8 @@ final class CameraProvider: NSObject, CMIOExtensionProviderSource, @unchecked Se
   private(set) var descriptors: [VirtualCameraDescriptor]
   private var runtimes: [String: CameraDeviceRuntime] = [:]
   private var pendingRemoval: Set<String> = []
+  private var removalRetryScheduled = false
+  private var removalRetryDelay = 1
 #if ULTRACAM_TEST_SUPPORT
   var addDeviceForTesting: ((CMIOExtensionDevice) throws -> Void)?
   var removeDeviceForTesting: ((CMIOExtensionDevice) throws -> Void)?
@@ -495,7 +505,7 @@ final class CameraProvider: NSObject, CMIOExtensionProviderSource, @unchecked Se
     self.output = output
     let expectedGroup = registryStore?.groupIdentifier ?? store?.groupIdentifier
     let fallback = Self.fallbackSnapshot(appGroupIdentifier: expectedGroup)
-    let selected = [registrySnapshot, registry, registryStore?.load(), store?.load()]
+    let selected = [registrySnapshot, registry, registryStore?.load(repairPrimary: false), store?.load(repairPrimary: false)]
       .compactMap { $0 }
       .first(where: { candidate in
         (try? candidate.validate()) != nil &&
@@ -592,11 +602,29 @@ final class CameraProvider: NSObject, CMIOExtensionProviderSource, @unchecked Se
       // CMIO can still call the published stream sources. Their owner is
       // unowned, so retain the runtime until native removal succeeds.
       logger.error("Cannot remove virtual camera: \(error.localizedDescription, privacy: .public)")
+      scheduleRemovalRetry()
       return
     }
     pendingRemoval.remove(runtime.descriptor.id)
     runtimes.removeValue(forKey: runtime.descriptor.id)
     descriptors.removeAll { $0.id == runtime.descriptor.id }
+  }
+
+  /// The host already sees the requested snapshot and will skip identical
+  /// writes. Retry a failed native removal even if no more clients connect.
+  private func scheduleRemovalRetry() {
+    guard !removalRetryScheduled else { return }
+    removalRetryScheduled = true
+    let delay = removalRetryDelay
+    removalRetryDelay = min(delay * 2, 30)
+    queue.asyncAfter(deadline: .now() + .seconds(delay)) { [weak self] in
+      guard let self else { return }
+      self.removalRetryScheduled = false
+      for id in self.pendingRemoval {
+        if let runtime = self.runtimes[id] { self.removeIfReleased(runtime) }
+      }
+      if !self.removalRetryScheduled { self.removalRetryDelay = 1 }
+    }
   }
 
   /// Reconcile one complete, validated registry snapshot. Existing runtimes
@@ -917,6 +945,10 @@ final class CameraStream: NSObject, CMIOExtensionStreamSource, @unchecked Sendab
         self?.stream.consumeSampleBuffer(from: client, completionHandler: completion)
       }
     } else {
+      let streaming = streamingSourceClientIDs
+      // Prefer the authorization of a client CMIO already lists as streaming.
+      let pendingIndex = pendingSourceClientIDs.firstIndex(where: { streaming.contains($0) })
+        ?? pendingSourceClientIDs.indices.first
       // Prepare the capability before admitting a source consumer. A failed
       // Metal4 setup must not publish demand or increment the lease count.
       do { try owner.prepareGPUStandby() }
@@ -924,8 +956,8 @@ final class CameraStream: NSObject, CMIOExtensionStreamSource, @unchecked Sendab
         // A failed start never becomes an active consumer. Release only the
         // authorization associated with this start, so a removed runtime can
         // finish teardown without dropping other clients' pending leases.
-        if !pendingSourceClientIDs.isEmpty {
-          let id = pendingSourceClientIDs.removeFirst()
+        if let pendingIndex {
+          let id = pendingSourceClientIDs.remove(at: pendingIndex)
           authorizedSourceClientIDs.remove(id)
           survivors.removeValue(forKey: id)
           owner.onDemandChange?()
@@ -933,12 +965,8 @@ final class CameraStream: NSObject, CMIOExtensionStreamSource, @unchecked Sendab
         throw error
       }
       let previous = owner.consumers
-      let streaming = streamingSourceClientIDs
-      // Prefer the authorization of a client CMIO already lists as streaming;
-      // otherwise the oldest authorization, as before.
-      if let index = (pendingSourceClientIDs.firstIndex(where: { streaming.contains($0) })
-        ?? pendingSourceClientIDs.indices.first) {
-        let id = pendingSourceClientIDs.remove(at: index)
+      if let pendingIndex {
+        let id = pendingSourceClientIDs.remove(at: pendingIndex)
         activeSourceClientIDs.append(id)
         owner.consumers += 1
       } else if let adopted = activeSourceClientIDs.first(where: { adoptedSourceClientIDs.contains($0) }) {

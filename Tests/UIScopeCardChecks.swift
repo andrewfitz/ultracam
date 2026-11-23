@@ -47,6 +47,19 @@ import XCTest
     XCTAssertEqual(far.size, start.size)
   }
 
+  func testDefaultPlaceUsesTheFittedCardSize() {
+    let compact = CGSize(width: 220, height: 124)
+    let wide = UIScopeCardFrame.defaultRect(.wide, in: compact)
+    XCTAssertEqual(wide.size, UIScopeCardShape.wide.minimumSize)
+    XCTAssertEqual(wide.maxY, compact.height - UIScopeCardFrame.bottomLabels)
+
+    let small = CGSize(width: 320, height: 180)
+    let square = UIScopeCardFrame.defaultRect(.square, in: small)
+    XCTAssertEqual(square.size, UIScopeCardShape.square.minimumSize)
+    XCTAssertEqual(square.maxX, small.width - 10)
+    XCTAssertEqual(square.maxY, small.height - UIScopeCardFrame.bottomLabels)
+  }
+
   func testAResizeKeepsTheCornerAndAVectorscopeSquare() {
     let start = CGRect(x: 100, y: 100, width: 300, height: 100)
     let wider = UIScopeCardFrame.resized(start, by: CGSize(width: 200, height: 50), .wide, in: picture)
@@ -58,6 +71,10 @@ import XCTest
     let square = CGRect(x: 900, y: 300, width: 200, height: 200)
     let grown = UIScopeCardFrame.resized(square, by: CGSize(width: 40, height: 90), .square, in: picture)
     XCTAssertEqual(grown, CGRect(x: 900, y: 300, width: 290, height: 290), "The larger move wins")
+    for inward in [CGSize(width: -40, height: 0), CGSize(width: 0, height: -40)] {
+      let shrunk = UIScopeCardFrame.resized(square, by: inward, .square, in: picture)
+      XCTAssertEqual(shrunk, CGRect(x: 900, y: 300, width: 160, height: 160))
+    }
     let capped = UIScopeCardFrame.resized(square, by: CGSize(width: 2000, height: 10), .square, in: picture)
     XCTAssertEqual(capped.width, capped.height)
     XCTAssertEqual(capped.origin, square.origin)

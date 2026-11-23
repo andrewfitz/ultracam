@@ -127,22 +127,30 @@ public struct MonitorView {
 #endif
 
 /// Hosts a `MonitorMetalView` the app built (several surfaces, scopes, host mode).
-public struct MonitorSceneView {
+public struct MonitorSceneView: View {
   let view: MonitorMetalView
 
   /// Hosts `view` in SwiftUI.
   public init(view: MonitorMetalView) { self.view = view }
+
+  public var body: some View {
+    HostedMonitor(view: view).id(ObjectIdentifier(view))
+  }
+}
+
+private struct HostedMonitor {
+  let view: MonitorMetalView
 }
 
 #if canImport(AppKit)
-  extension MonitorSceneView: NSViewRepresentable {
-    public func makeNSView(context: Context) -> MonitorMetalView { view }
-    public func updateNSView(_ view: MonitorMetalView, context: Context) {}
+  extension HostedMonitor: NSViewRepresentable {
+    func makeNSView(context: Context) -> MonitorMetalView { view }
+    func updateNSView(_ view: MonitorMetalView, context: Context) {}
   }
 #elseif canImport(UIKit)
-  extension MonitorSceneView: UIViewRepresentable {
-    public func makeUIView(context: Context) -> MonitorMetalView { view }
-    public func updateUIView(_ view: MonitorMetalView, context: Context) {}
+  extension HostedMonitor: UIViewRepresentable {
+    func makeUIView(context: Context) -> MonitorMetalView { view }
+    func updateUIView(_ view: MonitorMetalView, context: Context) {}
   }
 #endif
 

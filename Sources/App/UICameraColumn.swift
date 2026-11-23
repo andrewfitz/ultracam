@@ -44,6 +44,10 @@ struct UIColumnPictureLayout: Layout {
 
 // MARK: - Picture
 
+private extension FocusedValues {
+  @Entry var cameraPictureID: String?
+}
+
 /// The picture at 16:9 with its overlays. At rest it shows the camera's number, name and
 /// tally, the REC pill, the tools button and every enabled tool. Hovering the picture opens
 /// the full tool bar in every state (built on the picture, not on `revealed`, which is live
@@ -64,10 +68,13 @@ struct UICameraPictureView: View {
   /// Under 480 pt the timecode yields, so the REC pill never truncates.
   @State private var showsTimecode = true
   @FocusState private var focused: Bool
+  @FocusedValue(\.cameraPictureID) private var focusedPictureID
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
+  private var showsFocusedControls: Bool { hovering || focused || focusedPictureID == camera.id }
+
   private var revealed: Bool {
-    guard (hovering || focused) && !compact else { return false }
+    guard showsFocusedControls && !compact else { return false }
     switch camera.tileState {
     case .live, .updating: return true
     default: return false
@@ -78,7 +85,7 @@ struct UICameraPictureView: View {
   /// brings the tools and view controls back so Clean View can be turned off again.
   private var isClean: Bool { !compact && UICleanViewState.shared.clean.contains(camera.id) }
   private var toolPlacement: UIMonitorToolButtons.Placement {
-    UIMonitorToolButtons.Placement(hovering: hovering, panelOpen: toolPanel != nil, narrow: narrow, clean: isClean)
+    UIMonitorToolButtons.Placement(hovering: showsFocusedControls, panelOpen: toolPanel != nil, narrow: narrow, clean: isClean)
   }
 
   private static let cornerRadius: CGFloat = 14
@@ -151,6 +158,8 @@ struct UICameraPictureView: View {
     .onKeyPress(.space) { context.send(.select(cameraID: camera.id)); return .handled }
     .onKeyPress(.return) { context.send(.select(cameraID: camera.id)); return .handled }
     .contextMenu { pictureMenu }
+    // Keep the revealed controls visible as keyboard focus moves from the picture into them.
+    .focusedValue(\.cameraPictureID, compact ? nil : camera.id)
   }
 
   // MARK: Placeholders
@@ -161,6 +170,13 @@ struct UICameraPictureView: View {
     switch camera.tileState {
     case .live:
       EmptyView()
+    case .connecting where snapshot?.captureAuthorizationPending == true:
+      UIPicturePlaceholder(symbol: UISymbol.camera, title: camera.statusBadge, compact: compact,
+        detail: "Respond to the camera access prompt to start capture.", showsProgress: true) {
+        if camera.collapsed {
+          Button("Stop Capture") { context.send(.stopCamera(cameraID: camera.id)) }
+        }
+      }
     case .connecting:
       UIPicturePlaceholder(symbol: UISymbol.camera, title: "Starting…", compact: compact,
         detail: "Waiting for the first frame from \(camera.inputName).", showsProgress: true)
@@ -298,7 +314,7 @@ struct UICameraPictureView: View {
       }
     }
     .padding(compact ? 6 : 10)
-    .animation(reduceMotion ? nil : .easeOut(duration: 0.15), value: hovering || focused || toolPanel != nil)
+    .animation(reduceMotion ? nil : .easeOut(duration: 0.15), value: showsFocusedControls || toolPanel != nil)
   }
 
   /// What's coming in, along the picture's bottom: the signal's format, the body's exposure
@@ -365,8 +381,8 @@ struct UICameraPictureView: View {
     }
   }
 
-  /// The tools button and enabled tools at rest; the full bar on hover and while one of its
-  /// popovers is open. Clean View shows none at rest.
+  /// The tools button and enabled tools at rest; the full bar on hover, keyboard focus and
+  /// while one of its popovers is open. Clean View shows none at rest.
   @ViewBuilder private func tools(_ placement: UIMonitorToolButtons.Placement) -> some View {
     if placement.shown {
       UIMonitorToolButtons(camera: camera, context: context, openPanel: $toolPanel, expanded: placement.expanded,
@@ -527,6 +543,7 @@ struct UICameraPictureView: View {
       .frame(minWidth: 36, minHeight: 24)
       .help("Zoom (center crop, this view only)")
       .accessibilityLabel("Zoom")
+      .accessibilityValue(zoom == 1 ? "Fit" : "\(Int(zoom * 100)) percent")
       overlayButton(UISymbol.detach, help: "Detach to Window", label: "Detach to Window") {
         context.send(.detachMonitor(cameraID: camera.id))
       }
@@ -1244,7 +1261,7 @@ struct UIChannelStripView: View {
       if let recording = snapshot?.recording, recording.folderPath == nil {
         Button("Choose Folder…") { context.send(.chooseRecordingFolder(cameraID: camera.id)) }.controlSize(.small).fixedSize()
       }
-    case .stopped, .finishing, .ready:
+    case .stopped, .starting, .finishing, .ready:
       EmptyView()
     }
   }

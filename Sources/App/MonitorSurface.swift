@@ -20,9 +20,9 @@ import SwiftUI
 /// (`MonitorFeed.freeze`, into a feed of its own), so it pins no capture buffer.
 final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unchecked Sendable {
   let target: MonitorTargetID
-  let host: MonitorFeedHost
   let gpu: MonitorGPUContext
   private let lock = NSLock()
+  private var feedHost: MonitorFeedHost
 
   /// A held picture. `owned` (a copy in `feed`) replaces `live` once the render
   /// thread has copied it on the GPU.
@@ -30,6 +30,7 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
     let token: UInt64
     let preferences: MonitorFeedPreferences
     let state: MonitorState
+    let host: MonitorFeedHost
     var live: MonitorFeedHost.Delivery?
     var owned: MonitorFrame?
     var feed: MonitorFeed?
@@ -122,7 +123,7 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
 
   init(target: MonitorTargetID, host: MonitorFeedHost, gpu: MonitorGPUContext) {
     self.target = target
-    self.host = host
+    feedHost = host
     self.gpu = gpu
     DispatchQueue.main.async { [weak self] in
       guard self != nil else { return }
@@ -136,6 +137,14 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
   }
 
   var isProgram: Bool { target.isProgram }
+
+  var host: MonitorFeedHost { lock.withLock { feedHost } }
+
+  /// Changes the producer endpoint after the old one has detached and cleared its live frame.
+  /// Work already taken, including a freeze, keeps the host that supplied its frame.
+  @MainActor func setHost(_ host: MonitorFeedHost) {
+    lock.withLock { feedHost = host }
+  }
 
   var currentStamp: MonitorFeedHost.Stamp? {
     lock.withLock { frozen?.stamp ?? latest?.stamp ?? lingering?.stamp }
@@ -229,7 +238,7 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
       pendingFreeze = false
       nextFreezeToken &+= 1
       frozen = Frozen(
-        token: nextFreezeToken, preferences: preferences, state: encodeState, live: delivery, stamp: stamp,
+        token: nextFreezeToken, preferences: preferences, state: encodeState, host: feedHost, live: delivery, stamp: stamp,
         signal: delivery.signal, geometry: delivery.geometry, fromPendingRequest: true)
       copyToken = nextFreezeToken
       latest = nil
@@ -262,6 +271,7 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
       case frozenOwned(MonitorFrame, MonitorFeed, token: UInt64)
     }
     let content: Content
+    let host: MonitorFeedHost
     /// The shown frame's stamp (a hold's, while frozen or lingering).
     let stamp: MonitorFeedHost.Stamp?
     let state: MonitorState
@@ -301,11 +311,11 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
           content = .none
         }
         return RenderWork(
-          content: content, stamp: held.stamp, state: frozenState(held), preferences: held.preferences,
+          content: content, host: held.host, stamp: held.stamp, state: frozenState(held), preferences: held.preferences,
           latestVersion: latestVersion, stateVersion: stateVersion, scopeEpoch: scopeEpoch)
       }
       return RenderWork(
-        content: latest.map { .live($0) } ?? .none, stamp: latest?.stamp, state: encodeState,
+        content: latest.map { .live($0) } ?? .none, host: feedHost, stamp: latest?.stamp, state: encodeState,
         preferences: preferences, latestVersion: latestVersion, stateVersion: stateVersion, scopeEpoch: scopeEpoch)
     }
   }
@@ -335,13 +345,14 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
   /// never touch it. It is adopted only after successful GPU feedback; on failure the
   /// hold keeps the capture frame and the failure is counted.
   func makeFreezeCopy(token: UInt64) {
-    let source: MonitorFeedHost.Delivery? = lock.withLock {
+    let pending: (MonitorFeedHost, MonitorFeedHost.Delivery)? = lock.withLock {
       let held = frozen?.token == token ? frozen : lingering
-      guard let value = held, value.token == token, value.owned == nil, freezeCopyInFlight != token else { return nil }
+      guard let value = held, value.token == token, let source = value.live,
+        value.owned == nil, freezeCopyInFlight != token else { return nil }
       freezeCopyInFlight = token
-      return value.live
+      return (value.host, source)
     }
-    guard let source else { return }
+    guard let (host, source) = pending else { return }
     var committed = false
     defer { if !committed { lock.withLock { if freezeCopyInFlight == token { freezeCopyInFlight = nil } } } }
     let core: MonitorGPUContext.Core
@@ -464,21 +475,21 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
   /// The final LUT on this stage supplies the encoding of the measured values.
   func stageLUTSignal(_ stage: SignalStage, monitorEnabled: Bool) -> SignalDescription? {
     guard stage != .source else { return nil }
-    let (held, live) = lock.withLock {
-      (frozen ?? (latest == nil ? lingering : nil), latest)
+    let (held, live, host) = lock.withLock {
+      (frozen ?? (latest == nil ? lingering : nil), latest, feedHost)
     }
-    return stageLUTSignal(stage, monitorEnabled: monitorEnabled, held: held, live: live)
+    return stageLUTSignal(stage, monitorEnabled: monitorEnabled, held: held, live: live, host: host)
   }
 
   private func stageLUTSignal(
-    _ stage: SignalStage, monitorEnabled: Bool, held: Frozen?, live: MonitorFeedHost.Delivery?
+    _ stage: SignalStage, monitorEnabled: Bool, held: Frozen?, live: MonitorFeedHost.Delivery?, host: MonitorFeedHost
   ) -> SignalDescription? {
     guard stage != .source else { return nil }
     let delivery = held == nil ? live : held?.live
     let burn = held?.luts == nil ? delivery?.burnIn : held?.luts?.burnIn
     let lut: MonitorLUT?
     if stage == .monitor && monitorEnabled {
-      let monitor = held?.luts == nil ? host.monitorLUT : held?.luts?.monitor
+      let monitor = held?.luts == nil ? (held?.host ?? host).monitorLUT : held?.luts?.monitor
       lut = monitor ?? burn
     } else {
       lut = burn
@@ -704,7 +715,7 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
     } else if let held = latest {
       nextFreezeToken &+= 1
       frozen = Frozen(
-        token: nextFreezeToken, preferences: preferences, state: encodeState, live: held, stamp: held.stamp,
+        token: nextFreezeToken, preferences: preferences, state: encodeState, host: feedHost, live: held, stamp: held.stamp,
         signal: held.signal, geometry: held.geometry)
       // Hand the slot's buffer to the freeze; the render thread swaps it for a GPU copy.
       latest = nil
@@ -880,6 +891,7 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
     lock.lock()
     refreshScheduled = false
     let live = latest
+    let host = feedHost
     let frozenValue = frozen
     let held = latest == nil ? lingering : nil
     let pending = pendingFreeze
@@ -963,13 +975,14 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
     let shownState = shown?.state ?? state
     let interpretation = Self.describe(signal.flatMap {
       let stage = MonitorFeedHost.pictureReading(shownState, signal: $0)
-      return stageLUTSignal(stage, monitorEnabled: shownState.monitorLUT, held: shown, live: live) ?? reading(stage)
+      return stageLUTSignal(stage, monitorEnabled: shownState.monitorLUT, held: shown, live: live, host: host) ?? reading(stage)
     })
     if pictureInterpretation != interpretation { pictureInterpretation = interpretation }
     // Scopes measure the stage their settings name; with no LUT on it that is the signal itself.
     let scopeStage = shownTools.scopes.settings.stage
     let scopeText = Self.describe(
-      stageLUTSignal(scopeStage, monitorEnabled: shownTools.state.monitorLUT, held: shown, live: live) ?? reading(scopeStage))
+      stageLUTSignal(scopeStage, monitorEnabled: shownTools.state.monitorLUT, held: shown, live: live, host: host)
+        ?? reading(scopeStage))
     if scopeInterpretation != scopeText { scopeInterpretation = scopeText }
     if let geometry {
       let aspect = geometry.displayAspectRatio(for: shown?.state ?? state)
@@ -989,7 +1002,7 @@ final class MonitorSurfacePresenter: ObservableObject, MonitorFeedConsumer, @unc
       readout.setScopeTiming("No scope signal")
     }
     if let reason = gpu.unavailableReason { text += " · " + reason }
-    if let lut = host.lutMismatch { text += " · " + lut }
+    if let lut = (shown?.host ?? host).lutMismatch { text += " · " + lut }
     if !statuses.isEmpty { text += " · " + statuses.joined(separator: " · ") }
     readout.setDetail(text)
   }
@@ -1382,7 +1395,6 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
 
   private weak var presenter: MonitorSurfacePresenter?
   private let gpu: MonitorGPUContext
-  private let host: MonitorFeedHost
   private let layer: CAMetalLayer
   private var link: CAMetalDisplayLink?
   /// Draws the scope layer; created while a scope view is in a window.
@@ -1419,7 +1431,7 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
 
   /// The newest drawn picture, held only until its scope has been drawn.
   enum ScopeSource {
-    case live(MonitorFeedHost.Delivery)
+    case live(MonitorFeedHost.Delivery, MonitorFeedHost)
     /// An owned copy (both readings, as the live frame) and the feed it belongs to.
     case frozen(MonitorFrame, MonitorFeed)
   }
@@ -1450,8 +1462,9 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
   var hasPendingScopeForTesting: Bool { scopePending != nil }
   func holdScopeForTesting(_ delivery: MonitorFeedHost.Delivery, layer: CAMetalLayer,
     settings: MonitorScopePreferences) {
+    guard let presenter else { return }
     scopeLinkLayer = layer
-    scopePending = (.live(delivery), ScopeKey(stamp: delivery.stamp, frozenToken: 1,
+    scopePending = (.live(delivery, presenter.host), ScopeKey(stamp: delivery.stamp, frozenToken: 1,
       layer: ObjectIdentifier(layer), scopes: settings, monitorLUT: false))
   }
   #endif
@@ -1459,7 +1472,6 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
   init(presenter: MonitorSurfacePresenter, layer: CAMetalLayer) {
     self.presenter = presenter
     gpu = presenter.gpu
-    host = presenter.host
     self.layer = layer
   }
 
@@ -1649,7 +1661,7 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
     let source: ScopeSource?
     switch work.content {
     case .none: source = nil
-    case .live(let delivery), .frozenLive(let delivery, _): source = .live(delivery)
+    case .live(let delivery), .frozenLive(let delivery, _): source = .live(delivery, work.host)
     case .frozenOwned(let owned, let owner, _): source = .frozen(owned, owner)
     }
     queueScope(source, for: work, at: now)
@@ -1675,9 +1687,9 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
       try encodeClear(target, into: context)
       return nil
     case .live(let delivery), .frozenLive(let delivery, _):
-      let frame = try host.frame(delivery, in: context, core: core)
+      let frame = try work.host.frame(delivery, in: context, core: core)
       try drawPicture(frame, feed: feed, state: work.state, target: target, core: core, context: context)
-      return .live(delivery)
+      return .live(delivery, work.host)
     case .frozenOwned(let owned, let owner, _):
       // The copy as it is: both readings, so every stage's tools read it as live.
       try context.keepForeignFreeze(owned, owner: owner)
@@ -1692,8 +1704,8 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
     case .frozenOwned(_, let owner, _): return freezeFeed(owner: owner, core: core)
     case .live(let delivery), .frozenLive(let delivery, _):
       recoveredFreezeFeed = nil
-      return host.feed(engine: core.engine, for: delivery)
-    case .none: return host.feed(engine: core.engine)
+      return work.host.feed(engine: core.engine, for: delivery)
+    case .none: return work.host.feed(engine: core.engine)
     }
   }
 
@@ -1910,7 +1922,7 @@ final class MonitorSurfaceRenderLoop: NSObject, CAMetalDisplayLinkDelegate, Moni
       let frame: MonitorFrame
       let feed: MonitorFeed
       switch pending.source {
-      case .live(let delivery):
+      case .live(let delivery, let host):
         frame = try host.frame(delivery, in: context, core: core)
         feed = host.feed(engine: core.engine, for: delivery)
       case .frozen(let held, let owner):

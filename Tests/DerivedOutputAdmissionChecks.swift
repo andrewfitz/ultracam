@@ -5,6 +5,18 @@ import Synchronization
 import XCTest
 
 @objcMembers final class DerivedOutputAdmissionChecks: XCTestCase {
+  func testFullRangeTagRequiresCoreFoundationBoolean() throws {
+    let pixel = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+    let expected = try VideoContract.formatDescription(width: 2, height: 2, pixelFormat: pixel)
+    let extensions = try XCTUnwrap(CMFormatDescriptionGetExtensions(expected) as? [String: Any])
+    var malformed = extensions
+    malformed[kCMFormatDescriptionExtension_FullRangeVideo as String] = NSNumber(value: 0)
+    var requested: CMVideoFormatDescription?
+    XCTAssertEqual(CMVideoFormatDescriptionCreate(allocator: nil, codecType: pixel, width: 2,
+      height: 2, extensions: malformed as CFDictionary, formatDescriptionOut: &requested), noErr)
+    XCTAssertFalse(DerivedOutputContract.matchesFormat(try XCTUnwrap(requested), expected))
+  }
+
   private func image(width: Int = 1920, height: Int = 1080, pixel: OSType = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
                      pq: Bool = false) throws -> CVPixelBuffer {
     var result: CVPixelBuffer?

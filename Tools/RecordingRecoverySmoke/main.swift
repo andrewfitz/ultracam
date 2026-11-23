@@ -5,8 +5,8 @@ import CryptoKit
 import Darwin
 import Foundation
 
-// This helper never opens a camera. The parent SIGKILLs synthetic child
-// writers before finalization, then exercises the production recovery path.
+// This helper never opens a camera. Closing the parent's control pipe kills
+// its synthetic writer before finalization, including if the parent exits.
 func require(_ condition: Bool, _ message: String) throws {
   if !condition { throw RecordingOutputError.ioFailure(message) }
 }
@@ -84,23 +84,36 @@ func parent(root: URL) async throws {
       try FileManager.default.createDirectory(at: takeRoot, withIntermediateDirectories: true)
       let process = Process()
       process.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
-      process.arguments = ["--child", takeRoot.path, codec, timecode ? "timecode" : "source"]
+      process.arguments = ["--owned-child", takeRoot.path, codec, timecode ? "timecode" : "source"]
       let pipe = Pipe()
       process.standardOutput = pipe
+      let control = Pipe()
+      process.standardInput = control
+      let exited = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingOldest(1))
+      process.terminationHandler = { _ in
+        exited.continuation.yield(())
+        exited.continuation.finish()
+      }
       try process.run()
       defer {
-        if process.isRunning {
-          kill(process.processIdentifier, SIGKILL)
-          process.waitUntilExit()
-        }
+        try? control.fileHandleForWriting.close()
+        exited.continuation.finish()
       }
       try pipe.fileHandleForWriting.close()
       try waitForReady(pipe.fileHandleForReading)
+      try await Task.sleep(for: .seconds(seconds))
+      try require(process.isRunning, "Child writer exited before it could be interrupted.")
       let live = try RecordingRecovery.scan(root: takeRoot)
       try require(live.isEmpty, "Recovery offered an active recording.")
-      try await Task.sleep(for: .seconds(seconds))
-      kill(process.processIdentifier, SIGKILL)
-      process.waitUntilExit()
+      try control.fileHandleForWriting.close()
+      let timeout = Task {
+        try await Task.sleep(for: .seconds(10))
+        exited.continuation.finish()
+      }
+      var exits = exited.stream.makeAsyncIterator()
+      let didExit = await exits.next() != nil
+      timeout.cancel()
+      try require(didExit, "Timed out waiting for child termination.")
       try require(process.terminationReason == .uncaughtSignal && process.terminationStatus == SIGKILL,
         "Child was not abruptly interrupted.")
       let initial = try RecordingRecovery.scan(root: takeRoot)
@@ -132,19 +145,46 @@ func parent(root: URL) async throws {
 }
 
 Task {
+  let arguments = Array(CommandLine.arguments.dropFirst())
+  let usage = """
+    Usage: recovery-smoke OUTPUT_DIRECTORY
+           recovery-smoke --recover RECORDING_DIRECTORY
+           recovery-smoke --help
+    """
+  if arguments == ["--help"] {
+    print(usage)
+    exit(0)
+  }
   do {
-    if CommandLine.arguments.count == 5 && CommandLine.arguments[1] == "--child" {
-      try child(root: URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: true),
-        codecName: CommandLine.arguments[3], timecode: CommandLine.arguments[4] == "timecode")
-    } else if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--recover" {
-      let root = URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: true)
+    switch arguments.first {
+    case "--child", "--owned-child":
+      guard arguments.count == 4,
+        !arguments[1].isEmpty, !arguments[1].hasPrefix("-"),
+        ["ProRes", "HEVC"].contains(arguments[2]),
+        ["timecode", "source"].contains(arguments[3]) else {
+        fputs("Usage: recovery-smoke \(arguments[0]) OUTPUT_DIRECTORY {ProRes|HEVC} {timecode|source}\n", stderr)
+        exit(2)
+      }
+      if arguments[0] == "--owned-child" {
+        Thread.detachNewThread {
+          // EOF also arrives if the parent exits while the take is active.
+          _ = try? FileHandle.standardInput.read(upToCount: 1)
+          raise(SIGKILL)
+        }
+      }
+      try child(root: URL(fileURLWithPath: arguments[1], isDirectory: true),
+        codecName: arguments[2], timecode: arguments[3] == "timecode")
+    case "--recover" where arguments.count == 2 && !arguments[1].isEmpty && !arguments[1].hasPrefix("-"):
+      let root = URL(fileURLWithPath: arguments[1], isDirectory: true)
       guard let take = try RecordingRecovery.scan(root: root).first else {
         throw RecordingOutputError.ioFailure("No interrupted recording was found.")
       }
       print(try await RecordingRecovery.recover(take, root: root).path)
-    } else {
-      guard CommandLine.arguments.count == 2 else { throw RecordingOutputError.invalidRoot }
-      try await parent(root: URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true))
+    case let path? where arguments.count == 1 && !path.isEmpty && !path.hasPrefix("-"):
+      try await parent(root: URL(fileURLWithPath: path, isDirectory: true))
+    default:
+      fputs("\(usage)\n", stderr)
+      exit(2)
     }
     exit(0)
   } catch { fputs("RECOVERY FAIL \(error)\n", stderr); exit(1) }

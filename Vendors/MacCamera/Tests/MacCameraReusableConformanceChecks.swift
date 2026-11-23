@@ -92,6 +92,43 @@ import XCTest
     plugin.publishSessionStatus(CaptureDeviceStatus(availability: .free), id: id, diagnostics: diagnostics, token: token)
     plugin.endSession(id, token: token)
     XCTAssertEqual(plugin.status(deviceID: id), current)
+    XCTAssertNotNil(plugin.diagnostics(deviceID: id))
+    plugin.endSession(id, token: replacement)
+    XCTAssertNil(plugin.diagnostics(deviceID: id))
+  }
+
+  @MainActor func testQueuedStatusesPreserveOrderAndDoNotRetainObservation() throws {
+    let plugin = MacCameraCapturePlugin()
+    let id = MacCameraCapturePlugin.id(for: "observed-fixture")
+    let diagnostics = DeviceDiagnostics(counters: CaptureCounters(), temperatureCelsius: nil,
+      signalPresent: nil, hostTimeMapped: false, vendorFields: [])
+    let session = MacCameraCaptureSession(plugin: plugin)
+    let token = UUID()
+    try plugin.beginSession(id, token: token, owner: session)
+    defer { plugin.endSession(id, token: token) }
+
+    let started = CaptureDeviceStatus(availability: .inUseHere)
+    let stopped = CaptureDeviceStatus(availability: .free)
+    let delivered = expectation(description: "Ordered status notifications")
+    delivered.expectedFulfillmentCount = 2
+    var received: [CaptureDeviceStatus] = []
+    let retained = plugin.observeFixtureStatus { observedID, status in
+      XCTAssertEqual(observedID, id)
+      received.append(status)
+      delivered.fulfill()
+    }
+    var released: DeviceStatusObservation? = plugin.observeFixtureStatus { _, _ in
+      XCTFail("A released observation received an already queued status")
+    }
+    weak let weakObservation = released
+    plugin.publishSessionStatus(started, id: id, diagnostics: diagnostics, token: token)
+    plugin.publishSessionStatus(stopped, id: id, diagnostics: diagnostics, token: token)
+    // Synchronize with the inventory queue while the main queue is occupied.
+    XCTAssertEqual(plugin.status(deviceID: id), stopped)
+    released = nil
+    XCTAssertNil(weakObservation)
+    withExtendedLifetime(retained) { wait(for: [delivered], timeout: 3) }
+    XCTAssertEqual(received, [started, stopped])
   }
 
   func testNativeFramePassesSharedTranscriptOracle() throws {

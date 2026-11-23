@@ -139,15 +139,17 @@ import SwiftUI
     // The bar itself, with clip indicators on and the picture adjusted.
     let provider = UIFixtureMonitorSettings(session: session)
     provider.setPreferences(camera, for: cameraID)
-    let tools = UIMonitorTool.allCases.filter { UIMonitorBridge.activeTools(camera).contains($0) }
+    let active = UIMonitorBridge.activeTools(camera)
+    let tools = UIMonitorTool.allCases.filter(active.contains)
     screens.append(Screen(name: "monitor-tool-bar",
       view: AnyView(UIMonitorToolButtons(targetID: cameraID, name: name, activeTools: tools, isProgram: false,
-        toggle: { _ in }, monitor: provider, openPanel: .constant(nil)).padding(8).background(Color.black)),
+        toggle: { _ in }, monitor: provider, openPanel: .constant(nil), expanded: true).padding(8).background(Color.black)),
       size: CGSize(width: 360, height: 48)))
     // A narrow picture's bar: one menu button (its Settings items open the popovers).
     screens.append(Screen(name: "monitor-tool-bar-collapsed",
       view: AnyView(UIMonitorToolButtons(targetID: cameraID, name: name, activeTools: tools, isProgram: false,
-        toggle: { _ in }, monitor: provider, openPanel: .constant(nil)).frame(width: 120).padding(8).background(Color.black)),
+        toggle: { _ in }, monitor: provider, openPanel: .constant(nil), expanded: true)
+        .frame(width: 120).padding(8).background(Color.black)),
       size: CGSize(width: 136, height: 48)))
     return screens
   }

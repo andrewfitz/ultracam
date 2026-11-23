@@ -48,6 +48,14 @@ import XCTest
       rowBytes: 8, width: 4, height: 1, format: .twoVuy, luma: y, chroma: uv))
     XCTAssertThrowsError(try decoder.encode(commandBuffer: command, source: source,
       rowBytes: 8, width: 4, height: 1, format: .r210, luma: y, chroma: uv))
+    let arrayDescriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r16Uint, width: 4, height: 1, mipmapped: false)
+    arrayDescriptor.textureType = .type2DArray
+    arrayDescriptor.arrayLength = 2
+    arrayDescriptor.usage = .shaderWrite
+    let array = try XCTUnwrap(device.makeTexture(descriptor: arrayDescriptor))
+    let completeSource = try XCTUnwrap(device.makeBuffer(length: 8))
+    XCTAssertThrowsError(try decoder.encode(commandBuffer: command, source: completeSource,
+      rowBytes: 8, width: 4, height: 1, format: .twoVuy, luma: array, chroma: uv))
   }
 
   func testMetal4DecodesUYVAWithoutUsingAlpha() throws {

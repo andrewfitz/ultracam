@@ -11,6 +11,7 @@ import ctypes
 
 ROOT = Path(__file__).resolve().parents[1]
 RELOAD_HELPER = Path("Contents/Helpers/Ultracam Camera Reload.app")
+SWITCHER_WORKER = Path("Contents/MacOS/auto-switcher")
 STREAM_LICENSES = Path("ThirdParty/ProgramStreaming-Licenses.txt")
 
 
@@ -34,9 +35,23 @@ def reload_helper_executable(app):
     return executable
 
 
+def validate_switcher_worker(app, *, signed):
+    worker = app.resolve() / SWITCHER_WORKER
+    if (worker.resolve() != worker or not worker.is_file() or not (worker.stat().st_mode & 0o111)
+            or not _macho(worker)):
+        raise ValueError(f"Missing or invalid Auto Switcher worker: {worker}")
+    if signed:
+        result = subprocess.run(
+            ["/usr/bin/codesign", "-d", "--entitlements", ":-", str(worker)], capture_output=True)
+        entitlements = plistlib.loads(result.stdout) if result.returncode == 0 and result.stdout else {}
+        if (not isinstance(entitlements, dict) or any(entitlements.get(key) is not True
+                for key in ("com.apple.security.app-sandbox", "com.apple.security.inherit"))):
+            raise ValueError("Auto Switcher worker must inherit the host sandbox.")
+
+
 def validate(app, *, root=ROOT, inventory_path=None, signed=False, official_release=False,
              architectures=None, release_evidence=None):
-    app = Path(app)
+    app = Path(app).resolve()
     extension = app / "Contents/Library/SystemExtensions/org.ultracam.app.camera.systemextension"
     host_info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
     local_build = host_info.get("UltracamLocalDevelopmentBuild") is True
@@ -137,6 +152,7 @@ def validate(app, *, root=ROOT, inventory_path=None, signed=False, official_rele
             or stream_licenses.read_bytes() != (Path(root) / STREAM_LICENSES).read_bytes()):
         raise ValueError(f"Missing or incorrect Program streaming licenses: {stream_licenses}")
     reload_executable = reload_helper_executable(app)
+    validate_switcher_worker(app, signed=signed or local_build)
     validate_symbols(app)
     validate_vendors(app, root=root, inventory_path=inventory_path, signed=signed,
                      official_release=official_release, architectures=architectures, release_evidence=release_evidence,
@@ -334,6 +350,10 @@ def validate_vendors(app, *, root=ROOT, inventory_path=None, signed=False, offic
                 raise ValueError(f"Missing enabled vendor runtime: {destination}")
             if not destination.resolve().is_relative_to(app):
                 raise ValueError(f"Vendor runtime escapes app: {destination}")
+            if not _macho(destination):
+                raise ValueError(f"Enabled vendor runtime is not Mach-O: {destination}")
+            if destination in expected_embeds:
+                raise ValueError(f"Multiple vendor runtimes target {destination}")
             expected_embeds[destination] = {}
             for architecture in required_architectures:
                 expected = _install_names(root / item["path"], runner, [architecture])
@@ -348,6 +368,8 @@ def validate_vendors(app, *, root=ROOT, inventory_path=None, signed=False, offic
             raise ValueError(f"Code escapes app: {binary}")
         if binary.is_relative_to(extension) and (binary.name in all_vendor_names or (binary.suffix == ".dylib" and not binary.name.startswith("libswift"))):
             raise ValueError(f"Vendor runtime must not ship in camera extension: {binary}")
+        if binary.name in all_vendor_names and binary not in expected_embeds:
+            raise ValueError(f"Unexpected vendor runtime outside its enabled manifest destination: {binary}")
         arches = set(_tool(runner, ["/usr/bin/lipo", "-archs", str(binary)]).split())
         if not required_architectures.issubset(arches):
             raise ValueError(f"Missing architecture {sorted(required_architectures - arches)} in {binary}")
@@ -424,15 +446,25 @@ def validate_vendors(app, *, root=ROOT, inventory_path=None, signed=False, offic
             inspect_dependencies(target, architecture, search_paths, executable)
     extension_executables = [p for p in extension.glob("Contents/MacOS/*") if p in metadata]
     roots = [host] + extension_executables
+    worker = app / SWITCHER_WORKER
+    if worker in metadata:
+        roots.append(worker)
     if reload_executable is not None:
         roots.append(reload_executable)
-    roots.extend(expected_embeds)
-    roots.extend(metadata)
+    extension_info = plistlib.loads((extension / "Contents/Info.plist").read_bytes())
+    extension_main = extension / "Contents/MacOS" / extension_info["CFBundleExecutable"]
+    if extension_main not in extension_executables:
+        raise ValueError(f"Invalid camera extension executable: {extension_main}")
+    for executable in roots:
+        if executable not in metadata:
+            raise ValueError(f"Invalid bundle executable: {executable}")
     for architecture in required_architectures:
-        for binary in roots:
+        for executable in roots:
+            inspect_dependencies(executable, architecture, [], executable)
+        for binary in (*expected_embeds, *metadata):
             if (binary, architecture) in reached:
                 continue
-            executable = (extension_executables or [host])[0] if binary.is_relative_to(extension) else host
+            executable = extension_main if binary.is_relative_to(extension) else host
             # A helper app under Contents/Helpers runs as its own process: its
             # @executable_path is its own MacOS folder, not the host's.
             if reload_executable is not None and binary.is_relative_to(app / RELOAD_HELPER):

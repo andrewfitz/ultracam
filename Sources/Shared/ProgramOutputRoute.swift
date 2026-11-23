@@ -304,7 +304,6 @@ final class ProgramOutputRoute: @unchecked Sendable {
       }
       outputContract = contract
       outputActive = active
-      if active { errorReported = false }
       // No client, or a new contract: the converter's surfaces and output
       // pool for the old one are done with once their GPU work completes.
       if changed { normalizerProvider?()?.releaseIdleResources() }
@@ -336,6 +335,7 @@ final class ProgramOutputRoute: @unchecked Sendable {
     lock.lock()
     guard state.feedIDs != feedIDs else { lock.unlock(); return }
     let valid = Set(feedIDs)
+    sourcePauseTolerances = sourcePauseTolerances.filter { valid.contains($0.key) }
     // Topology is authoritative for capture gating. In particular, a source
     // removed and later re-added must not inherit its old live state.
     if let liveSources {
@@ -364,6 +364,10 @@ final class ProgramOutputRoute: @unchecked Sendable {
     }
     let previous = state
     state = SwitcherCoordinator(settings: settings, feedIDs: feedIDs)
+    if state.selectedFeedID != previous.selectedFeedID {
+      cutGeneration &+= 1
+      onAirSkips = 0
+    }
     // Readiness and a pending cut carry over; a cut whose target was removed
     // is reported, so its requester (the automatic director) is released.
     state.carryProgramTimeline(from: previous)
@@ -441,7 +445,12 @@ final class ProgramOutputRoute: @unchecked Sendable {
 
   private func mutate<T>(_ body: (inout SwitcherCoordinator) -> T) -> T {
     lock.lock()
+    let selected = state.selectedFeedID
     let result = body(&state)
+    if state.selectedFeedID != selected {
+      cutGeneration &+= 1
+      onAirSkips = 0
+    }
     let abandoned = state.takeAbandonedCut()
     let handler = eventHandler
     lock.unlock()
@@ -606,9 +615,17 @@ final class ProgramOutputRoute: @unchecked Sendable {
     // At least the original frame is allowed even when repetition is disabled.
     let limit = max(CMTimeGetSeconds(step), seconds)
     let clipped = CMTimeGetSeconds(duration) > limit
-    let boundedDuration = clipped
-      ? CMTime(seconds: limit, preferredTimescale: max(240_000, duration.timescale, step.timescale)) : duration
-    let end = CMTimeAdd(start, boundedDuration)
+    let span = clipped
+      ? CMTime(seconds: limit, preferredTimescale: start.timescale) : duration
+    // The mapper and cadence step use the same fixed Program timescale.
+    // Keep the grid on that scale even near Int64's limit, where CMTimeAdd
+    // can round to a coarser scale.
+    let endTicks = Int128(start.value) + Int128(span.value)
+    guard span.isNumeric, span.timescale == start.timescale, let endValue = Int64(exactly: endTicks) else {
+      reportErrorLocked("Program source span exceeds its timeline.", events: &events)
+      return (start, 0)
+    }
+    let end = CMTime(value: endValue, timescale: start.timescale)
     let missingDuration = coveredSourceEnd.map { CMTimeGetSeconds(CMTimeSubtract(start, $0)) } ?? 0
     if clipped || missingDuration > limit {
       stats.cadenceDiscontinuities &+= 1
@@ -617,32 +634,26 @@ final class ProgramOutputRoute: @unchecked Sendable {
     if coveredSourceEnd == nil || CMTimeCompare(end, coveredSourceEnd!) > 0 {
       coveredSourceEnd = end
     }
-    var slot = nextSlot ?? start
+    var slot = Int128((nextSlot ?? start).value)
+    let stepTicks = Int128(step.value)
     // Keep the original contract grid through missing callbacks. Jump directly
     // to its first slot at/after resume (constant work even for a long pause).
     // Sub-half-slot clock jitter keeps the pending slot, as before.
-    if CMTimeCompare(CMTimeAdd(slot, CMTimeMultiplyByRatio(step, multiplier: 1, divisor: 2)), start) <= 0 {
-      let delta = CMTimeSubtract(start, slot)
-      let numerator = Int128(delta.value) * Int128(step.timescale)
-      let denominator = Int128(delta.timescale) * Int128(step.value)
-      guard numerator > 0, denominator > 0,
-        let ticks = Int64(exactly: ((numerator + denominator - 1) / denominator) * Int128(step.value)) else {
-        return (slot, 0)
-      }
-      slot = CMTimeAdd(slot, CMTime(value: ticks, timescale: step.timescale))
+    let gap = Int128(start.value) - slot
+    if 2 * gap >= stepTicks {
+      slot += ((gap + stepTicks - 1) / stepTicks) * stepTicks
     }
     // An overlapping source prediction never rewinds slots already emitted.
     // A wholly covered span produces zero sends until source time catches up.
-    let first = slot
-    var count = 0
-    // Bounded in time, so low-rate sources fill the grid without an arbitrary
-    // four-frame cutoff and paused sources stop at their repeat window.
-    while CMTimeCompare(slot, end) < 0 {
-      count += 1
-      slot = CMTimeAdd(slot, step)
+    let remaining = max(0, endTicks - slot)
+    let count = (remaining + stepTicks - 1) / stepTicks
+    guard let sends = Int32(exactly: count), let first = Int64(exactly: slot),
+      let next = Int64(exactly: slot + count * stepTicks) else {
+      reportErrorLocked("Program repeat schedule exceeds its timeline.", events: &events)
+      return (start, 0)
     }
-    nextSlot = slot
-    return (first, count)
+    nextSlot = CMTime(value: next, timescale: start.timescale)
+    return (CMTime(value: first, timescale: start.timescale), Int(sends))
   }
 
   /// Appends one accepted frame to the ordered stage. Lock held. Never waits:
@@ -857,6 +868,9 @@ final class ProgramOutputRoute: @unchecked Sendable {
 
   private func flushOutputLocked() {
     timeline &+= 1
+    errorReported = false
+    healthyPublishedDuration = 0
+    healthyPublishedEnd = nil
     stats.flushedOnReset &+= UInt64(stage.count)
     stage.removeAll()
     fanOut.drain()
@@ -875,6 +889,7 @@ final class ProgramOutputRoute: @unchecked Sendable {
       streamSink?.discardPicture()
       flushOutputLocked()
       state.reset()
+      cutGeneration &+= 1
       nextSlot = nil
       coveredSourceEnd = nil
       onAirSkips = 0

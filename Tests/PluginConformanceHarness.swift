@@ -59,8 +59,8 @@ enum PluginConformanceHarness {
     catch { if !status.installed || !status.supported { return }; throw error }
     var ids = Set<String>()
     for device in devices {
-      guard device.id.hasPrefix(plugin.descriptor.id + ":"),
-        device.id.count > plugin.descriptor.id.count + 1, ids.insert(device.id).inserted else {
+      guard (try? VendorRegistry.pluginID(for: device.id)) == plugin.descriptor.id,
+        ids.insert(device.id).inserted else {
         throw PluginConformanceFailure.violation("Invalid or duplicate device identity")
       }
     }

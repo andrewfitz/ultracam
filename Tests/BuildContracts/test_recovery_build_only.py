@@ -1,10 +1,14 @@
-"""Compile validation must never accidentally execute the recovery writer tool."""
+"""Exercise recovery smoke orchestration without launching an encoder."""
+from contextlib import redirect_stdout
+import importlib.util
+from io import StringIO
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -33,6 +37,38 @@ target.chmod(0o755)
             result = subprocess.run(command[:-1] + ['--unknown'], env=environment,
                                     capture_output=True, text=True)
             self.assertEqual(result.returncode, 2)
+
+
+class RecoveryOwnerExitTests(unittest.TestCase):
+    def setUp(self):
+        source = ROOT / 'Tools/RecordingRecoverySmoke/verify_owner_exit.py'
+        spec = importlib.util.spec_from_file_location('verify_owner_exit', source)
+        self.verifier = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.verifier)
+
+    def test_readiness_message_may_arrive_in_multiple_reads(self):
+        with open(os.devnull, 'rb') as stream:
+            with patch.object(self.verifier.select, 'select', return_value=([stream], [], [])), \
+                 patch.object(self.verifier.os, 'read', side_effect=[b'RE', b'AD', b'Y\n']) as read:
+                self.verifier.wait_for_ready(stream)
+                self.assertEqual([call.args[1] for call in read.call_args_list], [6, 4, 2])
+
+    def test_owner_exit_closes_the_control_pipe(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            writer = root / 'writer'
+            writer.write_text('#!' + sys.executable + '\n' + '''
+import os
+import signal
+
+os.write(1, b'READY\\n')
+if os.read(0, 1) == b'':
+    signal.raise_signal(signal.SIGKILL)
+''')
+            writer.chmod(0o755)
+            with redirect_stdout(StringIO()) as output:
+                self.verifier.verify_owner_exit(writer, root)
+            self.assertIn('RECOVERY PASS owner exit', output.getvalue())
 
 
 if __name__ == '__main__':

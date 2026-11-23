@@ -66,6 +66,34 @@ import XCTest
     XCTAssertEqual(tap.counters.rejected, 0)
     tap.detach()
   }
+
+  func testInFlightPacketCannotRestoreDetectionAfterCaptureGap() {
+    let tap = AudioMeterTap()
+    tap.attach()
+    defer { tap.detach() }
+    let entered = DispatchSemaphore(value: 0)
+    let release = DispatchSemaphore(value: 0)
+    let done = DispatchSemaphore(value: 0)
+    let audible = [Int32](repeating: .max / 2, count: 64).withUnsafeBytes { Data($0) }
+    tap.producerAdmissionHook = { entered.signal(); release.wait() }
+    DispatchQueue.global().async {
+      tap.ingest(samples: audible, sampleFrames: 32, channels: 2, bytesPerSample: 4)
+      done.signal()
+    }
+    let started = entered.wait(timeout: .now() + 3)
+    tap.noteGap()
+    release.signal()
+    XCTAssertEqual(started, .success)
+    guard done.wait(timeout: .now() + 3) == .success else { return XCTFail("Producer did not finish") }
+    tap.producerAdmissionHook = nil
+    tap.waitUntilMetered()
+    XCTAssertEqual(tap.counters.metered, 1)
+    XCTAssertEqual(tap.detectedChannels, 0)
+
+    tap.ingest(samples: audible, sampleFrames: 32, channels: 2, bytesPerSample: 4)
+    tap.waitUntilMetered()
+    XCTAssertEqual(tap.detectedChannels, 2)
+  }
 #endif
 
   func testAttachmentCloseReleasesDemandWhileHandleIsStillRetained() {
@@ -144,6 +172,45 @@ import XCTest
     let summary = try XCTUnwrap(tap.endTake())
     XCTAssertEqual(summary.duration, 0.1, accuracy: 0.000001)
     XCTAssertLessThan(summary.maximumTruePeak, -12)
+  }
+
+  func testFinalPacketShorterThanPublishIntervalCountsItsOver() throws {
+    let tap = AudioMeterTap()
+    tap.beginTake()
+    let samples = [Int32](repeating: .max, count: 64).withUnsafeBytes { Data($0) }
+    tap.ingest(samples: samples, sampleFrames: 32, channels: 2, bytesPerSample: 4)
+    tap.closeTakeInput()
+    let summary = try XCTUnwrap(tap.endTake())
+    XCTAssertGreaterThan(summary.maximumTruePeak, -1)
+    XCTAssertEqual(summary.overs, 1)
+  }
+
+  func testStatusReadingsUseTheDisplayedRangeForSequence() {
+    let extreme = AudioMeterTap.snapshot(statusPeaks: [.greatestFiniteMagnitude, -.greatestFiniteMagnitude, .nan])
+    let displayed = AudioMeterTap.snapshot(statusPeaks: [1, 0, 0])
+    XCTAssertEqual(extreme.sequence, displayed.sequence)
+    for channel in 0..<3 { XCTAssertEqual(extreme[channel], displayed[channel]) }
+  }
+
+  func testLegacyStereoPacketRequiresCompatibleMeterAndHandlesUnalignedStorage() throws {
+    let tap = AudioMeterTap()
+    let meter = tap.attach()
+    let pcm = [Int32](repeating: Int32.max / 2, count: 64)
+    var padded = Data([0])
+    pcm.withUnsafeBytes { padded.append(contentsOf: $0) }
+    let samples = padded.dropFirst()
+    tap.ingest(samples: samples, sampleFrames: 32, channels: 2, bytesPerSample: 4)
+    tap.waitUntilMetered()
+    meter.flush()
+    XCTAssertEqual(meter.snapshot()[0].samplePeak, -6.0206, accuracy: 0.001)
+    let wider = try SourceAudioFormat(sampleRate: 48_000, channels: 4, sample: .int32,
+      interleaved: true, layout: AudioChannelMap(), clock: .hostTime)
+    try tap.configure(format: wider)
+    tap.ingest(samples: samples, sampleFrames: 32, channels: 2, bytesPerSample: 4)
+    tap.waitUntilMetered()
+    XCTAssertEqual(tap.counters.rejected, 1)
+    XCTAssertEqual(tap.counters.metered, 1)
+    tap.detach()
   }
 
   func testStableAttachmentFollowsDeclarationWithoutAddingViewers() throws {
@@ -448,6 +515,20 @@ import XCTest
     }
   }
 
+  func testRightJustified24BitPCMDiscardsPaddingForMetersAndActivity() throws {
+    let format = try SourceAudioFormat(sampleRate: 48_000, channels: 2, sample: .int24in32,
+      interleaved: true, layout: AudioChannelMap(), clock: .hostTime)
+    let bytes: Data = ([0x8840_0000, 0x00c0_0000, 0xffc0_0000, 0xab00_0000] as [UInt32]).map(\.littleEndian)
+      .withUnsafeBytes { Data($0) }
+    let packet = try CaptureAudioPacket(planes: [bytes], sampleFrameCount: 2, format: format, packetTime: .zero)
+    XCTAssertEqual(SourceAudioMeterInput.interleavedSamples(packet), [0.5, -0.5, -0.5, 0])
+    let levels = SourceAudioMeterInput.levels(packet)
+    XCTAssertEqual(levels.leftPeak, 0.5)
+    XCTAssertEqual(levels.rightPeak, 0.5)
+    XCTAssertEqual(levels.leftRMS, 0.5)
+    XCTAssertEqual(levels.rightRMS, sqrt(0.125), accuracy: 0.0001)
+  }
+
   func testPCMPacketOwnsBytesFromEveryPlane() throws {
     let format = try SourceAudioFormat(sampleRate: 48_000, channels: 2, sample: .int16,
       interleaved: false, layout: AudioChannelMap(), clock: .hostTime)
@@ -565,6 +646,12 @@ import XCTest
     let result = SourceAudioMeterInput.activity(peaks: [.nan, -.infinity, 0.8], rms: [-1, .infinity, 0.4])
     XCTAssertEqual(result.peak, 0.8, accuracy: 0.0001)
     XCTAssertEqual(result.rms, 0.4, accuracy: 0.0001)
+  }
+
+  func testAutoSwitchActivityClampsBeforeConvertingToFloat() {
+    let result = SourceAudioMeterInput.activity(peaks: [.greatestFiniteMagnitude], rms: [Double(Float.greatestFiniteMagnitude)])
+    XCTAssertEqual(result.peak, 1)
+    XCTAssertEqual(result.rms, 1)
   }
 
   func testRejectsUnsupportedChannelCountWithoutChangingLiveMeter() throws {

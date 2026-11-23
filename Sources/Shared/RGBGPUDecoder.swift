@@ -32,11 +32,13 @@ final class RGBGPUDecoder {
               residency: MTLResidencySet) throws -> EncodingResources {
     let minimum = try format.minimumRowBytes(width: width)
     let (size, overflow) = bytesPerRow.multipliedReportingOverflow(by: height)
-    guard height > 0, width <= Int(UInt32.max), height <= Int(UInt32.max),
+    let device = pipeline.device
+    guard input.device === device, output.device === device, commandBuffer.device === device, residency.device === device,
+          output.textureType == .type2D, output.usage.isEmpty || output.usage.contains(.shaderWrite),
+          height > 0, width <= Int(UInt32.max), height <= Int(UInt32.max),
           bytesPerRow >= minimum, bytesPerRow <= Int(UInt32.max), !overflow,
           size <= input.length, output.width == width, output.height == height,
           output.pixelFormat == .rgba32Float else { throw SourceFormatError.invalid("Invalid RGB GPU storage") }
-    let device = input.device
     let values: [UInt32] = [UInt32(width), UInt32(height), UInt32(bytesPerRow), UInt32(RGBFormat.allCases.firstIndex(of: format)!)]
     guard let parameters = device.makeBuffer(bytes: values, length: 16) else { throw SourceFormatError.invalid("RGB parameters allocation failed") }
     let descriptor = MTL4ArgumentTableDescriptor()

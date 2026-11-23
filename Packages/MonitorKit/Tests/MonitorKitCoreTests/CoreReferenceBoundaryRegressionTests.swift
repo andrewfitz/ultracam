@@ -7,6 +7,31 @@ import XCTest
 @testable import MonitorKitCore
 
 final class CoreReferenceBoundaryRegressionTests: XCTestCase {
+  func testChromaTapsPreservePhaseInLargestOddFrame() {
+    let last = (Int.max - 1) / 2
+    let taps = DecodeReference.chromaTaps(
+      x: Int.max - 2, y: Int.max - 1, width: Int.max, height: Int.max,
+      subsampling: .s420, siting: .center, vertical: .bottom)
+    XCTAssertEqual(taps.x0, last - 1)
+    XCTAssertEqual(taps.x1, last)
+    XCTAssertEqual(taps.fx, 0.25)
+    XCTAssertEqual(taps.y0, last - 1)
+    XCTAssertEqual(taps.y1, last)
+    XCTAssertEqual(taps.fy, 0.5)
+  }
+
+  func testChromaTapsClampDegenerateSubsampledAxesToOrigin() {
+    let taps = DecodeReference.chromaTaps(
+      x: Int.min, y: Int.min, width: 0, height: Int.min,
+      subsampling: .s420, siting: .center)
+    XCTAssertEqual(taps.x0, 0)
+    XCTAssertEqual(taps.x1, 0)
+    XCTAssertEqual(taps.fx, 0.75)
+    XCTAssertEqual(taps.y0, 0)
+    XCTAssertEqual(taps.y1, 0)
+    XCTAssertEqual(taps.fy, 0.75)
+  }
+
   func testConstantBT1886DisplayHasFiniteConstantLuminance() {
     for luminance in [0.0, 0.1, 100.0] {
       for signal in [-1.0, 0, 0.5, 1, 2] {

@@ -104,6 +104,8 @@ def positive_test_lines(text):
 # admits one static occurrence unless an explicit sixth field sets a reviewed
 # count; never arbitrary matching operations in a file.
 CLASSIFICATIONS = [
+    ('Sources/App/AudioMeterTap.swift', 'process', 'aligned.copyMemory(from:base,byteCount:raw.count)',
+     'pcm', 'Align a legacy PCM32 packet on the audio meter queue before typed sample access.'),
     ('Sources/Recording/RecordingPixelConverter.swift', 'encode', '.copyMemory(from:&rangeFlag,byteCount:4)', 'uniform', 'Upload exactly the four-byte UInt32 full-range flag at parameter offset four; shader performs video range conversion on GPU.', 1),
     ('Sources/Recording/PlanarRecordingConverter.swift', 'convert', 'IOSurfaceGetBaseAddress(inputSurface)', 'metadata', 'Input IOSurface address used only to compute checked plane offsets and allocation bounds; no pixel dereference.', 1),
     ('Sources/Recording/PlanarRecordingConverter.swift', 'convert', 'IOSurfaceGetBaseAddressOfPlane(inputSurface,plane)', 'metadata', 'Plane address participates only in offset/extent validation against IOSurface allocation; video read by GPU texture.', 1),

@@ -86,13 +86,36 @@ class GenerationModeTests(unittest.TestCase):
         self.assertTrue((comparison / 'project.pbxproj').is_file())
         self.assertEqual((self.root / bridge).read_text(), 'existing bridge')
 
-    def test_incomplete_switcher_uses_sibling_for_both_cargo_and_bridge(self):
-        self.write('Apps/AutoSwitcher/Cargo.toml')
-        self.write('Apps/AutoSwitcher/include/auto_switcher.h')
-        self.assertIn('$(SRCROOT)/../auto-switcher/include', self.run_generator())
-        self.write('Apps/AutoSwitcher/Cargo.lock')
-        self.write('Apps/AutoSwitcher/src/lib.rs')
-        self.assertIn('$(SRCROOT)/Apps/AutoSwitcher/include', self.run_generator())
+    def test_canonical_generation_ignores_a_local_build_directory_symlink(self):
+        canonical = self.run_generator()
+        work = self.root.parent / 'external work'
+        work.mkdir()
+        (self.root / '.build').symlink_to(work, target_is_directory=True)
+        self.assertEqual(self.run_generator(), canonical)
+
+    def test_switcher_header_matches_cargo_and_canonical_project_survives_both_layouts(self):
+        for path in ('Cargo.toml', 'Cargo.lock', 'src/lib.rs', 'include/auto_switcher.h'):
+            self.write('Apps/AutoSwitcher/' + path)
+        canonical = self.run_generator()
+        self.assertIn('$(SRCROOT)/../auto-switcher/include', canonical)
+        self.assertIn('$(SRCROOT)/Apps/AutoSwitcher/include', canonical)
+        project = self.root.parent / 'run/Ultracam.xcodeproj'
+        self.write('Ultracam.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved')
+        for relative in ('../auto-switcher', 'Apps/AutoSwitcher'):
+            if relative == 'Apps/AutoSwitcher':
+                (self.root.parent / 'auto-switcher/Cargo.lock').unlink()
+            with self.subTest(relative=relative):
+                selected = subprocess.check_output(
+                    [sys.executable, str(self.root / 'scripts/auto_switcher_source.py')], text=True).strip()
+                self.assertEqual(Path(selected).resolve(), (self.root / relative).resolve())
+                self.assertEqual(canonical, self.run_generator())
+                subprocess.run([sys.executable, str(self.root / 'scripts/generate_project.py'),
+                                '--build-project', str(project)], check=True, capture_output=True,
+                               env=self.environment)
+                generated = (project / 'project.pbxproj').read_text()
+                self.assertIn(f'$(SRCROOT)/{relative}/include', generated)
+                other = 'Apps/AutoSwitcher' if relative == '../auto-switcher' else '../auto-switcher'
+                self.assertNotIn(f'$(SRCROOT)/{other}/include', generated)
 
     def test_asset_catalogs_share_one_resources_phase(self):
         self.run_generator()
@@ -226,16 +249,25 @@ class GenerationModeTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('generate_project.py', result.stderr)
 
-    def test_concurrent_builds_keep_each_projects_profile_and_checkout_files(self):
-        shutil.copy2(ROOT / 'scripts/build.sh', self.root / 'scripts')
+    def install_build_fixtures(self):
+        for name in ('build.sh', 'publish_build.py'):
+            shutil.copy2(ROOT / 'scripts' / name, self.root / 'scripts')
         self.write('scripts/vendor-sdk.py', 'pass')
         self.write('scripts/fetch-decklink-sdk.sh', 'exit 0')
-        self.write('scripts/validate_bundle.py', 'pass')
+        self.write('scripts/validate_bundle.py', """import os
+if os.environ.get('INVALID_BUILD'):
+    raise SystemExit('invalid fixture build')
+""")
         self.write('bin/rustup', '#!/bin/sh\nexit 0\n')
         self.write('bin/xcodebuild', """#!/bin/bash
 set -eu
 test "$1" = -project
 echo "$2" > "$ULTRACAM_WORK_ROOT/project-path"
+test "$5" = -configuration
+test "$7" = -derivedDataPath
+product="$8/Build/Products/$6/Ultracam.app"
+mkdir -p "$product"
+printf '%s' "${BUILD_MARKER:-fixture}" > "$product/marker"
 case " $* " in
   *' -onlyUsePackageVersionsFromResolvedFile '*) ;;
   *) exit 1 ;;
@@ -248,13 +280,21 @@ esac
         self.write('Ultracam.xcodeproj/project.pbxproj', 'existing project')
         self.write('Sources/DeviceAPI/GeneratedBridgingHeader.h', 'existing bridge')
         self.write('inventory.json', json.dumps({'sony': True}))
+        return lock
+
+    def build_environment(self, work):
+        env = dict(self.environment, ULTRACAM_WORK_ROOT=str(work),
+                   PATH=str(self.root / 'bin') + os.pathsep + self.environment['PATH'])
+        env.pop('CARGO_TARGET_DIR', None)
+        env.pop('ULTRACAM_DERIVED_DATA_PATH', None)
+        return env
+
+    def test_concurrent_builds_keep_each_projects_profile_and_checkout_files(self):
+        lock = self.install_build_fixtures()
 
         def build(profile):
             work = self.root.parent / profile
-            env = dict(self.environment, ULTRACAM_WORK_ROOT=str(work),
-                       PATH=str(self.root / 'bin') + os.pathsep + self.environment['PATH'])
-            env.pop('CARGO_TARGET_DIR', None)
-            env.pop('ULTRACAM_DERIVED_DATA_PATH', None)
+            env = self.build_environment(work)
             if profile == 'present':
                 env['ULTRACAM_SDK_INVENTORY'] = 'inventory.json'
             subprocess.run(['bash', str(self.root / 'scripts/build.sh'), '--debug'], cwd=self.root,
@@ -274,10 +314,27 @@ esac
                                  str(project / 'project.pbxproj')]))['objects']
             guard = next(value['shellScript'] for value in objects.values()
                          if value.get('name') == 'Check Vendor Inputs')
+            env.pop('ULTRACAM_SDK_INVENTORY', None)
             subprocess.run(['/bin/sh', '-c', guard], cwd=project.parent,
                            env=dict(env, SRCROOT=str(self.root)), check=True, capture_output=True)
         self.assertEqual((self.root / 'Ultracam.xcodeproj/project.pbxproj').read_text(), 'existing project')
         self.assertEqual((self.root / 'Sources/DeviceAPI/GeneratedBridgingHeader.h').read_text(), 'existing bridge')
+
+    def test_reused_derived_data_preserves_the_last_validated_product(self):
+        self.install_build_fixtures()
+        work = self.root.parent / 'reused'
+        env = dict(self.build_environment(work), ULTRACAM_DERIVED_DATA_PATH='shared')
+        command = ['bash', str(self.root / 'scripts/build.sh'), '--debug']
+        subprocess.run(command, cwd=self.root, env=dict(env, BUILD_MARKER='verified'),
+                       check=True, capture_output=True)
+        stable = work / 'agent-work/ultracam/Ultracam.app'
+        self.assertEqual((stable / 'marker').read_text(), 'verified')
+        result = subprocess.run(command, cwd=self.root,
+                                env=dict(env, BUILD_MARKER='invalid', INVALID_BUILD='1'),
+                                capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('invalid fixture build', result.stderr)
+        self.assertEqual((stable / 'marker').read_text(), 'verified')
 
     def test_relative_inventory_from_other_cwd_uses_checkout_path_in_guard(self):
         self.write('profiles/present.json', json.dumps({'sony': True}))

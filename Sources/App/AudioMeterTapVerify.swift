@@ -173,8 +173,11 @@ import Synchronization
     driver.start()
     for index in 0..<300 {
       do {
-        let format = try SourceAudioFormat(sampleRate: index.isMultiple(of: 2) ? 48_000 : 48_001,
-          channels: 2, sample: .int32, interleaved: true, layout: AudioChannelMap(), clock: .hostTime)
+        // The legacy packets above have a fixed 48 kHz sample rate. Change the
+        // clock declaration to replace the session without invalidating its PCM.
+        let format = try SourceAudioFormat(sampleRate: EmbeddedAudioFormat.sampleRate,
+          channels: 2, sample: .int32, interleaved: true, layout: AudioChannelMap(),
+          clock: index.isMultiple(of: 2) ? .hostTime : .deviceClock)
         try tap.configure(format: format)
       } catch {
         verifier.check("audio meter tap: synthetic declaration is admitted", false, "\(error)")

@@ -180,7 +180,8 @@ public struct MonitorLayout: Equatable, Sendable {
 
     let raw = MonitorRect(x: 0, y: 0, width: vw, height: vh).fitting(aspect: aspect)
     // Whole-pixel edges keep borders and guides crisp; the aspect error is under a pixel.
-    let x0 = raw.x.rounded(), y0 = raw.y.rounded()
+    // Even a subpixel-wide or tall fit occupies one pixel inside the viewport.
+    let x0 = min(vw - 1, raw.x.rounded()), y0 = min(vh - 1, raw.y.rounded())
     let fit = MonitorRect(
       x: x0, y: y0, width: max(1, raw.maxX.rounded() - x0), height: max(1, raw.maxY.rounded() - y0))
     fitRect = fit
@@ -361,16 +362,27 @@ public struct GuideRaster: Equatable, Sendable {
         b.horizontal(basis.y + cell * Double(i), basis, &segments)
         i += 1
       }
-      var k = 0.0
-      // Without magnification no later clipping can remove a segment. Once the
-      // prefix is full, further columns (and later guides) would be discarded.
-      // Magnified grids must retain the old order through viewport clipping.
-      while basis.midX + k * cell < basis.maxX - b.half
-        && (layout.isMagnified || segments.count < Self.maximumSegments)
+      // Enumerate only columns whose strokes could reach the viewport.
+      // Include a pixel of padding for the builder's pixel snapping.
+      let left = -b.half - 1, right = layout.viewportWidth + b.half + 1
+      let middle = basis.midX
+      let firstDistance = max(0, max(left - middle, middle - right))
+      let lastDistance = max(middle - left, right - middle)
+      var k = cell > 0 ? max(0, (firstDistance / cell).rounded(.down) - 1) : .infinity
+      var visibleColumns = 0
+      while k.isFinite, middle + k * cell < basis.maxX - b.half,
+        k * cell <= lastDistance + cell, visibleColumns < Self.maximumSegments
       {
-        b.vertical(basis.midX + k * cell, basis, &segments)
-        if k > 0 { b.vertical(basis.midX - k * cell, basis, &segments) }
-        k += 1
+        for side in 0..<(k == 0 ? 1 : 2) {
+          let x = middle + (side == 0 ? k : -k) * cell
+          let snapped = b.across(x, basis.x, basis.maxX)
+          if snapped >= -b.half && snapped <= layout.viewportWidth + b.half {
+            b.vertical(x, basis, &segments)
+            visibleColumns += 1
+          }
+        }
+        // At very large public dimensions adding one can round back to k.
+        k = max(k + 1, k.nextUp)
       }
     }
     let half = b.half

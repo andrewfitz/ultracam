@@ -537,6 +537,76 @@ import XCTest
     XCTAssertEqual(try RecordingTakeSidecar.readSnapshot(for: movie).metadata.epoch, source.epochID)
   }
 
+  func testFirstEncoderFailureRemainsVisibleAfterLaterCallbacks() throws {
+    let config = try SourceRecordingConfiguration(feedID: .init("callback-diagnostics"),
+      outputURL: FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID()).mov"),
+      width: 16, height: 16)
+    let writer = try AVAssetSourceRecordingWriter(configuration: config)
+    writer.recordEncoderFailure(status: -50)
+    writer.recordEncoderFailure(status: -1234)
+
+    XCTAssertTrue(writer.hasFailed)
+    let telemetry = writer.telemetry
+    XCTAssertTrue(telemetry.lastError?.contains("-50") == true)
+    XCTAssertEqual(telemetry.encoderErrors, 2)
+    XCTAssertEqual(telemetry.droppedEncodedVideo, 2)
+  }
+
+  func testWriterCountsSynchronousEncoderDropOnceInEitherCallbackOrder() throws {
+    for callbackFirst in [true, false] {
+      let config = try SourceRecordingConfiguration(feedID: .init("synchronous-drop"),
+        outputURL: FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID()).mov"), width: 16, height: 16)
+      let writer = try AVAssetSourceRecordingWriter(configuration: config)
+      try writer.submitVideo(pts: .zero, nativeTimecode: nil) { _ in (noErr, .asynchronous) }
+      var droppedID: UInt?
+      XCTAssertThrowsError(try writer.submitVideo(pts: CMTime(value: 1, timescale: 30), nativeTimecode: nil) { id in
+        droppedID = id
+        if callbackFirst { writer.receiveEncodedVideo(status: noErr, flags: .frameDropped, sample: nil, submissionID: id) }
+        return (noErr, .frameDropped)
+      }) { XCTAssertTrue($0.localizedDescription.contains("dropped a recording frame")) }
+      if !callbackFirst {
+        writer.receiveEncodedVideo(status: noErr, flags: .frameDropped, sample: nil, submissionID: try XCTUnwrap(droppedID))
+      }
+
+      let telemetry = writer.telemetry
+      XCTAssertTrue(telemetry.failed)
+      XCTAssertEqual(telemetry.encoderPendingFrames, 1, "The earlier asynchronous frame is still pending")
+      XCTAssertEqual(telemetry.encoderErrors, 1)
+      XCTAssertEqual(telemetry.droppedEncodedVideo, 1)
+    }
+  }
+
+  func testWriterReportsAsynchronousEncoderDrop() throws {
+    let config = try SourceRecordingConfiguration(feedID: .init("asynchronous-drop"),
+      outputURL: FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID()).mov"), width: 16, height: 16)
+    let writer = try AVAssetSourceRecordingWriter(configuration: config)
+    var submittedID: UInt?
+    try writer.submitVideo(pts: .zero, nativeTimecode: nil) { id in
+      submittedID = id
+      return (noErr, .asynchronous)
+    }
+    XCTAssertFalse(writer.hasFailed)
+    writer.receiveEncodedVideo(status: noErr, flags: [.asynchronous, .frameDropped], sample: nil, submissionID: try XCTUnwrap(submittedID))
+
+    let telemetry = writer.telemetry
+    XCTAssertTrue(telemetry.failed)
+    XCTAssertTrue(telemetry.lastError?.contains("dropped a recording frame") == true)
+    XCTAssertEqual(telemetry.droppedEncodedVideo, 1)
+    XCTAssertEqual(telemetry.encoderPendingFrames, 0)
+  }
+
+  func testWriterReportsSynchronousEncoderStatus() throws {
+    let config = try SourceRecordingConfiguration(feedID: .init("synchronous-error"),
+      outputURL: FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID()).mov"), width: 16, height: 16)
+    let writer = try AVAssetSourceRecordingWriter(configuration: config)
+    XCTAssertThrowsError(try writer.submitVideo(pts: .zero, nativeTimecode: nil) { _ in (-1234, []) }) {
+      XCTAssertTrue($0.localizedDescription.contains("-1234"))
+    }
+    XCTAssertTrue(writer.hasFailed)
+    XCTAssertEqual(writer.telemetry.droppedEncodedVideo, 1)
+    XCTAssertEqual(writer.telemetry.encoderPendingFrames, 0)
+  }
+
   func testFinishRethrowsFirstEncoderCallbackFailureWithoutCreatingMovie() throws {
     let folder = FileManager.default.temporaryDirectory.appendingPathComponent("encoder-failure-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)

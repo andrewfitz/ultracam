@@ -66,11 +66,11 @@ struct UIProgramPictureView: View {
   @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
   private var session: UISessionSnapshot { context.session }
-  private var onAir: UICameraSnapshot? { session.cameras.first { $0.id == session.onAirID } }
   private var target: String { MonitorFeedHost.programTarget }
 
   var body: some View {
     let tally = context.presentation.programTally
+    let onAir = session.cameras.first { $0.id == session.onAirID }
     let placement = UIMonitorToolButtons.Placement(hovering: hovering, panelOpen: toolPanel != nil, narrow: narrow,
       clean: UICleanViewState.shared.clean.contains(target))
     return context.pictures.programPicture()
@@ -152,8 +152,9 @@ struct UIProgramPictureView: View {
 
   @ViewBuilder private func tools(_ placement: UIMonitorToolButtons.Placement) -> some View {
     if placement.shown {
+      let active = UIMonitorBridge.activeTools(context.monitor.preferences(for: target))
       UIMonitorToolButtons(targetID: target, name: "Program",
-        activeTools: UIMonitorTool.allCases.filter { UIMonitorBridge.activeTools(context.monitor.preferences(for: target)).contains($0) },
+        activeTools: UIMonitorTool.allCases.filter(active.contains),
         isProgram: true, toggle: { [context] in context.send(.toggleTool(cameraID: MonitorFeedHost.programTarget, $0)) },
         monitor: context.monitor, openPanel: $toolPanel, expanded: placement.expanded,
         singleColumnPanels: singleColumnTools)
@@ -217,8 +218,9 @@ struct UIProgramRowLayout: Layout {
   private func widths(_ width: CGFloat, height: CGFloat?) -> (program: CGFloat, sources: CGFloat) {
     let byHeight = height.map { $0 * 16 / 9 } ?? .infinity
     let program = max(320, min(width - gutter - Self.sourceWidth.lowerBound, byHeight))
-    let sources = min(Self.sourceWidth.upperBound, max(Self.sourceWidth.lowerBound, width - gutter - program))
-    return (min(program, width - gutter - sources), sources)
+    let available = max(0, width - gutter)
+    let sources = min(available, Self.sourceWidth.upperBound, max(Self.sourceWidth.lowerBound, available - program))
+    return (min(program, available - sources), sources)
   }
 
   func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {

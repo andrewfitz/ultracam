@@ -353,7 +353,7 @@ final class FeedCoordinator {
   func session(for id: FeedID) -> FeedSession {
     if let session = sessions[id] { return session }
     let descriptor = descriptors.first(where: { $0.id == id }) ?? FeedDescriptor(id: id)
-    if !descriptors.contains(where: { $0.id == id }) { descriptors.append(descriptor) }
+    if !descriptors.contains(where: { $0.id == id }) { update(descriptor) }
     let session = FeedSession(descriptor: descriptor)
     sessions[id] = session
     return session
@@ -368,25 +368,18 @@ final class FeedCoordinator {
   }
 
   func update(_ descriptor: FeedDescriptor) {
-    guard let index = descriptors.firstIndex(where: { $0.id == descriptor.id }) else {
+    if let index = descriptors.firstIndex(where: { $0.id == descriptor.id }) {
+      descriptors[index] = descriptor
+    } else {
       descriptors.append(descriptor)
-      if !descriptor.enabled {
-        capturePool.stop(descriptor.id)
-      }
-      programOutput.updateFeeds(descriptors.filter(\.enabled).map(\.id))
-      publishVirtualCameraRegistry()
-      return
     }
-    descriptors[index] = descriptor
     // A descriptor can be disabled while its session is idle (for example,
     // when a capture owner was started directly by a camera demand callback).
     // Stopping only the FeedSession in that case leaves the native capture
     // owner active and allows late frames to outlive the descriptor.
-    if !descriptor.enabled {
-      capturePool.stop(descriptor.id)
-      if selectedFeedID == descriptor.id {
-        selectedFeedID = descriptors.first(where: \.enabled)?.id ?? descriptor.id
-      }
+    if !descriptor.enabled { capturePool.stop(descriptor.id) }
+    if !selectedDescriptor.enabled, let enabled = descriptors.first(where: \.enabled) {
+      selectedFeedID = enabled.id
     }
     sessions[descriptor.id]?.update(descriptor: descriptor)
     programOutput.updateFeeds(descriptors.filter(\.enabled).map(\.id))
@@ -566,24 +559,23 @@ final class FeedCoordinator {
   @discardableResult
   private func publishVirtualCameraRegistry() -> Bool {
     let devices = virtualCameraDescriptors
-    let next: VirtualCameraRegistrySnapshot
-    if let current = registryStore?.load() {
-      next = current.advancing(to: devices)
+    let stored = registryStore?.load()
+    let previous: VirtualCameraRegistrySnapshot
+    if let stored, stored.generation >= virtualCameraRegistrySnapshot.generation {
+      previous = stored
     } else {
-      let generation = virtualCameraRegistrySnapshot.generation == UInt64.max
-        ? UInt64.max
-        : max(virtualCameraRegistrySnapshot.generation + 1, 1)
-      next = VirtualCameraRegistrySnapshot(generation: generation,
-        appGroupIdentifier: virtualCameraRegistrySnapshot.appGroupIdentifier, devices: devices)
+      previous = virtualCameraRegistrySnapshot
+    }
+    // Preferences such as LUT and cadence do not change the CMIO devices.
+    // Only reuse the generation when the store already agrees with it.
+    let next = previous.devices == devices && (registryStore == nil || previous == stored)
+      ? previous : previous.advancing(to: devices)
+    if let registryStore, next != stored {
+      do { try registryStore.save(next) }
+      catch { return false }
     }
     virtualCameraRegistrySnapshot = next
     virtualCameraRegistryVersion = Int(min(next.generation, UInt64(Int.max)))
-    guard let registryStore else { return true }
-    do {
-      try registryStore.save(next)
-      return true
-    } catch {
-      return false
-    }
+    return true
   }
 }

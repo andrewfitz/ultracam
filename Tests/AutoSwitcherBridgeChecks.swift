@@ -30,31 +30,28 @@ import XCTest
     bridge?.stop()
   }
 
-  func testTranscriptCueReachesRustBridgeAndIsNormalized() {
+  func testTranscriptCueReachesRustBridgeAndIsNormalized() throws {
     var settings = NaturalTalkingHeadSettings()
     settings.enabled = true
-    let bridge = AutoSwitcherBridge(settings: settings,
-      anchor: FeedID(rawValue: "anchor"), emphasis: FeedID(rawValue: "emphasis"))
-    let expectation = expectation(description: "transcript cue delivered")
-    bridge?.onTranscriptCue = { cue in
-      XCTAssertEqual(cue.segmentID, "segment-1")
-      XCTAssertEqual(cue.kind, "sentenceEnd")
-      XCTAssertEqual(cue.confidence, 1, accuracy: 0.0001)
-      XCTAssertEqual(cue.start, 1, accuracy: 0.0001)
-      XCTAssertEqual(cue.end, 1.4, accuracy: 0.0001)
-      expectation.fulfill()
-    }
-    bridge?.ingestTranscript(segmentID: "segment-1", revision: 2,
+    let bridge = try XCTUnwrap(AutoSwitcherBridge(settings: settings,
+      anchor: FeedID(rawValue: "anchor"), emphasis: FeedID(rawValue: "emphasis")))
+    bridge.ingestTranscript(segmentID: "segment-1", revision: 2,
       start: CMTime(seconds: 1, preferredTimescale: 1_000),
       end: CMTime(seconds: 1.4, preferredTimescale: 1_000), kind: "sentenceEnd",
       confidence: 2, isFinal: true)
-    wait(for: [expectation], timeout: 1)
-    // Invalid kinds and reversed ranges are rejected before crossing the C ABI.
-    bridge?.ingestTranscript(segmentID: "bad", revision: 1,
+    bridge.ingestTranscript(segmentID: "bad", revision: 1,
       start: CMTime(seconds: 2, preferredTimescale: 1_000),
       end: CMTime(seconds: 1, preferredTimescale: 1_000), kind: "unknown",
       confidence: 0.9, isFinal: false)
-    bridge?.stop()
+    bridge.stop()
+    let events = bridge.takeEvents()
+    XCTAssertEqual(events.count, 1)
+    guard case let .transcript(cue)? = events.first else { return XCTFail("Missing transcript cue") }
+    XCTAssertEqual(cue.segmentID, "segment-1")
+    XCTAssertEqual(cue.kind, "sentenceEnd")
+    XCTAssertEqual(cue.confidence, 1, accuracy: 0.0001)
+    XCTAssertEqual(cue.start, 1, accuracy: 0.0001)
+    XCTAssertEqual(cue.end, 1.4, accuracy: 0.0001)
   }
 
   /// The anchor came back, so the director's clock moves from the emphasis camera's stream
@@ -66,8 +63,6 @@ import XCTest
       var settings = NaturalTalkingHeadSettings()
       settings.enabled = true
       let bridge = try XCTUnwrap(AutoSwitcherBridge(settings: settings, anchor: anchor, emphasis: emphasis))
-      let log = InstructionLog()
-      bridge.onInstruction = { log.append($0) }
       bridge.manualOverride(cameraID: emphasis, at: .zero)
       for step in 0...20 { bridge.ingestAudio(time: CMTime(value: Int64(step), timescale: 10), rms: 0, peak: 0, present: true) }
       let handoff = CMTime(value: 600, timescale: 1)
@@ -76,7 +71,10 @@ import XCTest
         bridge.ingestAudio(time: CMTimeAdd(handoff, CMTime(value: Int64(step), timescale: 10)), rms: 0, peak: 0, present: true)
       }
       bridge.stop()  // Waits for every event already queued.
-      return log.instructions
+      return bridge.takeEvents().compactMap { event in
+        guard case let .instruction(instruction) = event else { return nil }
+        return instruction
+      }
     }
     XCTAssertFalse(try cuts(rebasing: false).isEmpty, "The hazard: a forced cut on the first tick of the new clock")
     XCTAssertEqual(try cuts(rebasing: true), [], "The shot on air starts over at the handoff")
@@ -84,40 +82,54 @@ import XCTest
   func testClockRebaseReportsEveryControlInputInDirectorOrder() throws {
     let anchor = FeedID(rawValue: "A"), emphasis = FeedID(rawValue: "B")
     let bridge = try XCTUnwrap(AutoSwitcherBridge(settings: NaturalTalkingHeadSettings(), anchor: anchor, emphasis: emphasis))
-    let log = ControlInputLog()
-    bridge.onControlEvent = { log.append($0) }
     bridge.rebaseClock(at: CMTime(value: 600, timescale: 1), onAir: emphasis,
       health: [(anchor, false), (emphasis, true)])
     bridge.stop()
-    XCTAssertEqual(log.events, [.reset, .health(cameraID: "A", healthy: false, time: 600),
+    XCTAssertEqual(controlEvents(from: bridge), [.reset, .health(cameraID: "A", healthy: false, time: 600),
       .health(cameraID: "B", healthy: true, time: 600), .manualOverride(cameraID: "B", time: 600)])
   }
 
   func testManualControlReportsAcceptedDirectorTimeAndOmitsRejectedOverrides() throws {
     let bridge = try XCTUnwrap(AutoSwitcherBridge(settings: NaturalTalkingHeadSettings(),
       anchor: FeedID(rawValue: "A"), emphasis: FeedID(rawValue: "B")))
-    let log = ControlInputLog()
-    bridge.onControlEvent = { log.append($0) }
     bridge.tick(time: CMTime(value: 100, timescale: 1))
     bridge.manualOverride(cameraID: FeedID(rawValue: "B"), at: CMTime(value: 99, timescale: 1))
     bridge.manualOverride(cameraID: FeedID(rawValue: "A"), at: .zero)
     bridge.manualOverride(cameraID: FeedID(rawValue: "unknown"), at: CMTime(value: 101, timescale: 1))
     bridge.stop()
-    XCTAssertEqual(log.events, [.manualOverride(cameraID: "B", time: 100)])
+    XCTAssertEqual(controlEvents(from: bridge), [.tick(time: 100), .manualOverride(cameraID: "B", time: 100)])
   }
 
-}
+  func testStopLeavesOrderedAudioAndControlInputsInOnePendingBatch() throws {
+    let a = FeedID(rawValue: "A"), b = FeedID(rawValue: "B")
+    let bridge = try XCTUnwrap(AutoSwitcherBridge(settings: NaturalTalkingHeadSettings(), anchor: a, emphasis: b))
+    let ready = expectation(description: "one wakeup for a pending batch")
+    ready.assertForOverFulfill = true
+    bridge.setEventsReadyHandler { ready.fulfill() }
+    bridge.ingestAudio(time: .zero, rms: 0.1, peak: 0.2, present: true)
+    bridge.manualOverride(cameraID: b, at: .zero)
+    bridge.tick(time: CMTime(value: 1, timescale: 2))
+    let acknowledged = UUID(), rejected = UUID()
+    bridge.acknowledge(decisionID: acknowledged, appliedAt: nil)
+    bridge.reject(decisionID: rejected)
+    bridge.stop()
+    wait(for: [ready], timeout: 1)
+    let events = bridge.takeEvents()
+    XCTAssertEqual(events.count, 6)
+    guard case let .audio(cue)? = events.first else { return XCTFail("Missing initial audio cue") }
+    XCTAssertEqual(cue.time, 0)
+    XCTAssertEqual(events.dropFirst().compactMap(control),
+      [.tick(time: 0), .manualOverride(cameraID: "B", time: 0), .tick(time: 0.5),
+        .acknowledge(decisionID: acknowledged, time: nil), .reject(decisionID: rejected)])
+    XCTAssertTrue(bridge.takeEvents().isEmpty)
+  }
 
-private final class InstructionLog: @unchecked Sendable {
-  private let lock = NSLock()
-  private var stored: [AutoSwitcherInstruction] = []
-  func append(_ instruction: AutoSwitcherInstruction) { lock.withLock { stored.append(instruction) } }
-  var instructions: [AutoSwitcherInstruction] { lock.withLock { stored } }
-}
+  private func controlEvents(from bridge: AutoSwitcherBridge) -> [AutoSwitcherControlEvent] {
+    bridge.takeEvents().compactMap(control)
+  }
 
-private final class ControlInputLog: @unchecked Sendable {
-  private let lock = NSLock()
-  private var stored: [AutoSwitcherControlEvent] = []
-  func append(_ event: AutoSwitcherControlEvent) { lock.withLock { stored.append(event) } }
-  var events: [AutoSwitcherControlEvent] { lock.withLock { stored } }
+  private func control(_ event: AutoSwitcherBridge.Event) -> AutoSwitcherControlEvent? {
+    guard case let .control(controlEvent) = event else { return nil }
+    return controlEvent
+  }
 }

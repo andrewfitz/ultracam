@@ -1267,6 +1267,85 @@ final class MonitorCompletionProbe: MonitorGPUCompletion, @unchecked Sendable {
     XCTAssertEqual(presenter.target, beta, "A surface still bound to it says so")
   }
 
+  func testReaddedCameraRebindsAnExistingSurfaceToTheNewHost() throws {
+    let value = coordinator()
+    let id = UUID()
+    let camera = FeedDescriptor(id: FeedID(rawValue: beta.rawValue), name: "Tight")
+    let presenter = value.surface(id: id, target: beta)
+    value.registerSurface(id: id, target: beta, isVisible: true, scopeVisible: false)
+    let previousHost = value.captureSink(for: beta)
+    let frame = try monitorPixelBuffer()
+    previousHost.offer(frame, pts: .zero, captureGeneration: 1, sequence: 1)
+    let previousWork = try XCTUnwrap(presenter.renderWork(after: (0, 0), force: true))
+
+    value.updateTargets(feeds: [], programAvailable: false)
+    XCTAssertFalse(previousHost.hasConsumers)
+    XCTAssertNil(presenter.currentStamp)
+    value.updateTargets(feeds: [camera], programAvailable: false)
+    XCTAssertEqual(value.hostTargets, [beta])
+    let replacementHost = value.captureSink(for: beta)
+    XCTAssertFalse(replacementHost === previousHost)
+    XCTAssertTrue(replacementHost.hasConsumers)
+    XCTAssertTrue(value.surface(id: id, target: beta) === presenter)
+
+    replacementHost.offer(frame, pts: .zero, captureGeneration: 1, sequence: 1)
+    let replacementWork = try XCTUnwrap(presenter.renderWork(after: (0, 0), force: true))
+    XCTAssertTrue(previousWork.host === previousHost)
+    XCTAssertTrue(replacementWork.host === replacementHost)
+    XCTAssertGreaterThan(try XCTUnwrap(replacementWork.stamp).generation, try XCTUnwrap(previousWork.stamp).generation)
+    previousHost.offer(frame, pts: .zero, captureGeneration: 2, sequence: 2)
+    XCTAssertEqual(presenter.currentStamp, replacementWork.stamp)
+  }
+
+  func testRestoringProgramResumesAnExistingSurface() throws {
+    let value = coordinator()
+    let cameras = [FeedDescriptor(id: FeedID(rawValue: alpha.rawValue), name: "Wide")]
+    value.updateTargets(feeds: cameras, programAvailable: true)
+    let (presenter, host) = liveSurface(value, target: .program)
+    let frame = try monitorPixelBuffer()
+    host.offer(frame, pts: .zero, captureGeneration: 1, sequence: 1)
+    XCTAssertNotNil(presenter.currentStamp)
+
+    value.updateTargets(feeds: cameras, programAvailable: false)
+    XCTAssertFalse(host.hasConsumers)
+    XCTAssertNil(presenter.currentStamp)
+    value.updateTargets(feeds: cameras, programAvailable: true)
+    XCTAssertTrue(host.hasConsumers)
+    host.offer(frame, pts: .zero, captureGeneration: 2, sequence: 1)
+    XCTAssertNotNil(presenter.currentStamp)
+  }
+
+  func testDiagnosticsRespectThePresentedFramesExpectedPeriod() {
+    let value = coordinator()
+    let (presenter, _) = liveSurface(value)
+    let now = ProcessInfo.processInfo.systemUptime
+    let slow = MonitorFeedHost.Stamp(target: alpha.rawValue, generation: 1, sequence: 1,
+      sourcePTS: 0, hostTime: now - 1.5, revision: 1, expectedPeriod: 1)
+    presenter.recordPresented(slow)
+    value.refreshDiagnostics()
+    XCTAssertEqual(value.diagnostics(for: alpha).availability, .live)
+
+    let fast = MonitorFeedHost.Stamp(target: alpha.rawValue, generation: 2, sequence: 1,
+      sourcePTS: 0, hostTime: now - 0.5, revision: 1, expectedPeriod: 1.0 / 30)
+    presenter.recordPresented(fast)
+    value.refreshDiagnostics()
+    XCTAssertEqual(value.diagnostics(for: alpha).availability, .stale)
+  }
+
+  func testCoordinatorTeardownReleasesRegisteredSurfaces() {
+    weak var retiredPresenter: MonitorSurfacePresenter?
+    weak var retiredHost: MonitorFeedHost?
+    do {
+      let coordinator = coordinator()
+      let (presenter, host) = liveSurface(coordinator, target: beta)
+      retiredPresenter = presenter
+      retiredHost = host
+      XCTAssertTrue(host.hasConsumers)
+    }
+    XCTAssertNil(retiredPresenter)
+    XCTAssertNil(retiredHost)
+  }
+
   func testFocusAnalysisUsesTheStageAvailableToThePicture() {
     XCTAssertEqual(
       MonitorSurfaceRenderLoop.focusAnalysisStage(

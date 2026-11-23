@@ -85,9 +85,10 @@ struct PlanarStage {
       b += 1
       let width = Int(buffer.mNumberChannels)
       let data = UnsafeRawPointer(buffer.mData)
-      if data != nil {
+      if data != nil, width > 0 {
+        // Divide the advertised size so an invalid frame count cannot overflow.
         precondition(
-          frameCount * width * format.byteSize <= Int(buffer.mDataByteSize), "AudioBuffer shorter than frameCount")
+          frameCount <= Int(buffer.mDataByteSize) / format.byteSize / width, "AudioBuffer shorter than frameCount")
       }
       var i = 0
       while i < width, c < channelCount {

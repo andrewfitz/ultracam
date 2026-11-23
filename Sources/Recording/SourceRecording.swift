@@ -337,14 +337,14 @@ struct SourceRecordingConfiguration {
     }
     self.targetVideoBitrate = targetVideoBitrate
     self.render420 = render420
-    guard width > 0, height > 0 else {
-      throw SourceRecordingError.invalidConfiguration("Video dimensions must be positive.")
+    guard width > 0, height > 0, Int32(exactly: width) != nil, Int32(exactly: height) != nil else {
+      throw SourceRecordingError.invalidConfiguration("Video dimensions must fit positive 32-bit integers.")
     }
     guard queueCapacity > 0, audioQueueCapacity > 0, maximumBufferedWriterBytes > 0 else {
       throw SourceRecordingError.invalidConfiguration("Queue capacity must be positive.")
     }
-    guard spaceCheckInterval > 0 else {
-      throw SourceRecordingError.invalidConfiguration("The space-check interval must be positive.")
+    guard spaceCheckInterval > 0, spaceCheckInterval * 1_000_000_000 < Double(Int.max) else {
+      throw SourceRecordingError.invalidConfiguration("The space-check interval must fit the dispatch timer.")
     }
     guard maxKeyFrameInterval.map({ $0 > 0 }) ?? true,
       maxKeyFrameIntervalDuration.isFinite, maxKeyFrameIntervalDuration > 0 else {
@@ -679,12 +679,9 @@ final class SourceRecorderCore: @unchecked Sendable {
   private let queue: DispatchQueue
   /// Short lock over state and counters. Never held across writer calls.
   private let stateLock = RecordingLock()
-  /// Counts an admission that has not yet reached `queue.async`. `stop` waits
-  /// for it so finish cannot run in that gap, and the lock is not held across
-  /// the async submit.
-  private let admission = DispatchGroup()
   private let stopCompletion = DispatchGroup()
   private let queueKey = DispatchSpecificKey<Bool>()
+  private var startInProgress = false
   private var stopStarted = false
   private var stopResult: Result<Void, SourceRecordingError>?
   private let configuration: SourceRecordingConfiguration
@@ -714,7 +711,9 @@ final class SourceRecorderCore: @unchecked Sendable {
   private var gapLog = LossLogLimiter()
   private static let log = Logger(subsystem: "org.ultracam.app", category: "recording")
   private var spaceTimer: DispatchSourceTimer?
-  /// Space-check timer state (utility queue only).
+  /// Invalidates a probe that ran across a pause and subsequent resume.
+  private var spaceCheckGeneration: UInt64 = 0
+  /// Under `stateLock`, including direct callers of `spaceHeadroom`.
   private var lastSpaceCheck: (time: TimeInterval, acceptedBytes: UInt64)?
   /// What a paused or failed take last reported it still owes. Timer queue.
   private var reportedOwedBytes: UInt64?
@@ -748,49 +747,47 @@ final class SourceRecorderCore: @unchecked Sendable {
 
   var telemetry: SourceRecordingTelemetry {
     let writerSnapshot = writer.telemetry
-    return stateLock.withLock {
-      if writerSnapshot.failed {
-        telemetryValue.state = .failed
-        if telemetryValue.lastError == nil { telemetryValue.lastError = writerSnapshot.lastError }
-      }
+    var snapshot = stateLock.withLock {
+      if writerSnapshot.failed { observeWriterFailureLocked(writerSnapshot.lastError) }
       var snapshot = telemetryValue
-      snapshot.encodedVideo = writerSnapshot.encodedVideo
-      snapshot.droppedEncodedVideo = writerSnapshot.droppedEncodedVideo
-      snapshot.encoderErrors = writerSnapshot.encoderErrors
-      snapshot.droppedAudio &+= writerSnapshot.droppedAudio
-      snapshot.droppedTimecode = writerSnapshot.droppedTimecode
-      snapshot.encodedVideoBytes = writerSnapshot.encodedVideoBytes
-      snapshot.encoderLatencyMS = writerSnapshot.encoderLatencyMS
-      snapshot.maxEncoderLatencyMS = writerSnapshot.maxEncoderLatencyMS
-      snapshot.hardwareEncoder = writerSnapshot.hardwareEncoder
-      snapshot.encoderID = writerSnapshot.encoderID
-      snapshot.encoderPendingFrames = writerSnapshot.encoderPendingFrames
-      snapshot.writerBufferedBytes = writerSnapshot.bufferedBytes
-      snapshot.writerMaxBufferedBytes = writerSnapshot.maxBufferedBytes
-      snapshot.writerBufferCapacityBytes = writerSnapshot.bufferCapacityBytes
-      snapshot.cadenceRepeatedFrames = writerSnapshot.cadenceRepeatedFrames
-      snapshot.cadenceSkippedFrames = writerSnapshot.cadenceSkippedFrames
-      snapshot.gpuConvertedFrames = writerSnapshot.gpuConvertedFrames
-      snapshot.passThroughFrames = writerSnapshot.passThroughFrames
-      snapshot.systemCompatibilityFrames = writerSnapshot.systemCompatibilityFrames
-      snapshot.gpuConversionFailures = writerSnapshot.gpuConversionFailures
-      snapshot.droppedGPUFrames = writerSnapshot.droppedGPUFrames
-      snapshot.mappedAudioFrames = writerSnapshot.mappedAudioFrames
-      snapshot.audioClockDiscontinuities = writerSnapshot.audioClockDiscontinuities
-      snapshot.audioCorrectionRatio = writerSnapshot.audioCorrectionRatio
-      snapshot.cpuConvertedFrames = writerSnapshot.cpuConvertedFrames
-      snapshot.gpuConversionMS = writerSnapshot.gpuConversionMS
-      snapshot.encoderInputFormat = writerSnapshot.encoderInputFormat
       snapshot.queueSamples = pendingVideo
       snapshot.queueCapacity = configuration.queueCapacity
       snapshot.queuedAudio = pendingAudio
-      if let note = writerSnapshot.warning { snapshot.warning = snapshot.warning.map { "\($0) \(note)" } ?? note }
-      if let note = snapshot.audioSyncNote {
-        snapshot.warning = snapshot.warning.map { "\($0) \(note)" } ?? note
-      }
-      if snapshot.lastError == nil { snapshot.lastError = writerSnapshot.lastError }
       return snapshot
     }
+    snapshot.encodedVideo = writerSnapshot.encodedVideo
+    snapshot.droppedEncodedVideo = writerSnapshot.droppedEncodedVideo
+    snapshot.encoderErrors = writerSnapshot.encoderErrors
+    snapshot.droppedAudio &+= writerSnapshot.droppedAudio
+    snapshot.droppedTimecode = writerSnapshot.droppedTimecode
+    snapshot.encodedVideoBytes = writerSnapshot.encodedVideoBytes
+    snapshot.encoderLatencyMS = writerSnapshot.encoderLatencyMS
+    snapshot.maxEncoderLatencyMS = writerSnapshot.maxEncoderLatencyMS
+    snapshot.hardwareEncoder = writerSnapshot.hardwareEncoder
+    snapshot.encoderID = writerSnapshot.encoderID
+    snapshot.encoderPendingFrames = writerSnapshot.encoderPendingFrames
+    snapshot.writerBufferedBytes = writerSnapshot.bufferedBytes
+    snapshot.writerMaxBufferedBytes = writerSnapshot.maxBufferedBytes
+    snapshot.writerBufferCapacityBytes = writerSnapshot.bufferCapacityBytes
+    snapshot.cadenceRepeatedFrames = writerSnapshot.cadenceRepeatedFrames
+    snapshot.cadenceSkippedFrames = writerSnapshot.cadenceSkippedFrames
+    snapshot.gpuConvertedFrames = writerSnapshot.gpuConvertedFrames
+    snapshot.passThroughFrames = writerSnapshot.passThroughFrames
+    snapshot.systemCompatibilityFrames = writerSnapshot.systemCompatibilityFrames
+    snapshot.gpuConversionFailures = writerSnapshot.gpuConversionFailures
+    snapshot.droppedGPUFrames = writerSnapshot.droppedGPUFrames
+    snapshot.mappedAudioFrames = writerSnapshot.mappedAudioFrames
+    snapshot.audioClockDiscontinuities = writerSnapshot.audioClockDiscontinuities
+    snapshot.audioCorrectionRatio = writerSnapshot.audioCorrectionRatio
+    snapshot.cpuConvertedFrames = writerSnapshot.cpuConvertedFrames
+    snapshot.gpuConversionMS = writerSnapshot.gpuConversionMS
+    snapshot.encoderInputFormat = writerSnapshot.encoderInputFormat
+    if let note = writerSnapshot.warning { snapshot.warning = snapshot.warning.map { "\($0) \(note)" } ?? note }
+    if let note = snapshot.audioSyncNote {
+      snapshot.warning = snapshot.warning.map { "\($0) \(note)" } ?? note
+    }
+    if snapshot.lastError == nil { snapshot.lastError = writerSnapshot.lastError }
+    return snapshot
   }
 
   /// Prepares the encoder (about 100 ms cold) and opens admission. Call it
@@ -798,28 +795,26 @@ final class SourceRecorderCore: @unchecked Sendable {
   /// A drive that is already too full for the first seconds of the take is
   /// refused here, before anything is written.
   func start() throws {
-    if let check = configuration.checkAvailableSpace {
-      do {
-        try check(UInt64(2 * configuration.nominalBytesPerSecond * configuration.spaceCheckInterval))
-      } catch {
-        let failure = Self.spaceFailure(error, starting: true)
-        stateLock.withLock {
-          telemetryValue.state = .failed
-          telemetryValue.writerErrors &+= 1
-          telemetryValue.lastError = failure.localizedDescription
-        }
-        throw failure
-      }
-    }
     try queue.sync {
-      let current = stateLock.withLock { telemetryValue.state }
-      guard current == .idle else {
-        throw SourceRecordingError.invalidState(current, operation: "start")
+      try stateLock.withLock {
+        guard telemetryValue.state == .idle else {
+          throw SourceRecordingError.invalidState(telemetryValue.state, operation: "start")
+        }
+        startInProgress = true
       }
+      defer { stateLock.withLock { startInProgress = false } }
       do {
+        if let check = configuration.checkAvailableSpace {
+          let headroom = 2 * configuration.nominalBytesPerSecond * configuration.spaceCheckInterval
+          do { try check(UInt64(min(headroom, Double(UInt64.max / 2)))) }
+          catch { throw Self.spaceFailure(error, starting: true) }
+        }
         if let sourceAdmission = configuration.sourceAdmission { try writer.bindSourceAdmission(sourceAdmission) }
         try writer.start()
-        stateLock.withLock { telemetryValue.state = .recording }
+        stateLock.withLock {
+          if telemetryValue.state == .idle { telemetryValue.state = .recording }
+        }
+        startSpaceChecks()
       } catch {
         let failure = Self.recordingError(error)
         stateLock.withLock {
@@ -830,7 +825,6 @@ final class SourceRecorderCore: @unchecked Sendable {
         throw failure
       }
     }
-    startSpaceChecks()
   }
 
   var sourceAdmission: SourceAdmissionSnapshot? { stateLock.withLock { boundSourceAdmission } }
@@ -838,8 +832,12 @@ final class SourceRecorderCore: @unchecked Sendable {
   /// Ordered declaration callback: bind once before any media. A new epoch or
   /// clock binding ends this take even if its format signature is unchanged.
   func bindSourceAdmission(_ snapshot: SourceAdmissionSnapshot) throws {
-    do {
-      try stateLock.withLock {
+    try stateLock.withLock {
+      guard telemetryValue.state == .idle || telemetryValue.state == .recording ||
+        telemetryValue.state == .paused else {
+        throw SourceRecordingError.invalidState(telemetryValue.state, operation: "bind source declaration")
+      }
+      do {
         if let bound = boundSourceAdmission {
           guard bound.epochID == snapshot.epochID, bound.formatSignature == snapshot.formatSignature,
             bound.clockBindings == snapshot.clockBindings else {
@@ -857,20 +855,33 @@ final class SourceRecorderCore: @unchecked Sendable {
           snapshot.format.pixel.rawValue == configuration.sourcePixelFormat else {
           throw SourceRecordingError.unsupportedSample("Recording source declaration differs from configured dimensions or pixel format.")
         }
+        try SourceRecordingConfiguration.validate420Render(format: snapshot.format,
+          encoderPixel: configuration.videoProfile.encoderPixelFormat, render420: configuration.render420,
+          burnIn: configuration.lutBurnIn)
         boundSourceAdmission = snapshot
+        // Submit the writer binding before a callback can queue media with this snapshot.
+        queue.async { [weak self] in
+          guard let self else { return }
+          do { try self.writer.bindSourceAdmission(snapshot) }
+          catch {
+            self.stateLock.withLock {
+              self.failLocked(Self.recordingError(error).localizedDescription)
+              self.drainAdmittedAfterFailure = false
+            }
+          }
+        }
+      } catch {
+        let failure = Self.recordingError(error)
+        failLocked(failure.localizedDescription)
+        throw failure
       }
-      try writer.bindSourceAdmission(snapshot)
-    } catch {
-      let failure = Self.recordingError(error)
-      stateLock.withLock { failLocked(failure.localizedDescription) }
-      throw failure
     }
   }
 
   func bindTakeContext(_ context: RecordingTakeContext) throws {
     do { try context.validateCurrentAudio() }
     catch {
-      stateLock.withLock { failLocked(error.localizedDescription) }
+      failTakeMetadata(error.localizedDescription)
       throw error
     }
     try bindSourceAdmission(context.sourceAdmission)
@@ -888,15 +899,15 @@ final class SourceRecorderCore: @unchecked Sendable {
   }
 
   func noteClockMapping(_ event: RecordingClockMappingEvent) throws {
-    try stateLock.withLock {
-      guard let bound = boundSourceAdmission, bound.epochID == event.epochID,
+    try enqueueMetadata(prepare: {
+      guard let bound = self.boundSourceAdmission, bound.epochID == event.epochID,
         bound.clockBindings.video == event.clockID || bound.clockBindings.audio == event.clockID else {
         let message = "Recording received a stale clock mapping."
-        failLocked(message)
+        self.failLocked(message)
         throw SourceRecordingError.unsupportedSample(message)
       }
-    }
-    try enqueueMetadata { writer in try writer.noteClockMapping(event) }
+      return true
+    }) { writer in try writer.noteClockMapping(event) }
   }
 
   /// Capture-side work is bounded validation and one ordered enqueue only.
@@ -938,7 +949,10 @@ final class SourceRecorderCore: @unchecked Sendable {
   }
 
   func failTakeMetadata(_ message: String) {
-    stateLock.withLock { failLocked(message) }
+    stateLock.withLock {
+      guard telemetryValue.state == .recording || telemetryValue.state == .paused else { return }
+      failLocked(message)
+    }
   }
 
   func failSourceAdmission(_ message: String) {
@@ -981,14 +995,11 @@ final class SourceRecorderCore: @unchecked Sendable {
         throw SourceRecordingError.invalidState(telemetryValue.state, operation: "pause")
       }
       telemetryValue.state = .paused
+      spaceCheckGeneration &+= 1
     }
   }
 
   func resume() throws {
-    // A pre-pause callback may have passed admission but not submitted its
-    // queue work yet. Keep the resume marker behind that accepted media;
-    // otherwise it removes the pause at a frame captured before the pause.
-    admission.wait()
     try stateLock.withLock {
       guard telemetryValue.state == .paused else {
         throw SourceRecordingError.invalidState(telemetryValue.state, operation: "resume")
@@ -1007,9 +1018,9 @@ final class SourceRecorderCore: @unchecked Sendable {
   /// waiting there would deadlock the caller performing finalization.
   func stop() throws {
     guard DispatchQueue.getSpecific(key: queueKey) != true else { return }
-    let failedBeforeStop = state == .failed
+    if writer.hasFailed { observeWriterFailure() }
     let shouldStop = stateLock.withLock { () -> Bool in
-      guard !stopStarted, telemetryValue.state != .idle else { return false }
+      guard !stopStarted, telemetryValue.state != .idle || startInProgress else { return false }
       stopStarted = true
       stopCompletion.enter()
       if telemetryValue.state != .failed { telemetryValue.state = .stopping }
@@ -1021,7 +1032,6 @@ final class SourceRecorderCore: @unchecked Sendable {
       return
     }
     stopSpaceChecks()
-    admission.wait()
     let result: Result<Void, SourceRecordingError> = queue.sync {
       do {
         let final = stateLock.withLock { (telemetryValue.lastError, [
@@ -1035,21 +1045,20 @@ final class SourceRecorderCore: @unchecked Sendable {
           "audio.trimmedFrames": telemetryValue.audioResyncTrimmedFrames,
           "audio.silenceFilledFrames": telemetryValue.audioSilenceFilledFrames]) }
         try writer.finish(finalError: final.0, sourceCounters: final.1)
-        let writerFailed = writer.hasFailed
+        if writer.hasFailed { observeWriterFailure() }
         stateLock.withLock {
           // A sample that failed while this stop was draining must stay failed.
-          telemetryValue.state = failedBeforeStop || writerFailed || telemetryValue.state == .failed
-            ? .failed : .finished
+          if telemetryValue.state != .failed { telemetryValue.state = .finished }
         }
         return .success(())
       } catch {
         let failure = Self.recordingError(error)
         stateLock.withLock {
-          telemetryValue.state = .failed
-          telemetryValue.writerErrors &+= 1
-          if telemetryValue.lastError == nil || !failedBeforeStop {
+          if telemetryValue.lastError == nil || telemetryValue.state != .failed {
             telemetryValue.lastError = failure.localizedDescription
           }
+          telemetryValue.state = .failed
+          telemetryValue.writerErrors &+= 1
         }
         return .failure(failure)
       }
@@ -1063,7 +1072,7 @@ final class SourceRecorderCore: @unchecked Sendable {
   /// One line per take, healthy or not, so a take's losses can be found in
   /// the log by its feed and file name long after its stats are gone.
   private func logTakeSummary() {
-    let t = stateLock.withLock { telemetryValue }
+    let t = telemetry
     let unlogged = stateLock.withLock { gapLog.flush() }
     let feed = configuration.feedID.rawValue
     let file = configuration.outputURL.lastPathComponent
@@ -1076,18 +1085,15 @@ final class SourceRecorderCore: @unchecked Sendable {
   private var pendingAudioSegmentRestart = false // under stateLock
 
   private func enqueue(_ sample: CMSampleBuffer, kind: SampleKind, audioMapping: AudioVideoClockMapping? = nil, pairedVideoTime: CMTime? = nil, resumingAudio: Bool = false) -> Bool {
-    guard Self.isReady(sample, kind: kind) else {
+    let pts = CMSampleBufferGetPresentationTimeStamp(sample)
+    let duration = CMSampleBufferGetDuration(sample)
+    guard Self.isReady(sample, kind: kind, pts: pts, duration: duration) else {
       recordDrop(.invalidSample, video: kind == .video)
       return false
     }
     // Observe asynchronous writer failures before admitting media.
     if writer.hasFailed { observeWriterFailure() }
-    var retained: MediaRetentionLedger.Lease?
-    var intentionallyPaused = false
-    var restartAudioSegment = false
-    let pts = CMSampleBufferGetPresentationTimeStamp(sample)
-    let duration = CMSampleBufferGetDuration(sample)
-    let admitted = stateLock.withLock { () -> Bool in
+    return stateLock.withLock {
       if resumingAudio { pendingAudioSegmentRestart = true }
       guard telemetryValue.state == .recording else {
         switch telemetryValue.state {
@@ -1095,7 +1101,7 @@ final class SourceRecorderCore: @unchecked Sendable {
           telemetryValue.droppedPaused &+= 1
           // Declared audio callbacks report contract acceptance, including an
           // intentional pause. A false result tells capture to fail the take.
-          intentionallyPaused = kind == .audio && (audioMapping != nil || pairedVideoTime != nil)
+          return kind == .audio && (audioMapping != nil || pairedVideoTime != nil)
         case .failed:
           // Media the take can no longer record is lost media: count it.
           telemetryValue.droppedNotRecording &+= 1
@@ -1131,6 +1137,7 @@ final class SourceRecorderCore: @unchecked Sendable {
           : "Recording fell behind: \(capacity) audio packets were already waiting for the encoder. The take stopped here. Everything recorded up to this point is kept.")
         return false
       }
+      let retained: MediaRetentionLedger.Lease
       do {
         let bytes: Int
         let seconds: Double
@@ -1157,6 +1164,7 @@ final class SourceRecorderCore: @unchecked Sendable {
         return false
       }
       if kind == .video, !noteCaptureTime(pts, duration: duration) { return false }
+      var restartAudioSegment = false
       switch kind {
       case .video:
         pendingVideo += 1
@@ -1169,13 +1177,15 @@ final class SourceRecorderCore: @unchecked Sendable {
         pendingAudio += 1
         telemetryValue.enqueuedAudio &+= 1
       }
-      admission.enter()
+      // Media, metadata and the resume marker must enter the writer queue in admission order.
+      scheduleAppend(QueuedSample(value: sample, retention: retained), kind: kind, audioMapping: audioMapping,
+        pairedVideoTime: pairedVideoTime, resumesAudioSegment: restartAudioSegment)
       return true
     }
-    guard admitted, let retained else { return intentionallyPaused }
-    let resumesAudioSegment = restartAudioSegment
-    let queuedSample = QueuedSample(value: sample, retention: retained)
-    defer { admission.leave() }
+  }
+
+  private func scheduleAppend(_ queuedSample: QueuedSample, kind: SampleKind, audioMapping: AudioVideoClockMapping?,
+    pairedVideoTime: CMTime?, resumesAudioSegment: Bool) {
     queue.async { [weak self] in
       guard let self else { return }
       defer {
@@ -1243,7 +1253,6 @@ final class SourceRecorderCore: @unchecked Sendable {
         }
       }
     }
-    return true
   }
 
   /// Under `stateLock`, for an admitted video frame. A step of two or more
@@ -1311,9 +1320,10 @@ final class SourceRecorderCore: @unchecked Sendable {
   /// Under `stateLock`: one line per gap at its place in the take, bounded
   /// by `gapLog` so a flaky source cannot flood the log.
   private func logGap(_ frames: UInt64, at pts: CMTime) {
+    let decision = gapLog.note(frames: frames, at: ProcessInfo.processInfo.systemUptime)
+    guard decision != .quiet else { return }
     let at = String(format: "%.3f", firstAdmittedVideoPTS.map { CMTimeSubtract(pts, $0).seconds } ?? 0)
     let feed = configuration.feedID.rawValue
-    let decision = gapLog.note(frames: frames, at: ProcessInfo.processInfo.systemUptime)
     switch decision {
     case .log, .logLast:
       Self.log.notice("\(feed, privacy: .public): \(frames) frames missing from the input before \(at, privacy: .public) s of the take (gap \(self.gapLog.events), \(self.gapLog.frames) frames so far)")
@@ -1330,7 +1340,7 @@ final class SourceRecorderCore: @unchecked Sendable {
   /// A failure the recorder raises itself, under `stateLock`. The file writer
   /// is fine, so samples already admitted are still written.
   private func failLocked(_ message: String) {
-    guard telemetryValue.state != .failed else { return }
+    guard telemetryValue.state != .failed, telemetryValue.state != .finished else { return }
     telemetryValue.state = .failed
     telemetryValue.writerErrors &+= 1
     telemetryValue.lastError = message
@@ -1349,17 +1359,19 @@ final class SourceRecorderCore: @unchecked Sendable {
   /// Moves the recorder to `.failed` once the writer reports a fatal error.
   private func observeWriterFailure() {
     let message = writer.telemetry.lastError
-    stateLock.withLock {
-      switch telemetryValue.state {
-      case .recording, .paused, .stopping:
-        telemetryValue.state = .failed
-        if telemetryValue.lastError == nil { telemetryValue.lastError = message }
-        logFailureLocked(telemetryValue.lastError ?? "The file writer failed.")
-      case .idle, .finished, .failed:
-        break
-      }
-      drainAdmittedAfterFailure = false
+    stateLock.withLock { observeWriterFailureLocked(message) }
+  }
+
+  private func observeWriterFailureLocked(_ message: String?) {
+    switch telemetryValue.state {
+    case .recording, .paused, .stopping:
+      telemetryValue.state = .failed
+      if let message { telemetryValue.lastError = message }
+      logFailureLocked(telemetryValue.lastError ?? "The file writer failed.")
+    case .idle, .finished, .failed:
+      break
     }
+    drainAdmittedAfterFailure = false
   }
 
   // MARK: Free space
@@ -1375,8 +1387,11 @@ final class SourceRecorderCore: @unchecked Sendable {
     timer.schedule(deadline: .now() + interval, repeating: interval,
       leeway: .milliseconds(Int(min(250, max(1, interval * 100)))))
     timer.setEventHandler { [weak self] in self?.runSpaceCheck(check) }
-    stateLock.withLock { spaceTimer = timer }
-    timer.resume()
+    stateLock.withLock {
+      timer.resume()
+      if telemetryValue.state == .recording || telemetryValue.state == .paused { spaceTimer = timer }
+      else { timer.cancel() }
+    }
   }
 
   private func stopSpaceChecks() {
@@ -1395,14 +1410,20 @@ final class SourceRecorderCore: @unchecked Sendable {
   /// full disk. Timer queue only.
   func spaceHeadroom(now: TimeInterval = ProcessInfo.processInfo.systemUptime) -> UInt64 {
     let writerSnapshot = writer.telemetry
-    let rawFrames = stateLock.withLock { pendingVideo } + writerSnapshot.encoderPendingFrames
+    let (pendingFrames, previous) = stateLock.withLock {
+      let previous = lastSpaceCheck
+      if now.isFinite, now > (previous?.time ?? -.infinity) {
+        lastSpaceCheck = (now, writerSnapshot.acceptedBytes)
+      }
+      return (pendingVideo, previous)
+    }
+    let rawFrames = Double(pendingFrames) + Double(writerSnapshot.encoderPendingFrames)
     var rate = configuration.nominalBytesPerSecond
-    if let last = lastSpaceCheck, now > last.time, writerSnapshot.acceptedBytes >= last.acceptedBytes {
+    if let last = previous, now > last.time, writerSnapshot.acceptedBytes >= last.acceptedBytes {
       rate = max(rate, Double(writerSnapshot.acceptedBytes - last.acceptedBytes) / (now - last.time))
     }
-    lastSpaceCheck = (now, writerSnapshot.acceptedBytes)
     let frameBytes = rate * (configuration.sourceFrameRate?.nominal ?? configuration.frameRate.frameDuration).seconds
-    let headroom = Double(writerSnapshot.bufferedBytes) + Double(rawFrames) * frameBytes
+    let headroom = Double(writerSnapshot.bufferedBytes) + rawFrames * frameBytes
       + 2 * rate * configuration.spaceCheckInterval
     return UInt64(min(headroom, Double(UInt64.max / 2)))
   }
@@ -1413,17 +1434,17 @@ final class SourceRecorderCore: @unchecked Sendable {
   func owedBytes() -> UInt64 {
     guard !writer.hasFailed else { return 0 }
     let writerSnapshot = writer.telemetry
-    let rawFrames = stateLock.withLock { pendingVideo } + writerSnapshot.encoderPendingFrames
+    let rawFrames = Double(stateLock.withLock { pendingVideo }) + Double(writerSnapshot.encoderPendingFrames)
     let frameBytes = configuration.nominalBytesPerSecond * (configuration.sourceFrameRate?.nominal ?? configuration.frameRate.frameDuration).seconds
-    let owed = Double(writerSnapshot.bufferedBytes) + Double(rawFrames) * frameBytes
+    let owed = Double(writerSnapshot.bufferedBytes) + rawFrames * frameBytes
     return UInt64(min(owed, Double(UInt64.max / 2)))
   }
 
   private func runSpaceCheck(_ check: (UInt64) throws -> Void) {
     if writer.hasFailed { observeWriterFailure() }
-    let state = stateLock.withLock { () -> SourceRecordingState in
+    let (state, generation) = stateLock.withLock {
       if telemetryValue.state == .recording { telemetryValue.spaceChecks &+= 1 }
-      return telemetryValue.state
+      return (telemetryValue.state, spaceCheckGeneration)
     }
     if state == .failed || state == .paused {
       // Nothing new is accepted, but what already was is still being written:
@@ -1444,7 +1465,7 @@ final class SourceRecorderCore: @unchecked Sendable {
       let failure = Self.spaceFailure(error)
       stateLock.withLock {
         // A take that paused or stopped meanwhile is not failed by a stale check.
-        guard telemetryValue.state == .recording else { return }
+        guard telemetryValue.state == .recording, spaceCheckGeneration == generation else { return }
         failLocked(failure.localizedDescription)
       }
     }
@@ -1502,16 +1523,10 @@ final class SourceRecorderCore: @unchecked Sendable {
     }
   }
 
-  private static func isReady(_ sample: CMSampleBuffer, kind: SampleKind) -> Bool {
+  private static func isReady(_ sample: CMSampleBuffer, kind: SampleKind, pts: CMTime, duration: CMTime) -> Bool {
     guard CMSampleBufferDataIsReady(sample),
-      CMSampleBufferGetPresentationTimeStamp(sample).isValid,
-      CMSampleBufferGetPresentationTimeStamp(sample).isNumeric,
-      CMSampleBufferGetPresentationTimeStamp(sample).epoch == 0,
-      CMSampleBufferGetPresentationTimeStamp(sample).value >= 0,
-      CMSampleBufferGetDuration(sample).isValid,
-      CMSampleBufferGetDuration(sample).isNumeric,
-      CMSampleBufferGetDuration(sample).epoch == 0,
-      CMSampleBufferGetDuration(sample).value > 0 else { return false }
+      pts.isValid, pts.isNumeric, pts.epoch == 0, pts.value >= 0,
+      duration.isValid, duration.isNumeric, duration.epoch == 0, duration.value > 0 else { return false }
     switch kind {
     case .video:
       return CMSampleBufferGetImageBuffer(sample) != nil &&

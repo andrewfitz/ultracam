@@ -30,7 +30,7 @@ import XCTest
   }
 
   private func rig(defaults: UserDefaults? = nil, controlPresent: Bool = true, properties: [ControlProperty] = [],
-    deviceIDs: [String] = ["fake:left", "fake:right"]) throws -> Rig {
+    deviceIDs: [String] = ["fake:left", "fake:right"], configure: (inout AppHardware) -> Void = { _ in }) throws -> Rig {
     let defaults = defaults ?? self.defaults()
     let format = try SourceFormat(width: 3840, height: 2160, pixel: .v210, rate: .constant(VideoContract.slowDuration))
     let capture = FakeCapturePlugin(format: format, audio: .absent, deviceIDs: deviceIDs, descriptor: Self.captureDescriptor)
@@ -53,6 +53,7 @@ import XCTest
       queryProperties: { $0([]) }))
     var hardware = AppHardware.registry(registry)
     hardware.captureServices = AppHardware.offline.captureServices
+    configure(&hardware)
     let model = AppModel(settingsStore: AppSettingsStore(defaults: defaults),
       registryStore: VirtualCameraRegistryStore(defaults: defaults), registryPublisher: SyntheticRegistryPublisher(),
       recordingFolderStore: RecordingFolderStore(defaults: defaults), installer: installer, hardware: hardware)
@@ -286,6 +287,15 @@ import XCTest
     XCTAssertTrue(UIBodySetup.same("rec709-video", "unspecified"))
   }
 
+  func testSetupCanEnableTypedTimecodeWithoutAnOnChoice() {
+    let timecode = ControlProperty(id: "timecode", label: "Timecode", writable: true, value: .boolean(false),
+      role: .timecodeOutput, currentValueLabel: "Disabled")
+    let setup = UIBodySetup(properties: [timecode], cameraName: "Camera 1", declaredProfileID: "unspecified",
+      captureName: nil, detected: nil, timecodeMode: .source)
+    XCTAssertEqual(setup.rows.first?.pieces, ["Disabled"])
+    XCTAssertEqual(setup.advisory?.action, .setProperty(timecode.id, .boolean(true)))
+  }
+
   // MARK: Device settings
 
   /// Retry after a failed write is a change like any other: while a camera runs it asks before
@@ -388,6 +398,55 @@ import XCTest
     rig.capture.setConnected(true)
     rig.model.refresh()
     XCTAssertNil(rig.model.hardwareInventory.status(for: "fake:left"), "Plugged back in: unknown until read")
+
+    rig.capture.setConnected(false)
+    rig.model.refresh()
+    rig.capture.setStatus(CaptureDeviceStatus(availability: .free, link: .thunderbolt, connector: .sdi), for: "fake:left")
+    XCTAssertNil(rig.model.hardwareInventory.statuses["fake:left"], "An idle read completed after removal")
+    XCTAssertNil(rig.model.hardwareInventory.status(for: "fake:left"), "A plugin can still cache that late read")
+    rig.capture.setConnected(true)
+    XCTAssertNil(rig.model.hardwareInventory.status(for: "fake:left"), "That late read is still stale after reconnection")
+    rig.capture.setStatus(CaptureDeviceStatus(availability: .free, link: .thunderbolt, connector: .hdmi), for: "fake:left")
+    XCTAssertEqual(rig.model.hardwareInventory.status(for: "fake:left")?.connector, .hdmi)
+  }
+
+  func testDeviceEnumerationRecoveryClearsResolvedProblem() throws {
+    var fails = true
+    let rig = try rig { hardware in
+      let devices = hardware.devices
+      hardware.devices = {
+        if fails { throw PluginError.failed("Cannot enumerate the fixture inputs") }
+        return try devices()
+      }
+    }
+    XCTAssertTrue(rig.model.appProblems.contains { $0.id == "inputs" })
+    fails = false
+    rig.model.refresh()
+    XCTAssertFalse(rig.model.appProblems.contains { $0.id == "inputs" })
+  }
+
+  func testListedDeviceWithDeniedPermissionCannotRequestStart() throws {
+    let rig = try rig { hardware in
+      hardware.captureAuthorization = { _, _ in .unavailable(.unavailable("Fixture access denied")) }
+    }
+    let id = rig.model.selectedFeedID
+    let input = try XCTUnwrap(rig.model.descriptor(for: id)?.selectedDevice)
+    XCTAssertTrue(rig.model.devices.contains { $0.id == input })
+    XCTAssertFalse(rig.model.canRequestCaptureStart(id))
+  }
+
+  func testUnchangedDevicesCanBePublishedAndSavedAtLastRegistryGeneration() throws {
+    let defaults = defaults()
+    let registry = VirtualCameraRegistryStore(defaults: defaults)
+    let snapshot = AppSettingsSnapshot()
+    try registry.save(.init(generation: UInt64.max - 1,
+      devices: VirtualCameraRegistrySnapshot.devices(for: snapshot.feeds)))
+    let rig = try rig(defaults: defaults)
+    let id = rig.model.selectedFeedID
+    rig.model.updateCamera(id) { $0.automaticFeed = true }
+    XCTAssertEqual(AppSettingsStore(defaults: defaults).loadSnapshot().feeds.first?.automaticFeed, true)
+    XCTAssertEqual(registry.load()?.generation, UInt64.max - 1)
+    XCTAssertNil(rig.model.addFeed(), "Only a topology change needs the next generation")
   }
 
   /// A shown view whose window is minimized, hidden with the app or fully covered stops the

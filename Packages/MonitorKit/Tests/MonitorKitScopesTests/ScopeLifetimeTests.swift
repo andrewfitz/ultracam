@@ -35,6 +35,63 @@ final class ScopeLifetimeTests: XCTestCase {
 
   // MARK: retirement
 
+  func testGroupReleasesReplacedBinsWhileMembersAccumulateIndependently() throws {
+    let (_, _, engine) = try GPU.require()
+    let waveform = try engine.makeAccumulator(settings: ScopeSettings(kind: .waveform))
+    let histogram = try engine.makeAccumulator(settings: ScopeSettings(kind: .histogram))
+    let group = try engine.makeGroup([waveform, histogram])
+    let frame = try TestFrame.natural(.bgra8, width: 64, height: 36, mirror: false)
+    // Prime the fused path, including the resource list for concurrent dispatch.
+    try group.prepare(layouts: [.bgra8])
+    weak var replaced: MTLBuffer?
+    try autoreleasepool {
+      try GPU.run { cb in
+        let encoder = try XCTUnwrap(cb.makeComputeCommandEncoder(dispatchType: .concurrent))
+        defer { encoder.endEncoding() }
+        try group.accumulate(frame.frame, burnInLUT: nil, monitorLUT: nil, using: encoder)
+      }
+      replaced = waveform.bins
+    }
+    XCTAssertEqual(group.fusedMemberCount, 2)
+    waveform.settings.waveformLevels = waveform.settings.waveformLevels == 256 ? 512 : 256
+    for _ in 0...MonitorFeed.retiredFrames {
+      try autoreleasepool {
+        try GPU.run { cb in try waveform.accumulate(frame.frame, burnInLUT: nil, monitorLUT: nil, into: cb) }
+      }
+    }
+    withExtendedLifetime(group) { XCTAssertNil(replaced) }
+  }
+
+  func testPausedRendererReleasesReplacedBins() throws {
+    let (_, _, engine) = try GPU.require()
+    let accumulator = try engine.makeAccumulator(settings: ScopeSettings(kind: .waveform))
+    let renderer = engine.makeRenderer()
+    let frame = try TestFrame.natural(.bgra8, width: 64, height: 36, mirror: false)
+    let target = try makeTarget(width: 256, height: 128)
+    weak var replaced: MTLBuffer?
+    try autoreleasepool {
+      try GPU.run { cb in
+        try accumulator.accumulate(frame.frame, burnInLUT: nil, monitorLUT: nil, into: cb)
+        try renderer.render(accumulator, target: target, into: cb)
+      }
+      replaced = accumulator.bins
+    }
+
+    accumulator.settings.waveformLevels = 256
+    for _ in 0...MonitorFeed.retiredFrames {
+      try autoreleasepool {
+        try GPU.run { cb in
+          try accumulator.accumulate(frame.frame, burnInLUT: nil, monitorLUT: nil, into: cb)
+        }
+      }
+    }
+
+    withExtendedLifetime(renderer) {
+      XCTAssertTrue(renderer.hasTrace)
+      XCTAssertNil(replaced, "the cached trace must hold no ownership of its source bins")
+    }
+  }
+
   /// Bins, trace and graticule textures replaced while an unretained command
   /// buffer that uses them is still unsubmitted stay alive for
   /// `MonitorFeed.retiredFrames` more encodes, then are released.

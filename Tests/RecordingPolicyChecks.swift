@@ -40,6 +40,27 @@ import XCTest
     XCTAssertThrowsError(try store.append(.init(kind: "late", detail: "late")))
     XCTAssertThrowsError(try RecordingTakeSidecar(movieURL: movie, metadata: .init(sourceSignature: "s", outputSignature: "o")))
   }
+
+  func testSidecarCreationPreservesDanglingLinkAndReleasesTheJournalName() throws {
+    let fm = FileManager.default
+    let folder = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try fm.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? fm.removeItem(at: folder) }
+    let movie = folder.appendingPathComponent("take.mov")
+    let sidecar = RecordingTakeSidecar.url(for: movie)
+    let missing = folder.appendingPathComponent("missing.json")
+    try fm.createSymbolicLink(at: sidecar, withDestinationURL: missing)
+    let metadata = RecordingTakeSidecar.Metadata(sourceSignature: "s", outputSignature: "o")
+
+    XCTAssertThrowsError(try RecordingTakeSidecar(movieURL: movie, metadata: metadata))
+    XCTAssertEqual(try fm.destinationOfSymbolicLink(atPath: sidecar.path), missing.path)
+    XCTAssertFalse(fm.fileExists(atPath: sidecar.appendingPathExtension("journal").path))
+    try fm.removeItem(at: sidecar)
+    let store = try RecordingTakeSidecar(movieURL: movie, metadata: metadata)
+    XCTAssertEqual(try RecordingTakeSidecar.readSnapshot(for: movie).metadata.sourceSignature, "s")
+    try store.finish()
+  }
+
   func testFailedSnapshotWritesCanRetryWithoutClosingOrDuplicatingJournal() throws {
     let fm = FileManager.default
     let folder = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)

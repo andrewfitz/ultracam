@@ -55,7 +55,6 @@ final class RecordingPixelConverter: @unchecked Sendable {
   /// Conversions in flight across every recorder. Each caller waits for its
   /// own, so this only matters with several feeds recording at once.
   static let slotCount = 8
-  private let cacheByteLimit: Int
   private let cacheIdleAge: TimeInterval
   private let monotonicNow: () -> TimeInterval
   private let allocationBudget: GPUAllocationBudget
@@ -71,20 +70,20 @@ final class RecordingPixelConverter: @unchecked Sendable {
     let surface: IOSurfaceID
     let plane: Int
     let format: UInt
+    let width: Int
+    let height: Int
   }
 
   private final class CachedTexture {
     let surface: IOSurfaceRef
     let texture: MTLTexture
-    var lastUsed: UInt64
-    var lastUsedTime: TimeInterval
+    var lastUsed: UInt64 = 0
+    var lastUsedTime: TimeInterval = 0
+    var pending = true
     let allocationLease: GPUAllocationBudget.Lease
-    init(surface: IOSurfaceRef, texture: MTLTexture, lastUsed: UInt64,
-      time: TimeInterval, lease: GPUAllocationBudget.Lease) {
+    init(surface: IOSurfaceRef, texture: MTLTexture, lease: GPUAllocationBudget.Lease) {
       self.surface = surface
       self.texture = texture
-      self.lastUsed = lastUsed
-      self.lastUsedTime = time
       self.allocationLease = lease
     }
   }
@@ -156,7 +155,6 @@ final class RecordingPixelConverter: @unchecked Sendable {
     guard cacheMaximumBytes > 0, cacheIdleAge.isFinite, cacheIdleAge > 0 else {
       throw ConversionError.metalUnavailable("Invalid recording GPU cache policy.")
     }
-    self.cacheByteLimit = cacheMaximumBytes
     self.cacheIdleAge = cacheIdleAge
     self.monotonicNow = monotonicNow
     allocationBudget = GPUAllocationBudget(policy: try GPUAllocationBudgetPolicy(maximumBytes: cacheMaximumBytes, minimumSlots: 1))
@@ -238,9 +236,19 @@ final class RecordingPixelConverter: @unchecked Sendable {
       CVPixelBufferGetHeight(destination) == height else {
       throw ConversionError.unsupportedSource("Source and destination sizes differ.")
     }
+    guard width <= 16384, height <= 16384,
+      CVPixelBufferGetWidthOfPlane(destination, 0) == width,
+      CVPixelBufferGetHeightOfPlane(destination, 0) == height,
+      CVPixelBufferGetWidthOfPlane(destination, 1) == (width + 1) / 2,
+      CVPixelBufferGetHeightOfPlane(destination, 1) == height else {
+      throw ConversionError.unsupportedSource("The frame exceeds the supported Metal texture layout.")
+    }
     guard let sourceSurface = CVPixelBufferGetIOSurface(source)?.takeUnretainedValue(),
       let destinationSurface = CVPixelBufferGetIOSurface(destination)?.takeUnretainedValue() else {
       throw ConversionError.unsupportedSource("A buffer is not IOSurface-backed.")
+    }
+    guard IOSurfaceGetID(sourceSurface) != IOSurfaceGetID(destinationSurface) else {
+      throw ConversionError.unsupportedSource("Source and destination alias the same IOSurface.")
     }
     let sourceRowBytes = IOSurfaceGetBytesPerRow(sourceSurface)
     let groups = (width + 5) / 6
@@ -249,7 +257,7 @@ final class RecordingPixelConverter: @unchecked Sendable {
     }
     let completion = Completion([source, destination])
     try encode(completion: completion, width: width, height: height, groups: groups,
-      source: (sourceSurface, sourceRowBytes / 4), destination: destinationSurface, fullRange: sourceRange == .full)
+      source: sourceSurface, destination: destinationSurface, fullRange: sourceRange == .full)
     guard completion.done.wait(timeout: .now() + Self.gpuTimeout) == .success else {
       throw ConversionError.gpuFailure("The GPU did not finish the repack within 2 seconds.")
     }
@@ -259,7 +267,7 @@ final class RecordingPixelConverter: @unchecked Sendable {
 
   /// Encodes and commits one conversion under `lock`.
   private func encode(completion: Completion, width: Int, height: Int, groups: Int,
-    source: (surface: IOSurfaceRef, words: Int), destination: IOSurfaceRef, fullRange: Bool) throws {
+    source: IOSurfaceRef, destination: IOSurfaceRef, fullRange: Bool) throws {
     lock.lock()
     defer { lock.unlock() }
     // Committed to `self.sequence` only once the work is on the GPU, so a
@@ -272,16 +280,14 @@ final class RecordingPixelConverter: @unchecked Sendable {
         throw ConversionError.gpuFailure("The GPU stalled for more than 2 seconds.")
       }
     }
-    // Mapping/budget/encoder failures must not leave entries tagged with a
-    // sequence that will never be signalled. Keep previous completion pins.
-    let previous = textures.mapValues { ($0.lastUsed, $0.lastUsedTime) }
+    // A texture touched by this command stays pinned during budget admission.
+    // Its last GPU use advances only after a successful commit.
     var committed = false
     defer {
       if !committed {
-        for (key, entry) in textures where entry.lastUsed == sequence {
-          if let old = previous[key] {
-            entry.lastUsed = old.0; entry.lastUsedTime = old.1
-          } else {
+        for (key, entry) in textures where entry.pending {
+          entry.pending = false
+          if entry.lastUsed == 0 {
             residency.removeAllocation(entry.texture)
             textures.removeValue(forKey: key)
           }
@@ -290,22 +296,22 @@ final class RecordingPixelConverter: @unchecked Sendable {
       }
     }
     var residencyChanged = false
-    let sourceTexture = try texture(source.surface, plane: 0, format: .r32Uint, width: source.words,
-      height: height, usage: .shaderRead, sequence: sequence, changed: &residencyChanged)
+    // IOSurface supplies the row stride. Only active v210 groups need texels.
+    let sourceTexture = try texture(source, plane: 0, format: .r32Uint, width: groups * 4,
+      height: height, usage: .shaderRead, changed: &residencyChanged)
     let lumaTexture = try texture(destination, plane: 0, format: .r16Uint, width: width,
-      height: height, usage: .shaderWrite, sequence: sequence, changed: &residencyChanged)
+      height: height, usage: .shaderWrite, changed: &residencyChanged)
     let chromaTexture = try texture(destination, plane: 1, format: .rg16Uint, width: (width + 1) / 2,
-      height: height, usage: .shaderWrite, sequence: sequence, changed: &residencyChanged)
-    residencyChanged = evictIdleTextures() || residencyChanged
+      height: height, usage: .shaderWrite, changed: &residencyChanged)
     if residencyChanged { residency.commit() }
 
     var pixelWidth = UInt32(width)
     slot.parameters.contents().copyMemory(from: &pixelWidth, byteCount: MemoryLayout<UInt32>.size)
     var rangeFlag: UInt32 = fullRange ? 1 : 0
     slot.parameters.contents().advanced(by: 4).copyMemory(from: &rangeFlag, byteCount: 4)
-    slot.table.setTexture(sourceTexture.gpuResourceID, index: 0)
-    slot.table.setTexture(lumaTexture.gpuResourceID, index: 1)
-    slot.table.setTexture(chromaTexture.gpuResourceID, index: 2)
+    slot.table.setTexture(sourceTexture.texture.gpuResourceID, index: 0)
+    slot.table.setTexture(lumaTexture.texture.gpuResourceID, index: 1)
+    slot.table.setTexture(chromaTexture.texture.gpuResourceID, index: 2)
     slot.table.setAddress(slot.parameters.gpuAddress, index: 0)
 
     slot.allocator.reset()
@@ -332,6 +338,12 @@ final class RecordingPixelConverter: @unchecked Sendable {
     }
     queue.commit([command], options: options)
     committed = true
+    let now = monotonicNow()
+    for entry in [sourceTexture, lumaTexture, chromaTexture] {
+      entry.lastUsed = sequence
+      entry.lastUsedTime = now
+      entry.pending = false
+    }
     queue.signalEvent(event, value: sequence)
     scheduleAgeSweepLocked()
     slot.lastSequence = sequence
@@ -340,17 +352,14 @@ final class RecordingPixelConverter: @unchecked Sendable {
 
   /// Under `lock`. Wrapping an IOSurface maps, never copies.
   private func texture(_ surface: IOSurfaceRef, plane: Int, format: MTLPixelFormat, width: Int, height: Int,
-    usage: MTLTextureUsage, sequence: UInt64, changed: inout Bool) throws -> MTLTexture {
-    let key = TextureKey(surface: IOSurfaceGetID(surface), plane: plane, format: format.rawValue)
-    if let cached = textures[key], cached.surface === surface,
-      cached.texture.width == width, cached.texture.height == height {
-      cached.lastUsed = sequence
-      cached.lastUsedTime = monotonicNow()
-      return cached.texture
-    }
-    if let stale = textures.removeValue(forKey: key) {
-      residency.removeAllocation(stale.texture)
-      changed = true
+    usage: MTLTextureUsage, changed: inout Bool) throws -> CachedTexture {
+    // Cached views retain their backing surface, so its ID stays unique for
+    // the lifetime of the view. A second view must not displace an in-flight one.
+    let key = TextureKey(surface: IOSurfaceGetID(surface), plane: plane, format: format.rawValue,
+      width: width, height: height)
+    if let cached = textures[key] {
+      cached.pending = true
+      return cached
     }
     let descriptor = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: format,
       width: width, height: height, mipmapped: false)
@@ -372,11 +381,11 @@ final class RecordingPixelConverter: @unchecked Sendable {
       lease = try allocationBudget.acquire(backingID: UInt64(IOSurfaceGetID(surface)), bytes: bytes,
         generation: 0, owner: surface)
     }
-    textures[key] = CachedTexture(surface: surface, texture: texture, lastUsed: sequence,
-      time: monotonicNow(), lease: lease)
+    let entry = CachedTexture(surface: surface, texture: texture, lease: lease)
+    textures[key] = entry
     residency.addAllocation(texture)
     changed = true
-    return texture
+    return entry
   }
 
   /// Under `lock`: drops surfaces idle long enough whose last GPU use has
@@ -385,7 +394,7 @@ final class RecordingPixelConverter: @unchecked Sendable {
     let completed = event.signaledValue
     let now = monotonicNow()
     var removed = false
-    for (key, entry) in textures where entry.lastUsed <= completed &&
+    for (key, entry) in textures where !entry.pending && entry.lastUsed <= completed &&
       (pressure || (now >= entry.lastUsedTime && now - entry.lastUsedTime >= cacheIdleAge)) {
       residency.removeAllocation(entry.texture)
       textures.removeValue(forKey: key)
@@ -417,8 +426,8 @@ final class RecordingPixelConverter: @unchecked Sendable {
   /// A recorder finished. Once no recorder is left, every cached surface
   /// whose GPU work is done is released at once (the x422 pool surfaces and
   /// capture surfaces of a 4K take are about 0.5 GB), and the rest as soon
-  /// as their work completes. While other recorders still convert, the idle
-  /// eviction in `encode` releases this take's surfaces as usual.
+  /// as their work completes. The age sweep releases idle surfaces while
+  /// other recorders still use the converter.
   func endUse() {
     lock.withLock { users = max(0, users - 1) }
     purgeWhenIdle()

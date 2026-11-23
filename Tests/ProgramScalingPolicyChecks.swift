@@ -33,6 +33,14 @@ import XCTest
     XCTAssertGreaterThanOrEqual(crop.scaledHeight, crop.targetHeight)
   }
 
+  func testCropRoundingDoesNotOverflowARepresentableResult() throws {
+    let aspect = try Rational(Int64.max, Int64.max - 1)
+    let plan = try ProgramScalingPolicy.plan(sourceWidth: 1, sourceHeight: 1,
+      targetWidth: 1, targetHeight: 1, mode: .crop, pixelAspect: aspect)
+    XCTAssertEqual(plan.scaledWidth, 2)
+    XCTAssertEqual(plan.scaledHeight, 1)
+  }
+
   func testAnamorphicSourceFitsUsingDisplayAspect() throws {
     let p = try ProgramScalingPolicy.plan(sourceWidth: 1440, sourceHeight: 1080,
       targetWidth: 1920, targetHeight: 1080, pixelAspect: Rational(4, 3))
@@ -51,6 +59,15 @@ import XCTest
     let crop = try ProgramScalingPolicy.plan(sourceWidth: 640, sourceHeight: 480,
       targetWidth: 1280, targetHeight: 720, mode: .crop)
     XCTAssertEqual([crop.scaledWidth, crop.scaledHeight, crop.cropLeft, crop.cropTop], [1280, 960, 0, 120])
+  }
+
+  func testThinPicturesRetainOneVisiblePixelWhenFit() throws {
+    let wide = try ProgramScalingPolicy.plan(sourceWidth: 8192, sourceHeight: 2,
+      targetWidth: 1280, targetHeight: 720)
+    XCTAssertEqual([wide.scaledWidth, wide.scaledHeight, wide.offsetY], [1280, 1, 359])
+    let tall = try ProgramScalingPolicy.plan(sourceWidth: 2, sourceHeight: 8192,
+      targetWidth: 1280, targetHeight: 720)
+    XCTAssertEqual([tall.scaledWidth, tall.scaledHeight, tall.offsetX], [1, 720, 639])
   }
 
   func testRejectsInvalidAndOverflowingGeometry() {

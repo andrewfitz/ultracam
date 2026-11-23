@@ -59,9 +59,22 @@ final class RecordingRecoveryJournal: @unchecked Sendable {
     var recoveredIdentity: MovieIdentity? = nil
     var sidecarOwned: Bool? = nil
   }
+  private struct Update: Codable {
+    let revision: UInt64
+    let entry: Entry
+  }
+  private struct StoredUpdate: Codable {
+    let payload: Data
+    let checksum: Data
+  }
   let url: URL
   private let descriptor: Int32
+  private var revision: UInt64 = 0
   private(set) var entry: Entry
+  // Keep the original JSON intact. The two slots above it alternate on
+  // update, so a torn write preserves the latest committed record.
+  private static let slotBytes = 16 * 1024
+  private static let maximumJournalBytes = 3 * slotBytes
 
   static func url(for temporary: URL) -> URL {
     temporary.appendingPathExtension("ultracam-recovery")
@@ -70,39 +83,73 @@ final class RecordingRecoveryJournal: @unchecked Sendable {
   init(temporary: URL, final: URL) throws {
     url = Self.url(for: temporary)
     entry = Entry(temporaryName: temporary.lastPathComponent, finalName: final.lastPathComponent)
-    descriptor = open(url.path, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, S_IRUSR | S_IWUSR)
-    guard descriptor >= 0 else { throw RecordingOutputError.ioFailure("Cannot create recovery journal.") }
-    guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
-      close(descriptor)
+    let opened = open(url.path, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, S_IRUSR | S_IWUSR)
+    guard opened >= 0 else { throw RecordingOutputError.ioFailure("Cannot create recovery journal.") }
+    guard flock(opened, LOCK_EX | LOCK_NB) == 0 else {
+      close(opened)
       throw RecordingOutputError.ioFailure("Cannot lock recovery journal.")
     }
-    do { try save() }
-    catch { close(descriptor); try? FileManager.default.removeItem(at: url); throw error }
+    descriptor = opened
+    do {
+      guard Self.isValid(entry, at: url) else { throw RecordingOutputError.unsafePath }
+      let baseline = try JSONEncoder().encode(entry)
+      guard baseline.count < Self.slotBytes else { throw RecordingOutputError.unsafePath }
+      let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
+      try handle.write(contentsOf: baseline)
+      try handle.synchronize()
+    }
+    catch { remove(); throw error }
   }
 
   init(opening url: URL) throws {
     self.url = url
-    descriptor = open(url.path, O_RDWR | O_NOFOLLOW | O_CLOEXEC)
-    guard descriptor >= 0 else { throw RecordingOutputError.unsafePath }
+    let opened = open(url.path, O_RDWR | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+    guard opened >= 0 else { throw RecordingOutputError.unsafePath }
     do {
-      guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
+      var info = stat()
+      // A creator acquires the lock before its first write. Leave a newly
+      // created empty file alone so discovery cannot take its lock first.
+      guard fstat(opened, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG,
+        info.st_size > 0 else { throw RecordingOutputError.unsafePath }
+      guard flock(opened, LOCK_EX | LOCK_NB) == 0 else {
         throw RecordingOutputError.ioFailure("This recording is still in use.")
       }
-      var info = stat()
-      guard fstat(descriptor, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG,
-        info.st_size > 0, info.st_size < 16_384 else { throw RecordingOutputError.unsafePath }
-      let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
-      entry = try JSONDecoder().decode(Entry.self, from: handle.readToEnd() ?? Data())
-      let finalExtension = URL(fileURLWithPath: entry.finalName).pathExtension
-      let validFinalExtension = (try? RecordingOutputConfiguration.validateExtension(finalExtension))
-      guard entry.version == 1,
-        Self.safeName(entry.temporaryName), Self.safeName(entry.finalName),
-        entry.temporaryName.hasPrefix("."), entry.temporaryName.hasSuffix(".partial"),
-        validFinalExtension == finalExtension.lowercased(),
-        url.lastPathComponent == entry.temporaryName + ".ultracam-recovery",
-        entry.temporaryName == "." + String(entry.finalName.dropLast(finalExtension.count + 1)) + ".partial",
-        entry.recoveredName.map(Self.safeName) ?? true else { throw RecordingOutputError.unsafePath }
-    } catch { close(descriptor); throw error }
+      guard fstat(opened, &info) == 0, info.st_size > 0,
+        info.st_size <= Self.maximumJournalBytes else { throw RecordingOutputError.unsafePath }
+      let handle = FileHandle(fileDescriptor: opened, closeOnDealloc: false)
+      guard let data = try handle.read(upToCount: Int(info.st_size)),
+        data.count == info.st_size else { throw RecordingOutputError.unsafePath }
+      let decoder = JSONDecoder()
+      // The sparse gap before the update slots reads as NUL, which cannot
+      // occur literally in JSON. A legacy file contains only the baseline.
+      let baselineBytes = data.prefix(Self.slotBytes).prefix { $0 != 0 }
+      let baseline = try decoder.decode(Entry.self, from: baselineBytes)
+      guard Self.isValid(baseline, at: url) else { throw RecordingOutputError.unsafePath }
+      var latest = Update(revision: 0, entry: baseline)
+      for offset in stride(from: Self.slotBytes, to: data.count, by: Self.slotBytes) {
+        let slot = data[offset..<min(offset + Self.slotBytes, data.count)]
+        guard let end = slot.firstIndex(of: 0x0a),
+          let stored = try? decoder.decode(StoredUpdate.self, from: slot[..<end]),
+          stored.checksum == Data(SHA256.hash(data: stored.payload)),
+          let update = try? decoder.decode(Update.self, from: stored.payload),
+          update.revision > latest.revision, Self.slotOffset(for: update.revision) == offset,
+          update.entry.finalName == baseline.finalName, Self.isValid(update.entry, at: url) else { continue }
+        latest = update
+      }
+      descriptor = opened
+      entry = latest.entry
+      revision = latest.revision
+    } catch { close(opened); throw error }
+  }
+
+  private static func isValid(_ entry: Entry, at url: URL) -> Bool {
+    let finalExtension = URL(fileURLWithPath: entry.finalName).pathExtension
+    return entry.version == 1 &&
+      safeName(entry.temporaryName) && safeName(entry.finalName) &&
+      (try? RecordingOutputConfiguration.validateExtension(finalExtension)) == finalExtension.lowercased() &&
+      url.lastPathComponent == entry.temporaryName + ".ultracam-recovery" &&
+      entry.temporaryName == "." + String(entry.finalName.dropLast(finalExtension.count + 1)) + ".partial" &&
+      (entry.recoveredName.map(safeName) ?? true)
   }
 
   private static func safeName(_ name: String) -> Bool {
@@ -110,24 +157,51 @@ final class RecordingRecoveryJournal: @unchecked Sendable {
       && !name.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) })
   }
 
-  private func save() throws {
-    let data = try JSONEncoder().encode(entry)
+  private static func slotOffset(for revision: UInt64) -> Int {
+    slotBytes * (revision.isMultiple(of: 2) ? 2 : 1)
+  }
+
+  private func save(_ candidate: Entry) throws {
+    guard Self.isValid(candidate, at: url) else { throw RecordingOutputError.unsafePath }
+    guard revision < UInt64.max else { throw RecordingOutputError.unsafePath }
+    let nextRevision = revision + 1
+    let offset = UInt64(Self.slotOffset(for: nextRevision))
+    let encoder = JSONEncoder()
+    let payload = try encoder.encode(Update(revision: nextRevision, entry: candidate))
+    var data = try encoder.encode(StoredUpdate(payload: payload, checksum: Data(SHA256.hash(data: payload))))
+    data.append(0x0a)
+    guard data.count <= Self.slotBytes else { throw RecordingOutputError.unsafePath }
     let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: false)
-    try handle.seek(toOffset: 0)
-    try handle.write(contentsOf: data)
-    try handle.truncate(atOffset: UInt64(data.count))
-    try handle.synchronize()
+    do {
+      try handle.seek(toOffset: offset)
+      try handle.write(contentsOf: data)
+      try handle.synchronize()
+      revision = nextRevision
+      entry = candidate
+    } catch {
+      // Invalidate an update the caller couldn't commit. The other slot
+      // (or the initial record) remains authoritative.
+      if (try? handle.seek(toOffset: offset)) != nil {
+        try? handle.write(contentsOf: Data([0]))
+        try? handle.synchronize()
+      }
+      throw error
+    }
   }
 
   func claimSidecar() throws {
-    entry.sidecarOwned = true
-    try save()
+    guard entry.sidecarOwned != true else { return }
+    var candidate = entry
+    candidate.sidecarOwned = true
+    try save(candidate)
   }
   func preparePublication(of staging: URL, to destination: URL) throws {
     let identity = try MovieIdentity(reading: staging)
-    entry.recoveredName = destination.lastPathComponent
-    entry.recoveredIdentity = identity
-    try save()
+    guard entry.recoveredName != destination.lastPathComponent || entry.recoveredIdentity != identity else { return }
+    var candidate = entry
+    candidate.recoveredName = destination.lastPathComponent
+    candidate.recoveredIdentity = identity
+    try save(candidate)
   }
 
   func publishedMovie(in folder: URL) -> URL? {
@@ -137,7 +211,13 @@ final class RecordingRecoveryJournal: @unchecked Sendable {
       entry.recoveredIdentity.map({ $0 == identity }) ?? true else { return nil }
     return url
   }
-  func remove() { try? FileManager.default.removeItem(at: url) }
+  func remove() {
+    var opened = stat()
+    var current = stat()
+    guard fstat(descriptor, &opened) == 0, lstat(url.path, &current) == 0,
+      opened.st_dev == current.st_dev, opened.st_ino == current.st_ino else { return }
+    _ = unlink(url.path)
+  }
   deinit { close(descriptor) }
 }
 
@@ -189,7 +269,7 @@ enum RecordingRecovery {
         unreadable = true
         continue
       }
-      for url in files where url.pathExtension == "ultracam-recovery" {
+      for url in files where url.lastPathComponent.hasSuffix(".partial.ultracam-recovery") {
         hasJournal = true
         guard let journal = try? RecordingRecoveryJournal(opening: url) else { continue }
         // Named from the journal's own folder, as `recover` does. The root's
@@ -199,12 +279,13 @@ enum RecordingRecovery {
         // The journal lock also covers export. Only reclaim its staging file
         // after a crashed exporter has released that lock.
         let staging = source.appendingPathExtension("export.ultracam-recovery")
-        if fm.fileExists(atPath: staging.path) {
-          if unlink(staging.path) != 0 {
-            // A read-only or unavailable take must not hide recordings in
-            // other folders. Its journal still retains the original root.
-            continue
-          }
+        var stagingInfo = stat()
+        if lstat(staging.path, &stagingInfo) == 0 {
+          guard (stagingInfo.st_mode & S_IFMT) == S_IFREG, unlink(staging.path) == 0 else { continue }
+        } else if errno != ENOENT {
+          // A read-only or unavailable take must not hide recordings in
+          // other folders. Its journal still retains the original root.
+          continue
         }
         let final = folder.appendingPathComponent(journal.entry.finalName)
         if journal.publishedMovie(in: folder) != nil { continue }
@@ -253,7 +334,7 @@ enum RecordingRecovery {
     }
     let fm = FileManager.default
     let staging = take.temporaryURL.appendingPathExtension("export.ultracam-recovery")
-    guard !fm.fileExists(atPath: staging.path) else { throw RecordingOutputError.destinationExists }
+    guard !RecordingOutputManager.pathExists(at: staging) else { throw RecordingOutputError.destinationExists }
     defer { _ = unlink(staging.path) }
     try await exporter.export(to: staging, as: mp4 ? .mp4 : .mov)
     // The staging name has no movie extension, so state the container type,
@@ -270,8 +351,13 @@ enum RecordingRecovery {
     let stem = take.finalURL.deletingPathExtension().lastPathComponent + "_Recovered"
     var destination = folder.appendingPathComponent(stem + "." + ext)
     var counter = 2
-    while fm.fileExists(atPath: destination.path) || fm.fileExists(atPath: RecordingTakeSidecar.url(for: destination).path)
-      || fm.fileExists(atPath: RecordingTakeSidecar.url(for: destination).appendingPathExtension("journal").path) {
+    func occupied(_ movie: URL) -> Bool {
+      let metadata = RecordingTakeSidecar.url(for: movie)
+      return [movie, metadata, metadata.appendingPathExtension("journal")].contains {
+        RecordingOutputManager.pathExists(at: $0)
+      }
+    }
+    while occupied(destination) {
       destination = folder.appendingPathComponent(stem + "_\(counter).\(ext)")
       counter += 1
     }

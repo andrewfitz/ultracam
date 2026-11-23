@@ -57,13 +57,14 @@ final class PlanarRecordingConverter: @unchecked Sendable {
     let ndi: NDIPlanarLayout? = i420 ? .i420 : (sourceType == 0x50413136 ? .pa16 : nil)
     let sourcePlaneCount = ndi == nil ? 2 : 3
     let width = CVPixelBufferGetWidth(source), height = CVPixelBufferGetHeight(source)
-    guard width > 0, height > 0, width.isMultiple(of: 2), sixteen || height.isMultiple(of: 2),
+    guard width > 0, height > 0, width <= 16384, height <= 16384,
+      width.isMultiple(of: 2), sixteen || height.isMultiple(of: 2),
       CVPixelBufferGetWidth(destination) == width, CVPixelBufferGetHeight(destination) == height,
       CVPixelBufferIsPlanar(source), CVPixelBufferIsPlanar(destination),
       CVPixelBufferGetPlaneCount(source) == sourcePlaneCount, CVPixelBufferGetPlaneCount(destination) == 2,
       let inputSurface = CVPixelBufferGetIOSurface(source)?.takeUnretainedValue(),
       let outputSurface = CVPixelBufferGetIOSurface(destination)?.takeUnretainedValue(),
-      inputSurface !== outputSurface else { throw ConversionError.invalidLayout }
+      IOSurfaceGetID(inputSurface) != IOSurfaceGetID(outputSurface) else { throw ConversionError.invalidLayout }
     if let ndi {
       let descriptors = try ndi.planes(width: width, height: height)
       for (plane, descriptor) in descriptors.enumerated() {
@@ -138,12 +139,13 @@ final class PlanarRecordingConverter: @unchecked Sendable {
       encoder.dispatchThreads(threadsPerGrid: MTLSize(width: pw, height: ph, depth: 1), threadsPerThreadgroup: MTLSize(width: 16, height: 8, depth: 1))
       encoder.endEncoding(); tables.append(table); parameters.append(parameter); textures += [input, output, separateV]
     }
+    residency.commit()
+    command.useResidencySet(residency)
     command.endCommandBuffer(); ended = true
     CVBufferPropagateAttachments(source, destination)
     // The destination fourCC and its format description must both declare video
     // range; never retain a producer's optional full-range extension after remap.
     CVBufferSetAttachment(destination, kCMFormatDescriptionExtension_FullRangeVideo, kCFBooleanFalse, .shouldPropagate)
-    residency.commit(); queue.addResidencySet(residency)
     let resources = Submission(converter: self, buffers: [source, destination], allocator: allocator,
       command: command, residency: residency, tables: tables, parameters: parameters, textures: textures, leases: leases, completion: completion)
     let options = MTL4CommitOptions(); options.addFeedbackHandler { feedback in resources.finish(feedback.error) }
@@ -162,7 +164,7 @@ final class PlanarRecordingConverter: @unchecked Sendable {
       self.tables = tables; self.parameters = parameters; self.textures = textures; self.leases = leases; self.completion = completion
     }
     func finish(_ error: Error?) {
-      converter.queue.removeResidencySet(residency); leases.forEach { $0.release() }; converter.slots.signal()
+      leases.forEach { $0.release() }; converter.slots.signal()
       if let error { completion(.failure(ConversionError.gpuFailed(error.localizedDescription))) } else { completion(.success(())) }
     }
   }

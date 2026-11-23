@@ -165,6 +165,10 @@ public final class MonitorFeed {
     )
   }
 
+  private static func thresholds(_ focus: FocusSettings) -> SIMD2<Float> {
+    SIMD2(Float(focus.edgeThreshold), Float(focus.normalizedNoiseRejection))
+  }
+
   /// The mask (made or reused at the frame's size), pipeline and inputs of an analysis.
   func prepareAnalysis(_ frame: MonitorFrame, focus: FocusSettings) throws -> Analysis {
     let mask: MTLTexture
@@ -193,7 +197,7 @@ public final class MonitorFeed {
     guard let pipeline = focusPipeline else { throw MonitorKitError.gpu("No focus-analysis pipeline.") }
     let uniforms = AnalysisUniforms(
       frame: frame.parameters(for: focus.stage),
-      thresholds: SIMD2(Float(focus.edgeThreshold), Float(min(1, max(0, focus.noiseRejection)))),
+      thresholds: Self.thresholds(focus),
       burn: burn?.parameters ?? .disabled, monitor: monitor?.parameters ?? .disabled)
     return Analysis(mask: mask, pipeline: pipeline, burn: burn, monitor: monitor, uniforms: uniforms)
   }
@@ -216,12 +220,14 @@ public final class MonitorFeed {
     focusMask != nil && maskKey?.matches(frame) == true
   }
 
-  /// Whether `focusMask` was analysed from `frame` on the stage a surface shows:
+  /// Whether `focusMask` was analysed with this surface's thresholds and stage:
   /// the LUTs it applied are the ones that surface's stage has, and so is its
   /// reading of the codes (a distinct output reading tells the source apart from
   /// an Output stage with no LUT).
-  func hasFocusMask(for frame: MonitorFrame, stage: SignalStage, monitorLUTEnabled: Bool) -> Bool {
+  func hasFocusMask(for frame: MonitorFrame, focus: FocusSettings, monitorLUTEnabled: Bool) -> Bool {
     guard focusMask != nil, let key = maskKey, key.matches(frame) else { return false }
+    guard key.uniforms.thresholds == Self.thresholds(focus) else { return false }
+    let stage = focus.stage
     let burn = stage != .source ? burnInLUT : nil
     let monitor = stage == .monitor && monitorLUTEnabled ? monitorLUT : nil
     guard key.burn === burn && key.monitor === monitor else { return false }

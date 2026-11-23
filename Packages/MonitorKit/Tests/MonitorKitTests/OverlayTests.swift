@@ -228,6 +228,33 @@ final class FocusTests: XCTestCase {
     }
   }
 
+  func testPeakingMatchesNormalizedAnalysisThresholds() throws {
+    let gpu = try requireGPU()
+    let frame = try Self.scene().frame(gpu, signal: .rec709)
+    let feed = gpu.engine.makeFeed(), pass = gpu.engine.makePass()
+    var state = MonitorState()
+    state.focus.enabled = true
+    state.focus.sensitivity = 2
+    state.focus.noiseRejection = .nan
+    try gpu.run { try feed.analyze(frame, focus: state.focus, into: $0) }
+    state.focus.sensitivity = 1
+    state.focus.noiseRejection = 0.02
+    state.focus.opacity = 0.7
+    state.focus.color = .green
+    _ = try gpu.render(frame, state: state, feed: feed, pass: pass)
+    XCTAssertTrue(pass.status.isActive(.focusPeaking))
+    let plain = try gpu.render(frame, state: MonitorState())
+    for (sensitivity, noise) in [(0.0, 0.02), (1.0, 0.2)] {
+      state.focus.sensitivity = sensitivity
+      state.focus.noiseRejection = noise
+      XCTAssertEqual(try gpu.render(frame, state: state, feed: feed, pass: pass).values, plain.values)
+      XCTAssertEqual(pass.status.reason(for: .focusPeaking), .focusNotAnalyzed)
+    }
+    try gpu.run { try feed.analyze(frame, focus: state.focus, into: $0) }
+    _ = try gpu.render(frame, state: state, feed: feed, pass: pass)
+    XCTAssertTrue(pass.status.isActive(.focusPeaking))
+  }
+
   func testPeakingNeedsAMaskForThisFrame() throws {
     let gpu = try requireGPU()
     let frame = try Self.scene().frame(gpu, signal: .rec709)

@@ -57,11 +57,11 @@ enum ProgramScalingPolicy {
       scaledHeight = th
       scaledWidth = try scaledProduct(sw, th, sh, roundingUp: mode == .crop)
     }
-    guard scaledWidth > 0, scaledHeight > 0,
-          scaledWidth <= Int64(Int.max), scaledHeight <= Int64(Int.max) else {
+    guard scaledWidth <= Int64(Int.max), scaledHeight <= Int64(Int.max) else {
       throw ProgramScalingError.arithmeticOverflow
     }
-    let w = Int(scaledWidth), h = Int(scaledHeight)
+    // A valid image can be less than one target pixel wide or tall after fit.
+    let w = max(1, Int(scaledWidth)), h = max(1, Int(scaledHeight))
     switch mode {
     case .fit:
       return ProgramScalingPlan(sourceWidth: sourceWidth, sourceHeight: sourceHeight,
@@ -87,11 +87,7 @@ enum ProgramScalingPolicy {
                                     roundingUp: Bool) throws -> Int64 {
     let (product, overflow) = value.multipliedReportingOverflow(by: numerator)
     guard !overflow else { throw ProgramScalingError.arithmeticOverflow }
-    if roundingUp {
-      let (adjusted, addOverflow) = product.addingReportingOverflow(denominator - 1)
-      guard !addOverflow else { throw ProgramScalingError.arithmeticOverflow }
-      return adjusted / denominator
-    }
-    return product / denominator
+    let (quotient, remainder) = product.quotientAndRemainder(dividingBy: denominator)
+    return roundingUp && remainder != 0 ? quotient + 1 : quotient
   }
 }

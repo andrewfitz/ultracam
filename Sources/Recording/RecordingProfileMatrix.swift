@@ -126,7 +126,13 @@ enum RecordingProfileMatrix {
     if profile == .hevcMain, sourcePixel == .video420, sourceRange == .full {
       return .full420ToVideo420
     }
-    if sourcePixel.rawValue == profile.encoderPixelFormat { return .native }
+    if sourcePixel.rawValue == profile.encoderPixelFormat {
+      let nativeRange: Colorimetry.Range = profile == .proRes4444 ? .full : .video
+      guard sourceRange == nil || sourceRange == nativeRange else {
+        throw RecordingProfileMatrixError.unsupportedRepack(profile: profile, source: sourcePixel)
+      }
+      return .native
+    }
     if sourcePixel == .v210, profile.requires422 { return .v210To422 }
     if profile.requires422 {
       // Packed 8-bit 422 repacks preserve code values. The writer cannot

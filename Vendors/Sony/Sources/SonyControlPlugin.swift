@@ -129,19 +129,10 @@ final class SonyControlPlugin: CameraControlPlugin {
       }
       try checkCancellation()
     } catch {
-      if sessions[feedID]?.key == session.key { sessions.removeValue(forKey: feedID) }
-      retired[feedID] = max(retired[feedID] ?? generation, generation)
-      // Retain camera ownership throughout the suspended cleanup, including
-      // timeout. A competing feed must never admit the same camera meanwhile.
-      pendingCleanup[feedID, default: [:]][generation] = session
-      do {
-        let _: [Property] = try await request { backend.disconnectFeed(session.key, completion: $0) }
-        if pendingCleanup[feedID]?[generation]?.key == session.key {
-          pendingCleanup[feedID]?[generation] = nil
-        }
-      } catch {
-        // Retained for an explicit disconnect retry using this exact native key.
-      }
+      // Disconnect and shutdown take ownership before waiting for an in-flight connect.
+      // A late connect reply must leave their cleanup and any replacement session alone.
+      guard sessions[feedID]?.key == session.key else { throw error }
+      try? await disconnect(feedID: feedID, generation: generation)
       throw error
     }
   }
@@ -161,13 +152,11 @@ final class SonyControlPlugin: CameraControlPlugin {
       let properties: [Property] = try await self.request { self.backend.refreshFeed(session.key, completion: $0) }
       try self.current(feedID, generation)
       if property == "cameraDisplay" {
-        guard case .boolean(let enabled) = value,
-          let display = properties.first(where: { $0.id == "monitoringDisplayHDMI" }), display.writable else {
+        guard case .boolean(let enabled) = value else {
           throw Self.failure("Camera display control is unavailable.", .invalidRequest)
         }
-        let fields = properties.filter { ["monitoringDisplayHDMI", "faceEyeFrameDisplay"].contains($0.id) && $0.writable }
         let raw: UInt64 = enabled ? 2 : 1
-        guard fields.allSatisfy({ $0.choices.contains(where: { $0.value == raw }) }) else {
+        guard let fields = Self.displayFields(in: properties, allowing: raw) else {
           throw Self.failure("The camera no longer allows this display value.", .invalidRequest)
         }
         for field in fields {
@@ -199,15 +188,16 @@ final class SonyControlPlugin: CameraControlPlugin {
     if let session = sessions[feedID], session.generation == generation {
       key = session.key
       sessions.removeValue(forKey: feedID)
-      retired[feedID] = max(retired[feedID] ?? generation, generation)
       pendingCleanup[feedID, default: [:]][generation] = session
     } else if let pending = pendingCleanup[feedID]?[generation] { key = pending.key }
     else { return }
     do {
-      try await serial(feedID) {
+      try await enqueue(feedID) {
+        guard self.pendingCleanup[feedID]?[generation]?.key == key else { return }
         let _: [Property] = try await self.request { self.backend.disconnectFeed(key, completion: $0) }
-      }
-      pendingCleanup[feedID]?[generation] = nil
+        self.pendingCleanup[feedID]?[generation] = nil
+        if self.pendingCleanup[feedID]?.isEmpty == true { self.pendingCleanup.removeValue(forKey: feedID) }
+      }.value
     } catch { throw Self.failure(error.localizedDescription, .cleanupPending) }
   }
 
@@ -223,13 +213,17 @@ final class SonyControlPlugin: CameraControlPlugin {
     catch { throw Self.failure(error.localizedDescription, .cleanupPending) }
   }
 
-  private func serial<T: Sendable>(_ feed: String, _ body: @escaping @MainActor @Sendable () async throws -> T) async throws -> T {
+  private func enqueue<T: Sendable>(_ feed: String, _ body: @escaping @MainActor @Sendable () async throws -> T) -> Task<T, Error> {
     let previous = tails[feed]
     let task = Task { @MainActor in
       await previous?.value
       return try await body()
     }
     tails[feed] = Task { _ = try? await task.value }
+    return task
+  }
+  private func serial<T: Sendable>(_ feed: String, _ body: @escaping @MainActor @Sendable () async throws -> T) async throws -> T {
+    let task = enqueue(feed, body)
     let result = try await withTaskCancellationHandler {
       try await task.value
     } onCancel: { task.cancel() }
@@ -350,6 +344,12 @@ final class SonyControlPlugin: CameraControlPlugin {
         overlayOrder: overlay.firstIndex(of: id), currentValueLabel: label, labelKey: "sony.control.\(id)", localizationTable: "SonyControl")
     }
   }
+  private static func displayFields(in properties: [Property], allowing value: UInt64) -> [Property]? {
+    let fields = properties.filter { $0.writable && ($0.id == "monitoringDisplayHDMI" || $0.id == "faceEyeFrameDisplay") }
+    guard fields.contains(where: { $0.id == "monitoringDisplayHDMI" }),
+      fields.allSatisfy({ $0.choices.contains(where: { $0.value == value }) }) else { return nil }
+    return fields
+  }
   private static func present(_ properties: [Property]) -> [ControlProperty] {
     var result = properties.map(\.controlValue)
     func label(_ id: String) -> String? { properties.first { $0.id == id }?.label }
@@ -382,9 +382,11 @@ final class SonyControlPlugin: CameraControlPlugin {
     } else {
       update("gamma") { $0.suggestedSourceProfileID = Self.sourceProfile(gamma: $0.currentValueLabel, gamut: label("colorMode")) }
     }
-    if let display = properties.first(where: { $0.id == "monitoringDisplayHDMI" }) {
-      result.append(ControlProperty(id: "cameraDisplay", label: "HDMI display", writable: display.writable,
-        value: .boolean(display.value == 2), role: .cameraDisplay, labelKey: "sony.control.cameraDisplay", localizationTable: "SonyControl"))
+    if let display = properties.first(where: { $0.id == "monitoringDisplayHDMI" }), [1, 2].contains(display.value) {
+      let enabled = display.value == 2
+      let writable = displayFields(in: properties, allowing: enabled ? 1 : 2) != nil
+      result.append(ControlProperty(id: "cameraDisplay", label: "HDMI display", writable: writable,
+        value: .boolean(enabled), role: .cameraDisplay, labelKey: "sony.control.cameraDisplay", localizationTable: "SonyControl"))
     }
     return result
   }

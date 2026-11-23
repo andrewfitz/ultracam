@@ -3,8 +3,19 @@ import CoreMedia
 import CoreVideo
 import Foundation
 
-// Synthetic v210 only. Exercise the real remote ProRes encoder, callback
+// Synthetic v210 only. Exercise the real ProRes and HEVC encoders, callback
 // queue, audio interleave and movie finalization without opening any device.
+let arguments = Array(CommandLine.arguments.dropFirst())
+let usage = "Usage: recording-stop-smoke OUTPUT_DIRECTORY"
+if arguments == ["--help"] {
+  print(usage)
+  exit(0)
+}
+guard arguments.count == 1, let path = arguments.first, !path.isEmpty, !path.hasPrefix("-") else {
+  fputs("\(usage)\n", stderr)
+  exit(2)
+}
+
 DispatchQueue.global().asyncAfter(deadline: .now() + 60) {
   fputs("RECORDING_STOP FAIL watchdog expired\n", stderr)
   _exit(124)
@@ -14,9 +25,6 @@ func require(_ condition: Bool, _ message: String) throws {
 }
 Task {
   do {
-    guard let path = CommandLine.arguments.dropFirst().first else {
-      throw SourceRecordingError.invalidConfiguration("Pass a temporary output directory.")
-    }
     let root = URL(fileURLWithPath: path, isDirectory: true)
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
     var buffer: CVPixelBuffer?

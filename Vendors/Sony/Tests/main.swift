@@ -301,7 +301,7 @@ private final class SonyStub: UCSonyCameraControl {
     expect(!store.state(for: "removed-feed").connected, "removal retires the connecting generation immediately")
     backend.finishConnection()
     await connection.value; await removal.value
-    expect(backend.disconnectCalls > closes, "removal releases the late connection")
+    expect(backend.disconnectCalls == closes + 1, "removal releases the late connection exactly once")
     expect(store.assignment(for: "removed-feed") == nil && !store.state(for: "removed-feed").connected, "late connection cannot restore removed feed")
     store.reset()
     expect(store.assignments.values.allSatisfy(\.isEmpty), "reset removes saved camera assignments")
@@ -498,7 +498,10 @@ private final class SonyStub: UCSonyCameraControl {
         "each failed retry waits longer")
       backend.discoveredCameras = [camera]
       sleeper.release()
-      await eventually("the retry reconnects once the camera is reachable") { store.state(for: "saved-feed").connected }
+      await eventually("the retry reconnects and completes its initial settings read") {
+        let state = store.state(for: "saved-feed")
+        return state.connected && !state.busy
+      }
       expect(backend.discoveryCalls == 3 && backend.connectCalls == 1 && store.state(for: "saved-feed").retryAt == nil &&
         store.state(for: "saved-feed").lostAt == nil && sleeper.pending == 0,
         "automatic reconnection needs no button once the camera becomes reachable")
